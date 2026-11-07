@@ -1184,17 +1184,25 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   (covered by engine unit tests with back-dated mtimes), metered gating (the user enabled downloads on mobile data).
 
 ## Phase 15 — Brand and design system
-- [ ] Adaptive "resonance rings" icon (gold dot + teal arcs on #0E1014; foreground/background/monochrome, 66dp safe
-  zone), notification icon, splash screen (core-splashscreen) + Material3 DayNight window theme.
-- [ ] Inter (bundled, OFL) typography scale, shape + spacing tokens, shared `SonorusChip` / `QualityBadge`.
-- [ ] All UI strings in `strings.xml`.
+- [x] Adaptive "resonance rings" icon (gold dot + teal arcs on #0E1014; foreground/background/monochrome, 66dp safe
+  zone) in `res/mipmap/` (minSdk 34, so no `-anydpi-v26` qualifier; plain `mipmap-anydpi` is not found by AAPT2),
+  notification icon, splash screen (core-splashscreen) + Material3 DayNight window theme. Source SVG in `docs/brand/`.
+- [x] Inter 4.1 (bundled, OFL; licence in assets + About → Open-source licenses) typography scale, shape + spacing
+  tokens (`Type.kt`, `Shape.kt`, `Dimens.kt`), shared `SonorusChip` / `QualityBadge`.
+- [x] All UI strings in `strings.xml` (275 entries incl. plurals). ViewModels that build text are `AndroidViewModel`s;
+  `CoreException.userMessage(context, @StringRes fallback)`.
+- [x] Settings redesigned (pulled forward from Phase 16 at the user's request): a minimal list of six categories
+  (Bucket, Library, Playback, Downloads & cache, Upload music, About) with one-line summaries, each opening its own
+  page inside the same route (`AnimatedContent` + `BackHandler`, one `SettingsViewModel`). Shared parts in
+  `SettingsParts.kt`: `SettingsRow`, `SettingsSwitch` (whole row toggles), `SettingsChoice` (radio dialog),
+  `SettingsGroupLabel`, `SettingsNote`, `SettingsStatus`. Disconnect now asks for confirmation.
 
 ## Phase 16 — UI/UX overhaul (artwork-tinted dark)
 - [ ] Single inset owner (fix double status-bar padding); palette-tinted gradients + blurred backdrop on Now Playing,
   Album, Artist; Now Playing slide-up/swipe-down, swipe art to skip, haptics, landscape two-pane.
 - [ ] Mini player animation + swipe to skip; drag-to-reorder + swipe-to-remove (queue, playlists) with Undo;
   swipeable Library tabs, A–Z fast scroll, pull-to-refresh → scan; artist cover collage.
-- [ ] Settings split into grouped subpages; nav transitions; accessibility semantics.
+- [ ] Nav transitions; accessibility semantics. (Settings subpages done in Phase 15.)
 
 ## Phase 17 — Playback quality
 - [ ] Next-track prefetch (~20 s before end, fills the cache); gapless when formats match (same ring, no reopen).

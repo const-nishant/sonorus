@@ -35,7 +35,7 @@ fun AlbumCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f),
-            cornerRadius = 8.dp,
+            shape = MaterialTheme.shapes.small,
         )
         Spacer(Modifier.height(6.dp))
         Text(

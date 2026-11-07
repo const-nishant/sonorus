@@ -1,7 +1,9 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.TrackInfo
@@ -21,9 +23,11 @@ data class AlbumData(val album: AlbumInfo, val tracks: List<TrackInfo>)
 
 /** Backs the Album screen: loads the album and its tracks and starts playback from it. */
 class AlbumViewModel(
+    application: Application,
     private val repository: SonorusRepository,
     private val albumId: Long,
-) : ViewModel() {
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow<LoadState<AlbumData>>(LoadState.Loading)
 
     /** The album, or the reason it could not be loaded. */
@@ -40,7 +44,7 @@ class AlbumViewModel(
     init {
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
-                _state.refresh {
+                _state.refresh(context) {
                     repository.call { core -> AlbumData(core.album(albumId), core.albumTracks(albumId)) }
                 }
                 refreshPin()
@@ -73,7 +77,7 @@ class AlbumViewModel(
             try {
                 repository.setAlbumPinned(albumId, pinned)
             } catch (e: CoreException) {
-                repository.events.emitError(e.userMessage("Could not change the download."))
+                repository.events.emitError(e.userMessage(context, R.string.error_download))
             }
             refreshPin()
         }

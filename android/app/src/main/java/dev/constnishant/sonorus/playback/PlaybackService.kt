@@ -4,9 +4,11 @@ import android.app.PendingIntent
 import android.content.Intent
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dev.constnishant.sonorus.MainActivity
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.data.repository
 
 /**
@@ -19,6 +21,11 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
+        setMediaNotificationProvider(
+            DefaultMediaNotificationProvider.Builder(this).build().apply {
+                setSmallIcon(R.drawable.ic_notification)
+            },
+        )
         val player = SonorusPlayer(applicationContext.repository, this)
         val activity = PendingIntent.getActivity(
             this,

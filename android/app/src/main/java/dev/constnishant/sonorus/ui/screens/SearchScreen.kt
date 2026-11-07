@@ -38,13 +38,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.SearchResult
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.AlbumCard
@@ -54,8 +57,10 @@ import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.SectionTitle
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
+import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 import dev.constnishant.sonorus.ui.components.rememberTrackActions
+import dev.constnishant.sonorus.ui.components.tracksText
 
 /**
  * The Search screen. The field is focused on entry; results are grouped into songs, albums and
@@ -69,7 +74,7 @@ import dev.constnishant.sonorus.ui.components.rememberTrackActions
 fun SearchScreen(onAlbum: (Long) -> Unit, onArtist: (Long) -> Unit, modifier: Modifier = Modifier) {
     val repository = LocalContext.current.repository
     val viewModel: SearchViewModel = viewModel(
-        factory = viewModelFactory { initializer { SearchViewModel(repository) } },
+        factory = viewModelFactory { initializer { SearchViewModel(checkNotNull(this[APPLICATION_KEY]), repository) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val currentId by rememberCurrentTrackId()
@@ -82,19 +87,19 @@ fun SearchScreen(onAlbum: (Long) -> Unit, onArtist: (Long) -> Unit, modifier: Mo
 
     Scaffold(
         modifier = modifier,
-        topBar = { TopAppBar(title = { Text("Search") }) },
+        topBar = { TopAppBar(title = { Text(stringResource(R.string.search_title)) }) },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             OutlinedTextField(
                 value = state.query,
                 onValueChange = viewModel::onQueryChange,
                 singleLine = true,
-                placeholder = { Text("Songs, albums, artists") },
+                placeholder = { Text(stringResource(R.string.search_placeholder)) },
                 leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
                 trailingIcon = {
                     if (state.query.isNotEmpty()) {
                         IconButton(onClick = { viewModel.onQueryChange("") }) {
-                            Icon(Icons.Rounded.Clear, contentDescription = "Clear search")
+                            Icon(Icons.Rounded.Clear, contentDescription = stringResource(R.string.cd_clear_search))
                         }
                     }
                 },
@@ -110,15 +115,15 @@ fun SearchScreen(onAlbum: (Long) -> Unit, onArtist: (Long) -> Unit, modifier: Mo
                 CenteredContent {
                     EmptyState(
                         Icons.Rounded.Search,
-                        "Search your library",
-                        "Find songs, albums and artists.",
+                        stringResource(R.string.search_intro_title),
+                        stringResource(R.string.search_intro_message),
                     )
                 }
             } else {
                 when (val results = state.results) {
                     LoadState.Loading -> LoadingContent()
                     is LoadState.Failed -> CenteredContent {
-                        EmptyState(Icons.Rounded.ErrorOutline, "Search failed", results.message)
+                        EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.search_failed), results.message)
                     }
                     is LoadState.Ready -> {
                         val result = results.value
@@ -139,8 +144,8 @@ fun SearchScreen(onAlbum: (Long) -> Unit, onArtist: (Long) -> Unit, modifier: Mo
                             CenteredContent {
                                 EmptyState(
                                     Icons.Rounded.Search,
-                                    "No results for \"$trimmed\"",
-                                    "Try a different spelling or fewer words.",
+                                    stringResource(R.string.search_no_results_title, trimmed),
+                                    stringResource(R.string.search_no_results_message),
                                 )
                             }
                         }
@@ -163,7 +168,7 @@ private fun SearchResults(
 ) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
         if (result.tracks.isNotEmpty()) {
-            item(key = "songs-title") { SectionTitle("Songs") }
+            item(key = "songs-title") { SectionTitle(stringResource(R.string.section_songs)) }
             itemsIndexed(result.tracks, key = { _, track -> "track-${track.id}" }) { index, track ->
                 TrackRow(
                     track = track,
@@ -175,7 +180,7 @@ private fun SearchResults(
             }
         }
         if (result.albums.isNotEmpty()) {
-            item(key = "albums-title") { SectionTitle("Albums") }
+            item(key = "albums-title") { SectionTitle(stringResource(R.string.section_albums)) }
             item(key = "albums-row") {
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 16.dp),
@@ -193,7 +198,7 @@ private fun SearchResults(
             item(key = "albums-gap") { Spacer(Modifier.height(8.dp)) }
         }
         if (result.artists.isNotEmpty()) {
-            item(key = "artists-title") { SectionTitle("Artists") }
+            item(key = "artists-title") { SectionTitle(stringResource(R.string.section_artists)) }
             items(result.artists, key = { "artist-${it.id}" }) { artist ->
                 ListItem(
                     modifier = Modifier.clickable { onArtist(artist.id) },
@@ -201,7 +206,7 @@ private fun SearchResults(
                         Text(artist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     },
                     supportingContent = {
-                        Text("${artist.albumCount} albums · ${artist.trackCount} tracks")
+                        Text(albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()))
                     },
                     leadingContent = { Icon(Icons.Rounded.Person, contentDescription = null) },
                 )

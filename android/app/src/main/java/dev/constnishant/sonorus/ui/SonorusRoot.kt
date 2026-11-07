@@ -1,5 +1,6 @@
 package dev.constnishant.sonorus.ui
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -23,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavType
@@ -31,6 +33,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.player.MiniPlayer
 import dev.constnishant.sonorus.ui.player.NowPlayingScreen
@@ -44,12 +47,12 @@ import dev.constnishant.sonorus.ui.screens.SearchScreen
 import dev.constnishant.sonorus.ui.settings.SettingsScreen
 import dev.constnishant.sonorus.ui.uploads.UploadsScreen
 
-private data class TopLevelTab(val route: String, val label: String, val icon: ImageVector)
+private data class TopLevelTab(val route: String, @StringRes val labelRes: Int, val icon: ImageVector)
 
 private val TopLevelTabs = listOf(
-    TopLevelTab(Routes.HOME, "Home", Icons.Rounded.Home),
-    TopLevelTab(Routes.LIBRARY, "Library", Icons.Rounded.LibraryMusic),
-    TopLevelTab(Routes.SEARCH, "Search", Icons.Rounded.Search),
+    TopLevelTab(Routes.HOME, R.string.nav_home, Icons.Rounded.Home),
+    TopLevelTab(Routes.LIBRARY, R.string.nav_library, Icons.Rounded.LibraryMusic),
+    TopLevelTab(Routes.SEARCH, R.string.nav_search, Icons.Rounded.Search),
 )
 
 /** Navigation arguments for the detail routes: a single non-null library id. */
@@ -116,7 +119,7 @@ fun SonorusRoot() {
                                     }
                                 },
                                 icon = { Icon(tab.icon, contentDescription = null) },
-                                label = { Text(tab.label) },
+                                label = { Text(stringResource(tab.labelRes)) },
                             )
                         }
                     }

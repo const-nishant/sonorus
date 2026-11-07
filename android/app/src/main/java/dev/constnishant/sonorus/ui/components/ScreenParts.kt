@@ -10,7 +10,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import dev.constnishant.sonorus.R
 
 /** A bold heading for a section of a list, with horizontal page padding. */
 @Composable
@@ -35,6 +37,6 @@ fun Section(title: String, content: @Composable () -> Unit) {
 @Composable
 fun BackButton(onClick: () -> Unit) {
     IconButton(onClick = onClick) {
-        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
+        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = stringResource(R.string.cd_back))
     }
 }

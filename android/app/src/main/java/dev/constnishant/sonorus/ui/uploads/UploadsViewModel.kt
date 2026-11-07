@@ -1,8 +1,11 @@
 package dev.constnishant.sonorus.ui.uploads
 
+import android.app.Application
+import android.content.Context
 import android.net.Uri
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.UploadJobInfo
 import dev.constnishant.sonorus.data.PrepareResult
@@ -26,7 +29,11 @@ import kotlinx.coroutines.withContext
  * State and actions for the uploads screen: the upload queue, the progress of running jobs, and
  * adding files. The queue reloads on start, after actions, and when a run ends.
  */
-class UploadsViewModel(private val repository: SonorusRepository) : ViewModel() {
+class UploadsViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow<LoadState<List<UploadJobInfo>>>(LoadState.Loading)
 
     /** The upload jobs, newest first, or the reason they could not be read. */
@@ -63,7 +70,7 @@ class UploadsViewModel(private val repository: SonorusRepository) : ViewModel() 
     /** Reloads the upload queue. */
     fun reload() {
         viewModelScope.launch {
-            _state.refresh { repository.uploads() }
+            _state.refresh(context) { repository.uploads() }
         }
     }
 
@@ -79,7 +86,7 @@ class UploadsViewModel(private val repository: SonorusRepository) : ViewModel() 
             } finally {
                 _preparing.value = false
             }
-            _messages.tryEmit(result.summary())
+            _messages.tryEmit(result.summary(context))
             reload()
             if (result.queued > 0) onQueued()
         }
@@ -96,7 +103,7 @@ class UploadsViewModel(private val repository: SonorusRepository) : ViewModel() 
             try {
                 repository.clearFinishedUploads()
             } catch (e: CoreException) {
-                _messages.tryEmit(e.userMessage("Could not clear the list."))
+                _messages.tryEmit(e.userMessage(context, R.string.error_clear_list))
             }
             reload()
         }
@@ -104,13 +111,24 @@ class UploadsViewModel(private val repository: SonorusRepository) : ViewModel() 
 }
 
 /** A one-line summary such as "3 queued, 1 already uploaded, 1 skipped: <reason>". */
-private fun PrepareResult.summary(): String {
+private fun PrepareResult.summary(context: Context): String {
     val parts = buildList {
-        if (queued > 0) add("$queued queued")
-        if (duplicates > 0) add("$duplicates already uploaded")
+        if (queued > 0) {
+            add(context.resources.getQuantityString(R.plurals.upload_summary_queued, queued, queued))
+        }
+        if (duplicates > 0) {
+            add(context.resources.getQuantityString(R.plurals.upload_summary_duplicates, duplicates, duplicates))
+        }
         if (skipped.isNotEmpty()) {
-            add("${skipped.size} skipped: ${skipped.distinct().joinToString(" ")}")
+            add(
+                context.resources.getQuantityString(
+                    R.plurals.upload_summary_skipped,
+                    skipped.size,
+                    skipped.size,
+                    skipped.distinct().joinToString(" "),
+                ),
+            )
         }
     }
-    return parts.joinToString(", ").ifEmpty { "Nothing was added." }
+    return parts.joinToString(", ").ifEmpty { context.getString(R.string.upload_summary_none) }
 }

@@ -1,27 +1,26 @@
 package dev.constnishant.sonorus.ui.player
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.OutputPathMode
 import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.data.audio.UsbDac
+import dev.constnishant.sonorus.ui.components.SonorusChip
 import dev.constnishant.sonorus.ui.components.formatKhz
 import dev.constnishant.sonorus.ui.components.label
 
@@ -31,25 +30,11 @@ import dev.constnishant.sonorus.ui.components.label
  */
 @Composable
 fun SignalPathChip(path: SignalPathInfo, onClick: () -> Unit) {
-    val text = modeLabel(path.mode)
-    val tint = if (path.mode == OutputPathMode.BIT_PERFECT) {
-        MaterialTheme.colorScheme.tertiary
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Surface(
+    SonorusChip(
+        text = modeLabel(path.mode),
+        accent = path.mode == OutputPathMode.BIT_PERFECT,
         onClick = onClick,
-        shape = RoundedCornerShape(50),
-        color = Color.Transparent,
-        contentColor = tint,
-        border = BorderStroke(1.dp, tint),
-    ) {
-        Text(
-            text = text,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-            style = MaterialTheme.typography.labelMedium,
-        )
-    }
+    )
 }
 
 /**
@@ -62,17 +47,17 @@ fun SignalPathDialog(path: SignalPathInfo, dac: UsbDac?, onDismiss: () -> Unit) 
         onDismissRequest = onDismiss,
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("Close")
+                Text(stringResource(R.string.action_close))
             }
         },
-        title = { Text("Signal path") },
+        title = { Text(stringResource(R.string.signal_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                SignalRow(label = "Source", value = sourceText(path))
-                SignalRow(label = "Output", value = outputText(path))
-                SignalRow(label = "Device", value = deviceText(path, dac))
+                SignalRow(label = stringResource(R.string.signal_source), value = sourceText(path))
+                SignalRow(label = stringResource(R.string.signal_output), value = outputText(path))
+                SignalRow(label = stringResource(R.string.signal_device), value = deviceText(path, dac))
                 SignalRow(
-                    label = "Mode",
+                    label = stringResource(R.string.signal_mode),
                     value = modeLabel(path.mode),
                     note = modeNote(path.mode),
                 )
@@ -115,29 +100,43 @@ private fun SignalRow(label: String, value: String, note: String? = null) {
     }
 }
 
-private fun modeLabel(mode: OutputPathMode): String = when (mode) {
-    OutputPathMode.BIT_PERFECT -> "Bit-perfect"
-    OutputPathMode.EXCLUSIVE -> "Exclusive"
-    OutputPathMode.MIXER -> "Mixer"
-}
+@Composable
+private fun modeLabel(mode: OutputPathMode): String = stringResource(
+    when (mode) {
+        OutputPathMode.BIT_PERFECT -> R.string.signal_mode_bit_perfect
+        OutputPathMode.EXCLUSIVE -> R.string.signal_mode_exclusive
+        OutputPathMode.MIXER -> R.string.signal_mode_mixer
+    },
+)
 
-private fun modeNote(mode: OutputPathMode): String = when (mode) {
-    OutputPathMode.BIT_PERFECT -> "Samples reach the DAC unchanged"
-    OutputPathMode.EXCLUSIVE -> "Direct stream, the device format may still differ"
-    OutputPathMode.MIXER -> "Android mixes and may resample to the device rate"
-}
+@Composable
+private fun modeNote(mode: OutputPathMode): String = stringResource(
+    when (mode) {
+        OutputPathMode.BIT_PERFECT -> R.string.signal_note_bit_perfect
+        OutputPathMode.EXCLUSIVE -> R.string.signal_note_exclusive
+        OutputPathMode.MIXER -> R.string.signal_note_mixer
+    },
+)
 
 /** "24-bit / 96 kHz", or "Unknown bit depth / 44.1 kHz". */
+@Composable
 private fun sourceText(path: SignalPathInfo): String {
-    val bits = path.sourceBits?.let { "$it-bit" } ?: "Unknown bit depth"
-    return "$bits / ${formatKhz(path.sourceRate)} kHz"
+    val bits = path.sourceBits?.let { stringResource(R.string.signal_sample_bits, it) }
+        ?: stringResource(R.string.signal_unknown_depth)
+    return stringResource(R.string.signal_source_line, bits, stringResource(R.string.khz_unit, formatKhz(path.sourceRate)))
 }
 
 /** "96 kHz · 24-bit · Exclusive", or "Not open" when no stream is open. */
+@Composable
 private fun outputText(path: SignalPathInfo): String {
-    val stream = path.stream ?: return "Not open"
-    val share = if (stream.exclusive) "Exclusive" else "Shared"
-    return "${formatKhz(stream.sampleRate)} kHz · ${stream.sampleFormat.label()} · $share"
+    val stream = path.stream ?: return stringResource(R.string.signal_not_open)
+    val share = if (stream.exclusive) {
+        stringResource(R.string.signal_mode_exclusive)
+    } else {
+        stringResource(R.string.signal_mode_shared)
+    }
+    val khz = stringResource(R.string.khz_unit, formatKhz(stream.sampleRate))
+    return khz + " · " + stream.sampleFormat.label(LocalContext.current) + " · " + share
 }
 
 /**
@@ -147,11 +146,13 @@ private fun outputText(path: SignalPathInfo): String {
  * after the open without a reopen, so the stream's device id can be stale. When the plan used the
  * default route and a DAC is connected, the DAC is named.
  */
+@Composable
 private fun deviceText(path: SignalPathInfo, dac: UsbDac?): String {
     if (path.plan.deviceId == null && dac != null) {
-        return "${dac.name} (id ${dac.id})"
+        return stringResource(R.string.signal_device_with_id, dac.name, dac.id)
     }
     val id = path.stream?.deviceId ?: path.plan.deviceId
-    val name = dac?.takeIf { id != null && it.id == id }?.name ?: "Phone speaker/default"
-    return if (id != null) "$name (id $id)" else name
+    val name = dac?.takeIf { id != null && it.id == id }?.name
+        ?: stringResource(R.string.signal_device_phone)
+    return if (id != null) stringResource(R.string.signal_device_with_id, name, id) else name
 }

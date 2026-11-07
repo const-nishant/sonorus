@@ -1,6 +1,7 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.AlbumSort
@@ -18,7 +19,11 @@ import kotlinx.coroutines.launch
  * Backs the Library screen: albums (sorted), artists and playlists, plus playlist create, rename
  * and delete. Lists reload whenever the catalogue changes.
  */
-class LibraryViewModel(private val repository: SonorusRepository) : ViewModel() {
+class LibraryViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _sort = MutableStateFlow(AlbumSort.ARTIST)
 
     /** The album sort order. */
@@ -43,13 +48,13 @@ class LibraryViewModel(private val repository: SonorusRepository) : ViewModel() 
         viewModelScope.launch {
             combine(_sort, repository.libraryChangeSignals()) { sort, _ -> sort }
                 .collectLatest { sort ->
-                    _albums.refresh { repository.call { core -> core.albums(sort, 2000u, 0u) } }
+                    _albums.refresh(context) { repository.call { core -> core.albums(sort, 2000u, 0u) } }
                 }
         }
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
-                _artists.refresh { repository.call { core -> core.artists(2000u, 0u) } }
-                _playlists.refresh { repository.call { core -> core.playlists() } }
+                _artists.refresh(context) { repository.call { core -> core.artists(2000u, 0u) } }
+                _playlists.refresh(context) { repository.call { core -> core.playlists() } }
             }
         }
     }

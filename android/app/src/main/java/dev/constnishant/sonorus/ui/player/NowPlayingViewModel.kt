@@ -1,14 +1,16 @@
 package dev.constnishant.sonorus.ui.player
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.RepeatMode
 import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.PlaybackUi
-import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.data.SonorusRepository
+import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.data.userMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,7 +27,11 @@ data class FavoriteOverride(val trackId: Long, val favorite: Boolean)
  * State and commands for the Now Playing screen and its queue sheet. Player commands are
  * fire-and-forget through the repository; favorites and track lookups await the core on IO.
  */
-class NowPlayingViewModel(private val repository: SonorusRepository) : ViewModel() {
+class NowPlayingViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     /** Playback state from the core. */
     val playback: StateFlow<PlaybackUi> = repository.events.playback
 
@@ -129,7 +135,7 @@ class NowPlayingViewModel(private val repository: SonorusRepository) : ViewModel
                 if (_favoriteOverride.value == optimistic) {
                     _favoriteOverride.value = FavoriteOverride(trackId, !favorite)
                 }
-                repository.events.emitError(e.userMessage("Could not change the favorite."))
+                repository.events.emitError(e.userMessage(context, R.string.error_favorite))
             }
         }
     }

@@ -85,6 +85,8 @@ private val LightColors = lightColorScheme(
 fun SonorusTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        typography = SonorusTypography,
+        shapes = SonorusShapes,
         content = content,
     )
 }

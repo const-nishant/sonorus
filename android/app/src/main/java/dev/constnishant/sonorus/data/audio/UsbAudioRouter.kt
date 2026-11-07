@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.OutputRouter
 import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.RoutePlanInfo
@@ -43,6 +44,7 @@ class UsbAudioRouter(
     private val onDacDetached: () -> Unit,
 ) : OutputRouter {
     private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val appContext: Context = context.applicationContext
     private val lock = Any()
 
     private val _dac = MutableStateFlow<UsbDac?>(null)
@@ -229,7 +231,9 @@ class UsbAudioRouter(
                         device.type == AudioDeviceInfo.TYPE_USB_HEADSET)
             }
             ?.let { device ->
-                val name = device.productName.toString().trim().ifEmpty { "USB audio" }
+                val name = device.productName.toString().trim().ifEmpty {
+                    appContext.getString(R.string.usb_dac_fallback_name)
+                }
                 UsbDac(device.id, name)
             }
 

@@ -1,0 +1,8 @@
+<resources>
+    <!-- Dark window background matches the dark color scheme in ui/theme/Theme.kt. -->
+    <style name="Theme.Sonorus" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E1014</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

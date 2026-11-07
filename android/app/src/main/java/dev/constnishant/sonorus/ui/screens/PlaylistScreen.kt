@@ -4,8 +4,8 @@ package dev.constnishant.sonorus.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,10 +27,10 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -44,16 +44,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.PlaylistEntryInfo
 import dev.constnishant.sonorus.data.DownloadsUi
 import dev.constnishant.sonorus.data.repository
@@ -71,6 +73,7 @@ import dev.constnishant.sonorus.ui.components.TrackRow
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 import dev.constnishant.sonorus.ui.components.rememberTrackActions
+import dev.constnishant.sonorus.ui.components.songsText
 
 /**
  * The Playlist screen. Lists the entries in order: catalogued tracks play from that entry on;
@@ -86,7 +89,7 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
     val repository = LocalContext.current.repository
     val viewModel: PlaylistViewModel = viewModel(
         key = "playlist-$playlistId",
-        factory = viewModelFactory { initializer { PlaylistViewModel(repository, playlistId) } },
+        factory = viewModelFactory { initializer { PlaylistViewModel(checkNotNull(this[APPLICATION_KEY]), repository, playlistId) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val pin by viewModel.pin.collectAsStateWithLifecycle()
@@ -102,17 +105,23 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
         modifier = modifier,
         topBar = {
             TopAppBar(
-                title = { Text(data?.playlist?.name ?: "Playlist", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = {
+                    Text(
+                        data?.playlist?.name ?: stringResource(R.string.playlist_fallback_title),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
                 navigationIcon = { BackButton(onBack) },
                 actions = {
                     if (data != null) {
                         Box {
                             IconButton(onClick = { menuOpen = true }) {
-                                Icon(Icons.Rounded.MoreVert, contentDescription = "Playlist options")
+                                Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.cd_playlist_options))
                             }
                             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                                 DropdownMenuItem(
-                                    text = { Text("Rename") },
+                                    text = { Text(stringResource(R.string.action_rename)) },
                                     leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
                                     onClick = {
                                         menuOpen = false
@@ -120,7 +129,7 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
                                     },
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Delete") },
+                                    text = { Text(stringResource(R.string.action_delete)) },
                                     leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null) },
                                     onClick = {
                                         menuOpen = false
@@ -137,7 +146,7 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
         when (val s = state) {
             LoadState.Loading -> LoadingContent(Modifier.padding(padding))
             is LoadState.Failed -> CenteredContent(Modifier.padding(padding)) {
-                EmptyState(Icons.Rounded.ErrorOutline, "Couldn't open playlist", s.message)
+                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.playlist_open_failed), s.message)
             }
             is LoadState.Ready -> PlaylistContent(
                 data = s.value,
@@ -157,9 +166,9 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
 
     if (renaming && data != null) {
         PlaylistNameDialog(
-            title = "Rename playlist",
+            title = stringResource(R.string.playlist_rename_title),
             initialName = data.playlist.name,
-            confirmLabel = "Rename",
+            confirmLabel = stringResource(R.string.action_rename),
             onConfirm = { name ->
                 viewModel.rename(name)
                 renaming = false
@@ -169,9 +178,9 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
     }
     if (deleting && data != null) {
         ConfirmDialog(
-            title = "Delete playlist?",
-            message = "\"${data.playlist.name}\" will be removed. Its tracks stay in your library.",
-            confirmLabel = "Delete",
+            title = stringResource(R.string.playlist_delete_title),
+            message = stringResource(R.string.playlist_delete_message, data.playlist.name),
+            confirmLabel = stringResource(R.string.action_delete),
             onConfirm = {
                 deleting = false
                 viewModel.delete()
@@ -209,7 +218,7 @@ private fun PlaylistContent(
                     .padding(16.dp),
             ) {
                 Text(
-                    "${playlist.trackCount} songs · ${formatTotal(playlist.durationMs.toLong())}",
+                    songsText(playlist.trackCount.toInt()) + " · " + formatTotal(LocalContext.current, playlist.durationMs.toLong()),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -218,12 +227,12 @@ private fun PlaylistContent(
                     Button(onClick = { onPlayAll(false) }, enabled = entries.isNotEmpty()) {
                         Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                        Text("Play")
+                        Text(stringResource(R.string.action_play))
                     }
                     OutlinedButton(onClick = { onPlayAll(true) }, enabled = entries.isNotEmpty()) {
                         Icon(Icons.Rounded.Shuffle, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                        Text("Shuffle")
+                        Text(stringResource(R.string.action_shuffle))
                     }
                     DownloadToggle(state = pin, onSetPinned = onSetPinned)
                 }
@@ -234,8 +243,8 @@ private fun PlaylistContent(
             item(key = "empty") {
                 EmptyState(
                     Icons.AutoMirrored.Rounded.QueueMusic,
-                    "This playlist is empty",
-                    "Add songs from any track menu with \"Add to playlist…\".",
+                    stringResource(R.string.playlist_empty_title),
+                    stringResource(R.string.playlist_empty_message),
                 )
             }
         }
@@ -280,7 +289,7 @@ private fun ColumnScope.EntryMenuItems(
     onDismiss: () -> Unit,
 ) {
     DropdownMenuItem(
-        text = { Text("Move up") },
+        text = { Text(stringResource(R.string.action_move_up)) },
         leadingIcon = { Icon(Icons.Rounded.ArrowUpward, contentDescription = null) },
         enabled = canMoveUp,
         onClick = {
@@ -289,7 +298,7 @@ private fun ColumnScope.EntryMenuItems(
         },
     )
     DropdownMenuItem(
-        text = { Text("Move down") },
+        text = { Text(stringResource(R.string.action_move_down)) },
         leadingIcon = { Icon(Icons.Rounded.ArrowDownward, contentDescription = null) },
         enabled = canMoveDown,
         onClick = {
@@ -298,7 +307,7 @@ private fun ColumnScope.EntryMenuItems(
         },
     )
     DropdownMenuItem(
-        text = { Text("Remove from playlist") },
+        text = { Text(stringResource(R.string.action_remove_from_playlist)) },
         leadingIcon = { Icon(Icons.Rounded.RemoveCircleOutline, contentDescription = null) },
         onClick = {
             onDismiss()
@@ -324,13 +333,13 @@ private fun UnavailableEntry(
             Icon(Icons.Rounded.ErrorOutline, contentDescription = null)
         },
         headlineContent = {
-            Text("Unavailable — $fileName", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(stringResource(R.string.playlist_unavailable_title, fileName), maxLines = 1, overflow = TextOverflow.Ellipsis)
         },
-        supportingContent = { Text("Not found in the library") },
+        supportingContent = { Text(stringResource(R.string.playlist_unavailable_message)) },
         trailingContent = {
             Box {
                 IconButton(onClick = { menuOpen = true }) {
-                    Icon(Icons.Rounded.MoreVert, contentDescription = "More options")
+                    Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.cd_more_options))
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     menu { menuOpen = false }

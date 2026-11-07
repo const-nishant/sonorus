@@ -16,8 +16,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cloud
@@ -37,13 +37,16 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.repository
@@ -53,7 +56,9 @@ import dev.constnishant.sonorus.ui.components.CenteredContent
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.Section
+import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
+import dev.constnishant.sonorus.ui.components.tracksText
 
 /**
  * The Home screen: recently played tracks and albums, recently added albums, and library totals.
@@ -67,7 +72,7 @@ import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Modifier = Modifier) {
     val repository = LocalContext.current.repository
     val viewModel: HomeViewModel = viewModel(
-        factory = viewModelFactory { initializer { HomeViewModel(repository) } },
+        factory = viewModelFactory { initializer { HomeViewModel(checkNotNull(this[APPLICATION_KEY]), repository) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val configured by repository.configured.collectAsStateWithLifecycle()
@@ -77,10 +82,10 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
         modifier = modifier,
         topBar = {
             TopAppBar(
-                title = { Text("Sonorus") },
+                title = { Text(stringResource(R.string.app_name)) },
                 actions = {
                     IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Rounded.Settings, contentDescription = "Settings")
+                        Icon(Icons.Rounded.Settings, contentDescription = stringResource(R.string.cd_settings))
                     }
                 },
             )
@@ -89,7 +94,7 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
         when (val s = state) {
             LoadState.Loading -> LoadingContent(Modifier.padding(padding))
             is LoadState.Failed -> CenteredContent(Modifier.padding(padding)) {
-                EmptyState(Icons.Rounded.ErrorOutline, "Couldn't load your library", s.message)
+                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.home_load_failed), s.message)
             }
             is LoadState.Ready -> {
                 val data = s.value
@@ -98,16 +103,16 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
                         if (configured) {
                             EmptyState(
                                 icon = Icons.Rounded.LibraryMusic,
-                                title = "Your library is empty",
-                                message = "Scan your bucket in Settings to add music.",
-                                action = { Button(onClick = onOpenSettings) { Text("Open settings") } },
+                                title = stringResource(R.string.home_empty_title),
+                                message = stringResource(R.string.scan_bucket_hint),
+                                action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
                             )
                         } else {
                             EmptyState(
                                 icon = Icons.Rounded.Cloud,
-                                title = "Connect your bucket",
-                                message = "Add your S3-compatible bucket in Settings to start listening.",
-                                action = { Button(onClick = onOpenSettings) { Text("Open settings") } },
+                                title = stringResource(R.string.home_connect_title),
+                                message = stringResource(R.string.home_connect_message),
+                                action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
                             )
                         }
                     }
@@ -144,7 +149,7 @@ private fun HomeContent(
     ) {
         if (data.recentTracks.isNotEmpty()) {
             item(key = "recent-tracks") {
-                Section("Recently played") {
+                Section(stringResource(R.string.home_recently_played)) {
                     LazyRow(
                         state = rememberShelfState(data.recentTracks.firstOrNull()?.id),
                         contentPadding = PaddingValues(horizontal = 16.dp),
@@ -163,21 +168,21 @@ private fun HomeContent(
         }
         if (data.recentAlbums.isNotEmpty()) {
             item(key = "recent-albums") {
-                Section("Recently played albums") {
+                Section(stringResource(R.string.home_recently_played_albums)) {
                     AlbumRow(data.recentAlbums, onAlbum)
                 }
             }
         }
         if (data.recentlyAdded.isNotEmpty()) {
             item(key = "recently-added") {
-                Section("Recently added") {
+                Section(stringResource(R.string.home_recently_added)) {
                     AlbumRow(data.recentlyAdded, onAlbum)
                 }
             }
         }
         item(key = "stats") {
             Text(
-                "${data.stats.tracks} tracks · ${data.stats.albums} albums",
+                tracksText(data.stats.tracks.toInt()) + " · " + albumsText(data.stats.albums.toInt()),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -227,7 +232,7 @@ private fun RecentTrackCard(track: TrackInfo, isCurrent: Boolean, onClick: () ->
             path = track.coverPath,
             contentDescription = track.album,
             modifier = Modifier.size(120.dp),
-            cornerRadius = 8.dp,
+            shape = MaterialTheme.shapes.small,
         )
         Spacer(Modifier.height(4.dp))
         Text(

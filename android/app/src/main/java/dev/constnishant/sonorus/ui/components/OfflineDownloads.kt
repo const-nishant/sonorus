@@ -2,6 +2,7 @@
 
 package dev.constnishant.sonorus.ui.components
 
+import android.content.Context
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DownloadDone
@@ -17,8 +18,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.DownloadStatus
 import dev.constnishant.sonorus.data.DownloadsUi
 
@@ -60,14 +64,18 @@ fun DownloadToggle(
     ) {
         Icon(
             imageVector = if (state.pinned) Icons.Rounded.DownloadDone else Icons.Rounded.DownloadForOffline,
-            contentDescription = if (state.pinned) "Remove download" else "Download for offline",
+            contentDescription = if (state.pinned) {
+                stringResource(R.string.cd_remove_download)
+            } else {
+                stringResource(R.string.cd_download_offline)
+            },
         )
     }
     if (confirming) {
         ConfirmDialog(
-            title = "Remove download?",
-            message = "The songs stay in your bucket and still stream.",
-            confirmLabel = "Remove",
+            title = stringResource(R.string.download_remove_title),
+            message = stringResource(R.string.download_remove_message),
+            confirmLabel = stringResource(R.string.action_remove),
             onConfirm = {
                 confirming = false
                 onSetPinned(false)
@@ -85,17 +93,21 @@ fun DownloadToggle(
  * "Waiting for Wi-Fi · 3 of 12" when idle with tracks pending; otherwise "Queued · 3 of 12". The
  * cached size is appended when there is one.
  */
-fun downloadStatusText(state: PinUi, downloads: DownloadsUi): String? {
+fun downloadStatusText(context: Context, state: PinUi, downloads: DownloadsUi): String? {
     val status = state.status ?: return null
     if (!status.pinned) return null
-    val counts = "${status.cachedTracks} of ${status.totalTracks}"
+    val counts = context.getString(R.string.download_counts, status.cachedTracks.toInt(), status.totalTracks.toInt())
     val base = when {
-        state.complete -> "Downloaded"
-        downloads.active -> "Downloading $counts"
-        downloads.pendingTracks > 0u -> "Waiting for Wi-Fi · $counts"
-        else -> "Queued · $counts"
+        state.complete -> context.getString(R.string.download_downloaded)
+        downloads.active -> context.getString(R.string.download_downloading, counts)
+        downloads.pendingTracks > 0u -> context.getString(R.string.download_waiting) + " · " + counts
+        else -> context.getString(R.string.download_queued) + " · " + counts
     }
-    return if (status.cachedBytes > 0u) "$base · ${formatBytes(status.cachedBytes)}" else base
+    return if (status.cachedBytes > 0u) {
+        "$base · ${formatBytes(context, status.cachedBytes)}"
+    } else {
+        base
+    }
 }
 
 /** The status line from [downloadStatusText]. Renders nothing when there is no status to show. */
@@ -105,7 +117,7 @@ fun DownloadStatusText(
     downloads: DownloadsUi,
     modifier: Modifier = Modifier,
 ) {
-    val text = downloadStatusText(state, downloads) ?: return
+    val text = downloadStatusText(LocalContext.current, state, downloads) ?: return
     Text(
         text = text,
         style = MaterialTheme.typography.bodySmall,

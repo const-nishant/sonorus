@@ -12,8 +12,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -24,8 +24,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.PlaybackState
 import dev.constnishant.sonorus.data.PlaybackUi
 import dev.constnishant.sonorus.ui.components.Artwork
@@ -76,7 +78,7 @@ fun MiniPlayer(
                     path = track.coverPath,
                     contentDescription = null,
                     modifier = Modifier.size(48.dp),
-                    cornerRadius = 6.dp,
+                    shape = MaterialTheme.shapes.small,
                 )
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -105,12 +107,16 @@ fun MiniPlayer(
                         val pause = playback.state.showsPause()
                         Icon(
                             imageVector = if (pause) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                            contentDescription = if (pause) "Pause" else "Play",
+                            contentDescription = if (pause) {
+                                stringResource(R.string.cd_pause)
+                            } else {
+                                stringResource(R.string.cd_play)
+                            },
                         )
                     }
                 }
                 IconButton(onClick = onNext) {
-                    Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
+                    Icon(Icons.Rounded.SkipNext, contentDescription = stringResource(R.string.cd_next))
                 }
             }
         }

@@ -1,6 +1,7 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.AlbumSort
@@ -25,7 +26,11 @@ data class HomeData(
 }
 
 /** Loads the Home sections and reloads them whenever the catalogue changes. */
-class HomeViewModel(private val repository: SonorusRepository) : ViewModel() {
+class HomeViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow<LoadState<HomeData>>(LoadState.Loading)
 
     /** The Home sections, or the reason they could not be loaded. */
@@ -34,7 +39,7 @@ class HomeViewModel(private val repository: SonorusRepository) : ViewModel() {
     init {
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
-                _state.refresh {
+                _state.refresh(context) {
                     repository.call { core ->
                         HomeData(
                             stats = core.stats(),

@@ -1,3 +1,356 @@
-<resources>
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <string name="app_name">Sonorus</string>
+
+    <!-- Navigation and shared actions -->
+    <string name="nav_home">Home</string>
+    <string name="nav_library">Library</string>
+    <string name="nav_search">Search</string>
+    <string name="action_play">Play</string>
+    <string name="action_play_all">Play all</string>
+    <string name="action_shuffle">Shuffle</string>
+    <string name="action_open_settings">Open settings</string>
+    <string name="action_create">Create</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_close">Close</string>
+    <string name="action_clear">Clear</string>
+    <string name="action_remove">Remove</string>
+    <string name="action_move_up">Move up</string>
+    <string name="action_move_down">Move down</string>
+    <string name="action_remove_from_playlist">Remove from playlist</string>
+    <string name="action_play_next">Play next</string>
+    <string name="action_add_to_queue">Add to queue</string>
+    <string name="action_add_to_playlist">Add to playlist…</string>
+    <string name="action_clear_finished">Clear finished</string>
+    <string name="action_add_music">Add music</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_back">Back</string>
+    <string name="cd_settings">Settings</string>
+    <string name="cd_more_options">More options</string>
+    <string name="cd_add_to_favorites">Add to favorites</string>
+    <string name="cd_remove_from_favorites">Remove from favorites</string>
+    <string name="cd_play">Play</string>
+    <string name="cd_pause">Pause</string>
+    <string name="cd_next">Next</string>
+    <string name="cd_previous">Previous</string>
+    <string name="cd_shuffle">Shuffle</string>
+    <string name="cd_repeat">Repeat</string>
+    <string name="cd_collapse">Collapse</string>
+    <string name="cd_now_playing">Now playing</string>
+    <string name="cd_move_up">Move up</string>
+    <string name="cd_move_down">Move down</string>
+    <string name="cd_remove_from_queue">Remove from queue</string>
+    <string name="cd_cancel_upload">Cancel upload</string>
+    <string name="cd_retry_upload">Retry upload</string>
+    <string name="cd_clear_search">Clear search</string>
+    <string name="cd_sort_albums">Sort albums</string>
+    <string name="cd_selected">Selected</string>
+    <string name="cd_playlist_options">Playlist options</string>
+    <string name="cd_new_playlist">New playlist</string>
+    <string name="cd_download_offline">Download for offline</string>
+    <string name="cd_remove_download">Remove download</string>
+    <string name="cd_show_secret">Show secret</string>
+    <string name="cd_hide_secret">Hide secret</string>
+
+    <!-- Badges and shared hints -->
+    <string name="badge_hi_res">HI-RES</string>
+    <string name="scan_bucket_hint">Scan your bucket in Settings to add music.</string>
+
+    <!-- Counts (use with pluralStringResource / getQuantityString) -->
+    <plurals name="tracks_count">
+        <item quantity="one">%1$d track</item>
+        <item quantity="other">%1$d tracks</item>
+    </plurals>
+    <plurals name="albums_count">
+        <item quantity="one">%1$d album</item>
+        <item quantity="other">%1$d albums</item>
+    </plurals>
+    <plurals name="songs_count">
+        <item quantity="one">%1$d song</item>
+        <item quantity="other">%1$d songs</item>
+    </plurals>
+    <plurals name="songs_offline">
+        <item quantity="one">%1$d song offline (%2$s downloaded)</item>
+        <item quantity="other">%1$d songs offline (%2$s downloaded)</item>
+    </plurals>
+    <plurals name="keep_days">
+        <item quantity="one">%1$d day</item>
+        <item quantity="other">%1$d days</item>
+    </plurals>
+    <plurals name="sync_playlists_count">
+        <item quantity="one">%1$d playlist</item>
+        <item quantity="other">%1$d playlists</item>
+    </plurals>
+    <plurals name="sync_favorites_count">
+        <item quantity="one">%1$d favorite</item>
+        <item quantity="other">%1$d favorites</item>
+    </plurals>
+
+    <!-- Home -->
+    <string name="home_load_failed">Couldn\'t load your library</string>
+    <string name="home_empty_title">Your library is empty</string>
+    <string name="home_connect_title">Connect your bucket</string>
+    <string name="home_connect_message">Add your S3-compatible bucket in Settings to start listening.</string>
+    <string name="home_recently_played">Recently played</string>
+    <string name="home_recently_played_albums">Recently played albums</string>
+    <string name="home_recently_added">Recently added</string>
+
+    <!-- Library -->
+    <string name="library_title">Library</string>
+    <string name="library_tab_albums">Albums</string>
+    <string name="library_tab_artists">Artists</string>
+    <string name="library_tab_playlists">Playlists</string>
+    <string name="library_albums_failed">Couldn\'t load albums</string>
+    <string name="library_artists_failed">Couldn\'t load artists</string>
+    <string name="library_playlists_failed">Couldn\'t load playlists</string>
+    <string name="library_no_albums">No albums yet</string>
+    <string name="library_no_artists">No artists yet</string>
+    <string name="library_no_playlists">No playlists yet</string>
+    <string name="library_playlists_hint">Tap + to create one, then add tracks from any song menu.</string>
+    <string name="library_sorted_by">Sorted by %1$s</string>
+    <string name="sort_artist">Artist</string>
+    <string name="sort_title">Title</string>
+    <string name="sort_year">Year</string>
+    <string name="sort_recently_added">Recently added</string>
+
+    <!-- Playlists -->
+    <string name="playlist_new_title">New playlist</string>
+    <string name="playlist_name_field">Name</string>
+    <string name="playlist_name_label">Playlist name</string>
+    <string name="playlist_rename_title">Rename playlist</string>
+    <string name="playlist_delete_title">Delete playlist?</string>
+    <string name="playlist_delete_message">\"%1$s\" will be removed. Its tracks stay in your library.</string>
+    <string name="playlist_open_failed">Couldn\'t open playlist</string>
+    <string name="playlist_fallback_title">Playlist</string>
+    <string name="playlist_empty_title">This playlist is empty</string>
+    <string name="playlist_empty_message">Add songs from any track menu with \"Add to playlist…\".</string>
+    <string name="playlist_unavailable_title">Unavailable — %1$s</string>
+    <string name="playlist_unavailable_message">Not found in the library</string>
+    <string name="add_to_playlist_title">Add to playlist</string>
+
+    <!-- Album and artist -->
+    <string name="album_open_failed">Couldn\'t open album</string>
+    <string name="artist_open_failed">Couldn\'t open artist</string>
+    <string name="album_disc_number">Disc %1$s</string>
+    <string name="album_other_tracks">Other tracks</string>
+    <string name="artist_no_albums">No albums</string>
+    <string name="artist_no_albums_message">This artist has no albums in the library.</string>
+
+    <!-- Search -->
+    <string name="search_title">Search</string>
+    <string name="search_placeholder">Songs, albums, artists</string>
+    <string name="search_intro_title">Search your library</string>
+    <string name="search_intro_message">Find songs, albums and artists.</string>
+    <string name="search_failed">Search failed</string>
+    <string name="search_no_results_title">No results for \"%1$s\"</string>
+    <string name="search_no_results_message">Try a different spelling or fewer words.</string>
+    <string name="section_songs">Songs</string>
+    <string name="section_albums">Albums</string>
+    <string name="section_artists">Artists</string>
+
+    <!-- Track rows and downloads -->
+    <string name="download_downloaded">Downloaded</string>
+    <string name="download_downloading">Downloading %1$s</string>
+    <string name="download_waiting">Waiting for Wi-Fi</string>
+    <string name="download_queued">Queued</string>
+    <string name="download_counts">%1$d of %2$d</string>
+    <string name="download_remove_title">Remove download?</string>
+    <string name="download_remove_message">The songs stay in your bucket and still stream.</string>
+
+    <!-- Player -->
+    <string name="now_playing_title">Now playing</string>
+    <string name="now_playing_empty">Nothing is playing</string>
+    <string name="now_playing_up_next">Up next</string>
+    <string name="now_playing_retrying">Connection lost — retrying in %1$ds (attempt %2$d)</string>
+    <string name="queue_empty">The queue is empty.</string>
+    <string name="queue_unavailable">Unavailable</string>
+    <string name="queue_loading" tools:ignore="TypographyEllipsis">Loading...</string>
+    <string name="signal_title">Signal path</string>
+    <string name="signal_source">Source</string>
+    <string name="signal_output">Output</string>
+    <string name="signal_device">Device</string>
+    <string name="signal_mode">Mode</string>
+    <string name="signal_not_open">Not open</string>
+    <string name="signal_unknown_depth">Unknown bit depth</string>
+    <string name="signal_sample_bits">%1$s-bit</string>
+    <string name="signal_source_line">%1$s / %2$s</string>
+    <string name="signal_mode_bit_perfect">Bit-perfect</string>
+    <string name="signal_mode_exclusive">Exclusive</string>
+    <string name="signal_mode_mixer">Mixer</string>
+    <string name="signal_mode_shared">Shared</string>
+    <string name="signal_note_bit_perfect">Samples reach the DAC unchanged</string>
+    <string name="signal_note_exclusive">Direct stream, the device format may still differ</string>
+    <string name="signal_note_mixer">Android mixes and may resample to the device rate</string>
+    <string name="signal_device_with_id">%1$s (id %2$s)</string>
+    <string name="signal_device_phone">Phone speaker/default</string>
+    <string name="khz_unit">%1$s kHz</string>
+
+    <!-- Output sample formats -->
+    <string name="sample_format_float">Float</string>
+    <string name="sample_format_32bit">32-bit</string>
+    <string name="sample_format_24bit">24-bit</string>
+    <string name="sample_format_16bit">16-bit</string>
+
+    <!-- Sizes and durations -->
+    <string name="duration_minutes">%1$d min</string>
+    <string name="duration_hours_minutes">%1$d h %2$d min</string>
+    <string name="size_gb">%1$s GB</string>
+    <string name="size_mb">%1$d MB</string>
+    <string name="size_kb">%1$d KB</string>
+    <string name="duration_hours">%1$s h</string>
+
+    <!-- Uploads -->
+    <string name="uploads_title">Uploads</string>
+    <string name="uploads_load_failed">Couldn\'t load uploads</string>
+    <string name="uploads_empty_title">No uploads yet</string>
+    <string name="uploads_empty_message">Add songs from this phone — they are copied to your bucket and appear in your library.</string>
+    <string name="uploads_reading">Reading files…</string>
+    <string name="upload_state_queued">Queued</string>
+    <string name="upload_state_uploading">Uploading</string>
+    <string name="upload_state_uploading_percent">Uploading %1$d%%</string>
+    <string name="upload_state_uploaded">Uploaded</string>
+    <string name="upload_state_duplicate">Already in bucket</string>
+    <string name="upload_state_failed">Failed: %1$s</string>
+    <string name="upload_state_cancelled">Cancelled</string>
+    <string name="upload_unknown_error">unknown error</string>
+    <string name="upload_size_mb">%1$s MB</string>
+    <string name="upload_summary_none">Nothing was added.</string>
+
+    <plurals name="upload_summary_queued">
+        <item quantity="one">%1$d queued</item>
+        <item quantity="other">%1$d queued</item>
+    </plurals>
+    <plurals name="upload_summary_duplicates">
+        <item quantity="one">%1$d already uploaded</item>
+        <item quantity="other">%1$d already uploaded</item>
+    </plurals>
+    <plurals name="upload_summary_skipped">
+        <item quantity="one">%1$d skipped: %2$s</item>
+        <item quantity="other">%1$d skipped: %2$s</item>
+    </plurals>
+
+    <!-- Notifications -->
+    <string name="notif_upload_channel">Uploads</string>
+    <string name="notif_upload_title">Uploading music</string>
+    <string name="notif_upload_preparing">Preparing uploads</string>
+    <string name="notif_upload_position">%1$d of %2$d</string>
+    <plurals name="notif_upload_finished">
+        <item quantity="one">Upload finished: %1$d uploaded, %2$d failed</item>
+        <item quantity="other">Upload finished: %1$d uploaded, %2$d failed</item>
+    </plurals>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_section_bucket">Bucket</string>
+    <string name="settings_section_library">Library</string>
+    <string name="settings_section_downloads">Downloads &amp; cache</string>
+    <string name="settings_section_about">About</string>
+    <string name="settings_endpoint">Endpoint</string>
+    <string name="settings_region">Region (optional)</string>
+    <string name="settings_bucket_name">Bucket</string>
+    <string name="settings_access_key">Access key ID</string>
+    <string name="settings_secret_key">Secret access key</string>
+    <string name="settings_path_style">Path-style URLs</string>
+    <string name="settings_path_style_hint">On for Backblaze B2 and Cloudflare R2</string>
+    <string name="settings_prefix">Folder prefix (optional)</string>
+    <string name="settings_save_connect">Save &amp; connect</string>
+    <string name="settings_disconnect">Disconnect</string>
+    <string name="settings_disconnect_title">Disconnect bucket?</string>
+    <string name="settings_disconnect_message">Removes the saved bucket settings from this phone. The music in your bucket is not touched.</string>
+    <string name="settings_not_connected">Not connected</string>
+    <string name="settings_provider">Provider</string>
+    <string name="settings_section_playback">Playback</string>
+    <string name="settings_group_credentials">Credentials</string>
+    <string name="settings_group_options">Options</string>
+    <string name="output_format">Output format</string>
+    <string name="output_current">Now</string>
+    <string name="output_usb_dac">USB DAC</string>
+    <string name="output_stream">Stream</string>
+    <string name="provider_b2" translatable="false">Backblaze B2</string>
+    <string name="provider_r2" translatable="false">Cloudflare R2</string>
+    <string name="provider_custom">Custom</string>
+    <string name="settings_connected">Connected</string>
+    <string name="settings_connected_no_files">Connected, but there are no files under \"%1$s\"</string>
+    <string name="settings_connected_empty">Connected, but the bucket is empty</string>
+    <string name="settings_disconnected">Disconnected. The change takes effect after restart.</string>
+    <string name="settings_stats_loading" tools:ignore="TypographyEllipsis">Loading library stats...</string>
+    <string name="settings_scan">Scan bucket</string>
+    <string name="settings_last_scan">Last scan: %1$s</string>
+    <plurals name="scan_progress_files">
+        <item quantity="one">%1$d of %2$d file</item>
+        <item quantity="other">%1$d of %2$d files</item>
+    </plurals>
+    <string name="scan_no_changes">no changes</string>
+    <string name="scan_added">%1$s added</string>
+    <string name="scan_updated">%1$s updated</string>
+    <string name="scan_removed">%1$s removed</string>
+    <string name="scan_failed">%1$s failed</string>
+    <string name="output_follows_volume">Float follows the volume setting. 32-bit and 24-bit send the samples unchanged (bit-perfect) at full volume.</string>
+    <string name="output_exclusive_title">Exclusive mode</string>
+    <string name="output_exclusive_message">Asks Android for a direct, low-latency stream. The device may still share it.</string>
+    <string name="output_changing_stops">Changing these stops playback.</string>
+    <string name="output_bitperfect_title">Bit-perfect to USB DAC</string>
+    <string name="output_bitperfect_message">Sends each track to the DAC in its own format, untouched. Other sounds are muted on the DAC while it plays.</string>
+    <string name="output_no_dac">No USB DAC connected</string>
+    <string name="output_no_stream">No active output stream</string>
+    <string name="output_channels">%1$d ch</string>
+    <string name="output_device">device %1$d</string>
+    <string name="output_burst">burst %1$d</string>
+    <string name="output_buffer">buffer %1$d</string>
+    <string name="output_xruns">xruns %1$d</string>
+    <string name="output_low_latency">low latency</string>
+    <string name="backend_aaudio" translatable="false">AAudio</string>
+    <string name="cache_size_gb">%1$d GB</string>
+    <string name="cache_size_label">Cache size</string>
+    <string name="cache_keep_label">Keep songs for</string>
+    <string name="cache_keep_forever">Forever</string>
+    <string name="cache_loading" tools:ignore="TypographyEllipsis">Loading cache usage...</string>
+    <string name="cache_using">Using %1$s of %2$s</string>
+    <string name="cache_freed">Freed %1$s</string>
+    <string name="cache_mobile_data">Download on mobile data</string>
+    <string name="cache_mobile_data_off">Off: downloads wait for Wi-Fi</string>
+    <string name="cache_clear">Clear cache</string>
+    <string name="cache_clear_title">Clear cache?</string>
+    <string name="cache_clear_message">Removes cached songs that aren\'t downloaded. Downloaded albums and playlists stay.</string>
+    <string name="upload_music">Upload music</string>
+    <string name="upload_music_hint">Copy songs from this phone to your bucket</string>
+    <string name="sync_button">Sync playlists &amp; favorites</string>
+    <string name="sync_applied">Applied %1$s, %2$s</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="about_audio_output">Audio output: AAudio</string>
+    <string name="about_licenses">Open-source licenses</string>
+    <string name="licenses_loading">Loading…</string>
+    <string name="licenses_unavailable">The license text could not be loaded.</string>
+
+    <!-- Errors shown to the user -->
+    <string name="error_load_generic">Could not load this.</string>
+    <string name="error_generic">Something went wrong.</string>
+    <string name="error_scan">The scan failed.</string>
+    <string name="error_not_configured">Connect a bucket in Settings first.</string>
+    <string name="error_access_denied">The bucket rejected the credentials. Check the key ID, secret key and bucket name.</string>
+    <string name="error_not_found">Not found: %1$s</string>
+    <string name="error_storage">Could not reach the bucket. Check the connection and try again.</string>
+    <string name="error_sync_refused">Sync refused: %1$s</string>
+    <string name="error_favorite">Could not change the favorite.</string>
+    <string name="error_download">Could not change the download.</string>
+    <string name="error_clear_list">Could not clear the list.</string>
+    <string name="error_add_file">Could not add %1$s.</string>
+    <string name="error_read_file">Could not read %1$s.</string>
+    <string name="error_upload_queue">Could not read the upload queue.</string>
+    <string name="error_cancel_upload">Could not cancel the upload.</string>
+    <string name="error_upload_failed">Upload failed.</string>
+    <string name="error_bucket_connect">Could not connect to the bucket.</string>
+    <string name="error_bucket_store">Could not store the bucket settings securely.</string>
+    <string name="error_save_bit_perfect">Could not save the bit-perfect setting.</string>
+    <string name="error_output_settings">Could not change the output settings.</string>
+    <string name="error_cache_save">Could not save the cache settings.</string>
+    <string name="error_cache_clear">Could not clear the cache.</string>
+    <string name="error_cache_read">Could not read the cache.</string>
+    <string name="error_stats">Could not read library stats.</string>
+    <string name="error_sync">Sync failed.</string>
+    <string name="file_name_fallback">audio file</string>
+    <string name="usb_dac_fallback_name">USB audio</string>
 </resources>

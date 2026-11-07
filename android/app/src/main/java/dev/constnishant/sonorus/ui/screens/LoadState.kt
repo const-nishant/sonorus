@@ -1,5 +1,7 @@
 package dev.constnishant.sonorus.ui.screens
 
+import android.content.Context
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
@@ -23,17 +25,17 @@ sealed interface LoadState<out T> {
  * Runs [block] (which calls the core through the repository) and stores its result as
  * [LoadState.Ready], or [LoadState.Failed] when it throws a [CoreException].
  */
-internal suspend fun <T> MutableStateFlow<LoadState<T>>.refresh(block: suspend () -> T) {
+internal suspend fun <T> MutableStateFlow<LoadState<T>>.refresh(context: Context, block: suspend () -> T) {
     value = try {
         LoadState.Ready(block())
     } catch (e: CoreException) {
-        LoadState.Failed(e.displayMessage())
+        LoadState.Failed(e.displayMessage(context))
     }
 }
 
 /** A message for a core failure. */
-internal fun Throwable.displayMessage(): String = when (this) {
-    is CoreException -> userMessage("Could not load this.")
+internal fun Throwable.displayMessage(context: Context): String = when (this) {
+    is CoreException -> userMessage(context, R.string.error_load_generic)
     else -> message?.takeIf { it.isNotBlank() } ?: toString()
 }
 

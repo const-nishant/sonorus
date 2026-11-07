@@ -1,6 +1,5 @@
 package dev.constnishant.sonorus.ui.player
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Favorite
@@ -47,21 +45,25 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.RepeatMode
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.PlaybackUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.Artwork
+import dev.constnishant.sonorus.ui.components.SonorusChip
 import dev.constnishant.sonorus.ui.components.formatDuration
 import dev.constnishant.sonorus.ui.components.isHiRes
 import dev.constnishant.sonorus.ui.components.qualityLabel
+import dev.constnishant.sonorus.ui.theme.tabular
 
 /**
  * Full-screen player. [onBack] collapses it, [onAlbum] and [onArtist] open the album or artist of
@@ -75,7 +77,7 @@ fun NowPlayingScreen(
     modifier: Modifier = Modifier,
 ) {
     val repository = LocalContext.current.repository
-    val viewModel: NowPlayingViewModel = viewModel { NowPlayingViewModel(repository) }
+    val viewModel: NowPlayingViewModel = viewModel { NowPlayingViewModel(checkNotNull(this[APPLICATION_KEY]), repository) }
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val track = playback.track
     var showQueue by rememberSaveable { mutableStateOf(false) }
@@ -92,10 +94,10 @@ fun NowPlayingScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Collapse")
+                Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = stringResource(R.string.cd_collapse))
             }
             Text(
-                text = "Now playing",
+                text = stringResource(R.string.now_playing_title),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -108,7 +110,7 @@ fun NowPlayingScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "Nothing is playing",
+                    text = stringResource(R.string.now_playing_empty),
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -126,7 +128,7 @@ fun NowPlayingScreen(
         TextButton(onClick = { showQueue = true }) {
             Icon(Icons.Rounded.QueueMusic, contentDescription = null)
             Spacer(Modifier.width(8.dp))
-            Text("Up next")
+            Text(stringResource(R.string.now_playing_up_next))
         }
     }
 
@@ -147,7 +149,7 @@ private fun NowPlayingBody(
     val favoriteOverride by viewModel.favoriteOverride.collectAsStateWithLifecycle()
     val favorite = favoriteOverride?.takeIf { it.trackId == track.id }?.favorite ?: track.isFavorite
     val hiRes = track.isHiRes()
-    val quality = playback.stream?.label ?: track.qualityLabel()
+    val quality = playback.stream?.label ?: track.qualityLabel(LocalContext.current)
     val busy = playback.state.isBusy()
     val playing = playback.state.showsPause()
     val signalPath by viewModel.signalPath.collectAsStateWithLifecycle()
@@ -160,7 +162,7 @@ private fun NowPlayingBody(
         path = track.coverPath,
         contentDescription = null,
         modifier = Modifier.fillMaxWidth().aspectRatio(1f),
-        cornerRadius = 16.dp,
+        shape = MaterialTheme.shapes.large,
     )
     Spacer(Modifier.height(24.dp))
 
@@ -168,12 +170,16 @@ private fun NowPlayingBody(
         val seconds = (recovery.retryInMs + 999UL) / 1000UL
         Surface(
             modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-            shape = RoundedCornerShape(12.dp),
+            shape = MaterialTheme.shapes.medium,
             color = MaterialTheme.colorScheme.errorContainer,
             contentColor = MaterialTheme.colorScheme.onErrorContainer,
         ) {
             Text(
-                text = "Connection lost — retrying in ${seconds}s (attempt ${recovery.attempt})",
+                text = stringResource(
+                    R.string.now_playing_retrying,
+                    seconds.toLong(),
+                    recovery.attempt.toLong(),
+                ),
                 modifier = Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -211,7 +217,11 @@ private fun NowPlayingBody(
         IconButton(onClick = { viewModel.setFavorite(track.id, !favorite) }) {
             Icon(
                 imageVector = if (favorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                contentDescription = if (favorite) "Remove from favorites" else "Add to favorites",
+                contentDescription = if (favorite) {
+                    stringResource(R.string.cd_remove_from_favorites)
+                } else {
+                    stringResource(R.string.cd_add_to_favorites)
+                },
                 tint = if (favorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -224,19 +234,7 @@ private fun NowPlayingBody(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (quality != null) {
-                val tint = if (hiRes) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color.Transparent,
-                    contentColor = tint,
-                    border = BorderStroke(1.dp, tint),
-                ) {
-                    Text(
-                        text = quality,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                }
+                SonorusChip(text = quality, accent = hiRes)
             }
             if (pathChip != null) {
                 SignalPathChip(path = pathChip, onClick = { showSignalPath = true })
@@ -264,12 +262,16 @@ private fun NowPlayingBody(
         IconButton(onClick = viewModel::toggleShuffle) {
             Icon(
                 Icons.Rounded.Shuffle,
-                contentDescription = "Shuffle",
+                contentDescription = stringResource(R.string.cd_shuffle),
                 tint = if (playback.shuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         IconButton(onClick = viewModel::previous, modifier = Modifier.size(56.dp)) {
-            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(36.dp))
+            Icon(
+                Icons.Rounded.SkipPrevious,
+                contentDescription = stringResource(R.string.cd_previous),
+                modifier = Modifier.size(36.dp),
+            )
         }
         FilledIconButton(
             onClick = viewModel::togglePlayPause,
@@ -284,19 +286,27 @@ private fun NowPlayingBody(
             } else {
                 Icon(
                     imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                    contentDescription = if (playing) "Pause" else "Play",
+                    contentDescription = if (playing) {
+                        stringResource(R.string.cd_pause)
+                    } else {
+                        stringResource(R.string.cd_play)
+                    },
                     modifier = Modifier.size(36.dp),
                 )
             }
         }
         IconButton(onClick = viewModel::next, modifier = Modifier.size(56.dp)) {
-            Icon(Icons.Rounded.SkipNext, contentDescription = "Next", modifier = Modifier.size(36.dp))
+            Icon(
+                Icons.Rounded.SkipNext,
+                contentDescription = stringResource(R.string.cd_next),
+                modifier = Modifier.size(36.dp),
+            )
         }
         IconButton(onClick = viewModel::cycleRepeat) {
             val repeatOn = playback.repeat != RepeatMode.OFF
             Icon(
                 imageVector = if (playback.repeat == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-                contentDescription = "Repeat",
+                contentDescription = stringResource(R.string.cd_repeat),
                 tint = if (repeatOn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -331,7 +341,7 @@ private fun SeekBar(playback: PlaybackUi, onSeek: (Long) -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(
             text = formatDuration(shownMs),
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelMedium.tabular(),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
@@ -340,7 +350,7 @@ private fun SeekBar(playback: PlaybackUi, onSeek: (Long) -> Unit) {
             } else {
                 "-" + formatDuration((duration - shownMs).coerceAtLeast(0L))
             },
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelMedium.tabular(),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.End,
         )

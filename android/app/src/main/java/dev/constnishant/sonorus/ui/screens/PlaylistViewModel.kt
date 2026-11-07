@@ -1,7 +1,9 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.PlaylistEntryInfo
 import dev.constnishant.sonorus.core.PlaylistInfo
@@ -24,9 +26,11 @@ data class PlaylistData(val playlist: PlaylistInfo, val entries: List<PlaylistEn
  * entries (remove, move, rename, delete).
  */
 class PlaylistViewModel(
+    application: Application,
     private val repository: SonorusRepository,
     private val playlistId: Long,
-) : ViewModel() {
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow<LoadState<PlaylistData>>(LoadState.Loading)
 
     /** The playlist, or the reason it could not be loaded. */
@@ -43,7 +47,7 @@ class PlaylistViewModel(
     init {
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
-                _state.refresh {
+                _state.refresh(context) {
                     repository.call { core ->
                         val playlist = core.playlists().firstOrNull { it.id == playlistId }
                             ?: throw CoreException.NotFound("playlist $playlistId")
@@ -80,7 +84,7 @@ class PlaylistViewModel(
             try {
                 repository.setPlaylistPinned(playlistId, pinned)
             } catch (e: CoreException) {
-                repository.events.emitError(e.userMessage("Could not change the download."))
+                repository.events.emitError(e.userMessage(context, R.string.error_download))
             }
             refreshPin()
         }

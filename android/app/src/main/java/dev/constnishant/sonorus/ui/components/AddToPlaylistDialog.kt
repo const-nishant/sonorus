@@ -14,12 +14,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -29,7 +29,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.PlaylistInfo
 import dev.constnishant.sonorus.data.repository
@@ -50,12 +52,13 @@ fun AddToPlaylistDialog(
     onDismiss: () -> Unit,
     actions: TrackActions,
 ) {
-    val repository = LocalContext.current.repository
+    val context = LocalContext.current
+    val repository = context.repository
     val playlists by produceState<LoadState<List<PlaylistInfo>>>(LoadState.Loading, repository) {
         value = try {
             LoadState.Ready(repository.call { core -> core.playlists() })
         } catch (e: CoreException) {
-            LoadState.Failed(e.displayMessage())
+            LoadState.Failed(e.displayMessage(context))
         }
     }
     var creating by remember { mutableStateOf(false) }
@@ -64,7 +67,7 @@ fun AddToPlaylistDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add to playlist") },
+        title = { Text(stringResource(R.string.add_to_playlist_title)) },
         text = {
             Column(
                 Modifier
@@ -91,7 +94,7 @@ fun AddToPlaylistDialog(
                             Column {
                                 Text(playlist.name, maxLines = 1)
                                 Text(
-                                    "${playlist.trackCount} tracks",
+                                    tracksText(playlist.trackCount.toInt()),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -108,13 +111,13 @@ fun AddToPlaylistDialog(
                 ) {
                     Icon(Icons.Rounded.Add, contentDescription = null)
                     Spacer(Modifier.size(16.dp))
-                    Text("New playlist")
+                    Text(stringResource(R.string.playlist_new_title))
                 }
                 if (creating) {
                     OutlinedTextField(
                         value = newName,
                         onValueChange = { newName = it },
-                        label = { Text("Playlist name") },
+                        label = { Text(stringResource(R.string.playlist_name_label)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -129,11 +132,11 @@ fun AddToPlaylistDialog(
                         actions.createPlaylistAndAdd(trimmed, trackIds)
                         onDismiss()
                     },
-                ) { Text("Create") }
+                ) { Text(stringResource(R.string.action_create)) }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
         },
     )
 }

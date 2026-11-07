@@ -1,6 +1,7 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.ArtistInfo
@@ -16,9 +17,11 @@ data class ArtistData(val artist: ArtistInfo, val albums: List<AlbumInfo>)
 
 /** Backs the Artist screen: loads the artist and their albums, and plays all their tracks. */
 class ArtistViewModel(
+    application: Application,
     private val repository: SonorusRepository,
     private val artistId: Long,
-) : ViewModel() {
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow<LoadState<ArtistData>>(LoadState.Loading)
 
     /** The artist, or the reason it could not be loaded. */
@@ -27,7 +30,7 @@ class ArtistViewModel(
     init {
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
-                _state.refresh {
+                _state.refresh(context) {
                     repository.call { core -> ArtistData(core.artist(artistId), core.artistAlbums(artistId)) }
                 }
             }

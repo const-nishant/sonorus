@@ -12,10 +12,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.dp
 import coil3.compose.SubcomposeAsyncImage
 import java.io.File
 
@@ -28,9 +26,8 @@ fun Artwork(
     path: String?,
     contentDescription: String?,
     modifier: Modifier = Modifier,
-    cornerRadius: Dp = 8.dp,
+    shape: Shape = MaterialTheme.shapes.small,
 ) {
-    val shape = RoundedCornerShape(cornerRadius)
     Box(modifier.clip(shape).background(MaterialTheme.colorScheme.surfaceVariant)) {
         if (path != null) {
             SubcomposeAsyncImage(

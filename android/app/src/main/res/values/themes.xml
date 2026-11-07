@@ -1,5 +1,15 @@
 <resources>
-    <style name="Theme.Sonorus" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
+    <!-- Launch splash: shown until MainActivity calls installSplashScreen(), then swaps to Theme.Sonorus. -->
+    <style name="Theme.Sonorus.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#0E1014</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.Sonorus</item>
+    </style>
+
+    <!-- Light window background matches the light color scheme in ui/theme/Theme.kt. -->
+    <style name="Theme.Sonorus" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F6F8FA</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
 </resources>

@@ -18,8 +18,8 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -31,13 +31,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.data.DownloadsUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.Artwork
@@ -55,6 +58,7 @@ import dev.constnishant.sonorus.ui.components.isHiRes
 import dev.constnishant.sonorus.ui.components.qualityLabel
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 import dev.constnishant.sonorus.ui.components.rememberTrackActions
+import dev.constnishant.sonorus.ui.components.songsText
 
 /**
  * The Album screen: cover and details, Play / Shuffle, and the track list grouped under disc
@@ -70,7 +74,7 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
     val repository = LocalContext.current.repository
     val viewModel: AlbumViewModel = viewModel(
         key = "album-$albumId",
-        factory = viewModelFactory { initializer { AlbumViewModel(repository, albumId) } },
+        factory = viewModelFactory { initializer { AlbumViewModel(checkNotNull(this[APPLICATION_KEY]), repository, albumId) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val pin by viewModel.pin.collectAsStateWithLifecycle()
@@ -91,7 +95,7 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
         when (val s = state) {
             LoadState.Loading -> LoadingContent(Modifier.padding(padding))
             is LoadState.Failed -> CenteredContent(Modifier.padding(padding)) {
-                EmptyState(Icons.Rounded.ErrorOutline, "Couldn't open album", s.message)
+                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.album_open_failed), s.message)
             }
             is LoadState.Ready -> AlbumContent(
                 data = s.value,
@@ -140,7 +144,7 @@ private fun AlbumContent(
                     path = album.coverPath,
                     contentDescription = album.title,
                     modifier = Modifier.size(200.dp),
-                    cornerRadius = 12.dp,
+                    shape = MaterialTheme.shapes.medium,
                 )
                 Spacer(Modifier.height(16.dp))
                 Text(
@@ -160,14 +164,14 @@ private fun AlbumContent(
                 Text(
                     listOfNotNull(
                         album.year?.toString(),
-                        "${album.trackCount} songs",
-                        formatTotal(album.durationMs.toLong()),
+                        songsText(album.trackCount.toInt()),
+                        formatTotal(LocalContext.current, album.durationMs.toLong()),
                     ).joinToString(" · "),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
                 )
-                val quality = first?.qualityLabel()
+                val quality = first?.qualityLabel(LocalContext.current)
                 if (first != null && quality != null) {
                     Text(
                         quality,
@@ -184,12 +188,12 @@ private fun AlbumContent(
                     Button(onClick = { onPlayAll(false) }, enabled = tracks.isNotEmpty()) {
                         Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                        Text("Play")
+                        Text(stringResource(R.string.action_play))
                     }
                     OutlinedButton(onClick = { onPlayAll(true) }, enabled = tracks.isNotEmpty()) {
                         Icon(Icons.Rounded.Shuffle, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                        Text("Shuffle")
+                        Text(stringResource(R.string.action_shuffle))
                     }
                     DownloadToggle(state = pin, onSetPinned = onSetPinned)
                 }
@@ -200,7 +204,8 @@ private fun AlbumContent(
             if (multiDisc && (index == 0 || tracks[index - 1].discNo != track.discNo)) {
                 item(key = "disc-$index") {
                     Text(
-                        track.discNo?.let { "Disc $it" } ?: "Other tracks",
+                        track.discNo?.let { stringResource(R.string.album_disc_number, it) }
+                            ?: stringResource(R.string.album_other_tracks),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),

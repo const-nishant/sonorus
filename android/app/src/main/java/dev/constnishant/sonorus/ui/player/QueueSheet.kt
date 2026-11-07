@@ -28,9 +28,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.constnishant.sonorus.R
 
 /**
  * The play queue as a bottom sheet. Tapping an entry jumps to it; the buttons on each row move it
@@ -48,13 +50,13 @@ fun QueueSheet(viewModel: NowPlayingViewModel, onDismiss: () -> Unit) {
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Text(
-            text = "Up next",
+            text = stringResource(R.string.now_playing_up_next),
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
         )
         if (playback.queue.isEmpty()) {
             Text(
-                text = "The queue is empty.",
+                text = stringResource(R.string.queue_empty),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
@@ -71,8 +73,8 @@ fun QueueSheet(viewModel: NowPlayingViewModel, onDismiss: () -> Unit) {
                 QueueRow(
                     title = when {
                         track != null -> track.title
-                        known -> "Unavailable"
-                        else -> "Loading..."
+                        known -> stringResource(R.string.queue_unavailable)
+                        else -> stringResource(R.string.queue_loading)
                     },
                     subtitle = track?.artist,
                     isCurrent = item.entryId == playback.entryId,
@@ -113,7 +115,7 @@ private fun QueueRow(
         if (isCurrent) {
             Icon(
                 imageVector = Icons.Rounded.QueueMusic,
-                contentDescription = "Now playing",
+                contentDescription = stringResource(R.string.cd_now_playing),
                 tint = accent,
                 modifier = Modifier.size(20.dp),
             )
@@ -138,13 +140,13 @@ private fun QueueRow(
             }
         }
         IconButton(onClick = onMoveUp, enabled = canMoveUp) {
-            Icon(Icons.Rounded.ArrowUpward, contentDescription = "Move up")
+            Icon(Icons.Rounded.ArrowUpward, contentDescription = stringResource(R.string.cd_move_up))
         }
         IconButton(onClick = onMoveDown, enabled = canMoveDown) {
-            Icon(Icons.Rounded.ArrowDownward, contentDescription = "Move down")
+            Icon(Icons.Rounded.ArrowDownward, contentDescription = stringResource(R.string.cd_move_down))
         }
         IconButton(onClick = onRemove) {
-            Icon(Icons.Rounded.Close, contentDescription = "Remove from queue")
+            Icon(Icons.Rounded.Close, contentDescription = stringResource(R.string.cd_remove_from_queue))
         }
     }
 }

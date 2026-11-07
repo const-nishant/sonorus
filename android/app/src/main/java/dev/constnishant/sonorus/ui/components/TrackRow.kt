@@ -32,11 +32,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.repository
+import dev.constnishant.sonorus.ui.theme.tabular
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -95,7 +98,7 @@ fun TrackRow(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (track.isHiRes()) {
                     Text(
-                        "HI-RES",
+                        stringResource(R.string.badge_hi_res),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.tertiary,
                     )
@@ -103,7 +106,7 @@ fun TrackRow(
                 }
                 Text(
                     formatDuration(track.durationMs?.toLong()),
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodySmall.tabular(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 IconButton(onClick = {
@@ -113,17 +116,21 @@ fun TrackRow(
                 }) {
                     Icon(
                         if (favorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                        contentDescription = if (favorite) "Remove from favorites" else "Add to favorites",
+                        contentDescription = if (favorite) {
+                            stringResource(R.string.cd_remove_from_favorites)
+                        } else {
+                            stringResource(R.string.cd_add_to_favorites)
+                        },
                         tint = if (favorite) primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Box {
                     IconButton(onClick = { menuOpen = true }) {
-                        Icon(Icons.Rounded.MoreVert, contentDescription = "More options")
+                        Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.cd_more_options))
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         DropdownMenuItem(
-                            text = { Text("Play next") },
+                            text = { Text(stringResource(R.string.action_play_next)) },
                             leadingIcon = { Icon(Icons.Rounded.QueuePlayNext, contentDescription = null) },
                             onClick = {
                                 menuOpen = false
@@ -131,7 +138,7 @@ fun TrackRow(
                             },
                         )
                         DropdownMenuItem(
-                            text = { Text("Add to queue") },
+                            text = { Text(stringResource(R.string.action_add_to_queue)) },
                             leadingIcon = { Icon(Icons.Rounded.Queue, contentDescription = null) },
                             onClick = {
                                 menuOpen = false
@@ -139,7 +146,7 @@ fun TrackRow(
                             },
                         )
                         DropdownMenuItem(
-                            text = { Text("Add to playlist…") },
+                            text = { Text(stringResource(R.string.action_add_to_playlist)) },
                             leadingIcon = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, contentDescription = null) },
                             onClick = {
                                 menuOpen = false
@@ -166,7 +173,7 @@ fun TrackRow(
 @Composable
 private fun TrackLeading(track: TrackInfo, number: Int?, showArtwork: Boolean) {
     if (showArtwork) {
-        Artwork(track.coverPath, contentDescription = null, modifier = Modifier.size(48.dp), cornerRadius = 6.dp)
+        Artwork(track.coverPath, contentDescription = null, modifier = Modifier.size(48.dp), shape = MaterialTheme.shapes.small)
     } else if (number != null) {
         Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
             Text(

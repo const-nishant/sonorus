@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon: the Sonorus mark as a white silhouette (the system tints it). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="68"
+    android:viewportHeight="68">
+    <group android:translateX="-20" android:translateY="-20">
+        <path
+            android:pathData="M66.29,62.6 A15,15 0 1,1 66.29,45.4"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="4.6"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M72.84,67.19 A23,23 0 1,1 72.84,40.81"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="4.6"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M78.58,71.21 A30,30 0 1,1 78.58,36.79"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="4.6"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M45.5,54 a8.5,8.5 0 1,0 17,0 a8.5,8.5 0 1,0 -17,0"
+            android:fillColor="#FFFFFF" />
+    </group>
+</vector>

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.provider.OpenableColumns
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CacheSettings
 import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.CoreConfig
@@ -143,7 +144,7 @@ class SonorusRepository(private val app: Context) {
             try {
                 block(core.await())
             } catch (e: CoreException) {
-                events.emitError(e.userMessage("Something went wrong."))
+                events.emitError(e.userMessage(app, R.string.error_generic))
             }
         }
     }
@@ -181,7 +182,7 @@ class SonorusRepository(private val app: Context) {
             } catch (e: CoreException) {
                 // Failures during the scan already arrived as a ScanFailed event; this also
                 // covers the ones before it starts, which send no event. Shown once, in scan state.
-                events.scanFailed(e.userMessage("The scan failed."))
+                events.scanFailed(e.userMessage(app, R.string.error_scan))
             }
         }
     }
@@ -295,11 +296,11 @@ class SonorusRepository(private val app: Context) {
                 val job = sonorus.uploadPrepare(pfd.detachFd(), uri.toString(), name)
                 if (job.state == UploadState.DUPLICATE) duplicates++ else queued++
             } catch (e: CoreException) {
-                skipped += e.userMessage("Could not add $name.")
+                skipped += e.userMessage(app, R.string.error_add_file, name)
             } catch (e: IOException) {
-                skipped += "Could not read $name."
+                skipped += app.getString(R.string.error_read_file, name)
             } catch (e: SecurityException) {
-                skipped += "Could not read $name."
+                skipped += app.getString(R.string.error_read_file, name)
             }
         }
         PrepareResult(queued, duplicates, skipped)
@@ -357,7 +358,7 @@ class SonorusRepository(private val app: Context) {
         }
         return queried?.takeIf { it.isNotBlank() }
             ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-            ?: "audio file"
+            ?: app.getString(R.string.file_name_fallback)
     }
 
     /**

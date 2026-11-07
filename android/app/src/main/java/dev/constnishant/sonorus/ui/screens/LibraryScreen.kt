@@ -13,24 +13,24 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Delete
-import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Person
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,12 +51,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.AlbumSort
 import dev.constnishant.sonorus.core.ArtistInfo
@@ -69,9 +72,15 @@ import dev.constnishant.sonorus.ui.components.ConfirmDialog
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.PlaylistNameDialog
+import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.formatTotal
+import dev.constnishant.sonorus.ui.components.tracksText
 
-private val LIBRARY_TABS = listOf("Albums", "Artists", "Playlists")
+private val LIBRARY_TABS = listOf(
+    R.string.library_tab_albums,
+    R.string.library_tab_artists,
+    R.string.library_tab_playlists,
+)
 
 /**
  * The Library screen with three tabs: albums (sortable grid), artists, and playlists. Playlists
@@ -91,7 +100,7 @@ fun LibraryScreen(
 ) {
     val repository = LocalContext.current.repository
     val viewModel: LibraryViewModel = viewModel(
-        factory = viewModelFactory { initializer { LibraryViewModel(repository) } },
+        factory = viewModelFactory { initializer { LibraryViewModel(checkNotNull(this[APPLICATION_KEY]), repository) } },
     )
     val albums by viewModel.albums.collectAsStateWithLifecycle()
     val sort by viewModel.sort.collectAsStateWithLifecycle()
@@ -104,11 +113,11 @@ fun LibraryScreen(
 
     Scaffold(
         modifier = modifier,
-        topBar = { TopAppBar(title = { Text("Library") }) },
+        topBar = { TopAppBar(title = { Text(stringResource(R.string.library_title)) }) },
         floatingActionButton = {
             if (tab == 2) {
                 FloatingActionButton(onClick = { creating = true }) {
-                    Icon(Icons.Rounded.Add, contentDescription = "New playlist")
+                    Icon(Icons.Rounded.Add, contentDescription = stringResource(R.string.cd_new_playlist))
                 }
             }
         },
@@ -119,7 +128,7 @@ fun LibraryScreen(
                     Tab(
                         selected = tab == index,
                         onClick = { tab = index },
-                        text = { Text(title) },
+                        text = { Text(stringResource(title)) },
                     )
                 }
             }
@@ -143,9 +152,9 @@ fun LibraryScreen(
 
     if (creating) {
         PlaylistNameDialog(
-            title = "New playlist",
+            title = stringResource(R.string.playlist_new_title),
             initialName = "",
-            confirmLabel = "Create",
+            confirmLabel = stringResource(R.string.action_create),
             onConfirm = { name ->
                 viewModel.createPlaylist(name)
                 creating = false
@@ -155,9 +164,9 @@ fun LibraryScreen(
     }
     renaming?.let { playlist ->
         PlaylistNameDialog(
-            title = "Rename playlist",
+            title = stringResource(R.string.playlist_rename_title),
             initialName = playlist.name,
-            confirmLabel = "Rename",
+            confirmLabel = stringResource(R.string.action_rename),
             onConfirm = { name ->
                 viewModel.renamePlaylist(playlist.id, name)
                 renaming = null
@@ -167,9 +176,9 @@ fun LibraryScreen(
     }
     deleting?.let { playlist ->
         ConfirmDialog(
-            title = "Delete playlist?",
-            message = "\"${playlist.name}\" will be removed. Its tracks stay in your library.",
-            confirmLabel = "Delete",
+            title = stringResource(R.string.playlist_delete_title),
+            message = stringResource(R.string.playlist_delete_message, playlist.name),
+            confirmLabel = stringResource(R.string.action_delete),
             onConfirm = {
                 viewModel.deletePlaylist(playlist.id)
                 deleting = null
@@ -190,14 +199,14 @@ private fun AlbumsTab(
     when (state) {
         LoadState.Loading -> LoadingContent()
         is LoadState.Failed -> CenteredContent {
-            EmptyState(Icons.Rounded.ErrorOutline, "Couldn't load albums", state.message)
+            EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.library_albums_failed), state.message)
         }
         is LoadState.Ready -> if (state.value.isEmpty()) {
             CenteredContent {
                 EmptyState(
                     Icons.Rounded.Album,
-                    "No albums yet",
-                    "Scan your bucket in Settings to add music.",
+                    stringResource(R.string.library_no_albums),
+                    stringResource(R.string.scan_bucket_hint),
                 )
             }
         } else {
@@ -231,13 +240,13 @@ private fun SortMenu(sort: AlbumSort, onSort: (AlbumSort) -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            "Sorted by ${sort.label()}",
+            stringResource(R.string.library_sorted_by, sort.label()),
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Box {
             IconButton(onClick = { open = true }) {
-                Icon(Icons.AutoMirrored.Rounded.Sort, contentDescription = "Sort albums")
+                Icon(Icons.AutoMirrored.Rounded.Sort, contentDescription = stringResource(R.string.cd_sort_albums))
             }
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
                 AlbumSort.entries.forEach { option ->
@@ -245,7 +254,7 @@ private fun SortMenu(sort: AlbumSort, onSort: (AlbumSort) -> Unit) {
                         text = { Text(option.label()) },
                         trailingIcon = {
                             if (option == sort) {
-                                Icon(Icons.Rounded.Check, contentDescription = "Selected")
+                                Icon(Icons.Rounded.Check, contentDescription = stringResource(R.string.cd_selected))
                             }
                         },
                         onClick = {
@@ -265,14 +274,14 @@ private fun ArtistsTab(state: LoadState<List<ArtistInfo>>, onArtist: (Long) -> U
     when (state) {
         LoadState.Loading -> LoadingContent()
         is LoadState.Failed -> CenteredContent {
-            EmptyState(Icons.Rounded.ErrorOutline, "Couldn't load artists", state.message)
+            EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.library_artists_failed), state.message)
         }
         is LoadState.Ready -> if (state.value.isEmpty()) {
             CenteredContent {
                 EmptyState(
                     Icons.Rounded.Person,
-                    "No artists yet",
-                    "Scan your bucket in Settings to add music.",
+                    stringResource(R.string.library_no_artists),
+                    stringResource(R.string.scan_bucket_hint),
                 )
             }
         } else {
@@ -284,7 +293,7 @@ private fun ArtistsTab(state: LoadState<List<ArtistInfo>>, onArtist: (Long) -> U
                             Text(artist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         },
                         supportingContent = {
-                            Text("${artist.albumCount} albums · ${artist.trackCount} tracks")
+                            Text(albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()))
                         },
                         leadingContent = { Icon(Icons.Rounded.Person, contentDescription = null) },
                     )
@@ -305,14 +314,14 @@ private fun PlaylistsTab(
     when (state) {
         LoadState.Loading -> LoadingContent()
         is LoadState.Failed -> CenteredContent {
-            EmptyState(Icons.Rounded.ErrorOutline, "Couldn't load playlists", state.message)
+            EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.library_playlists_failed), state.message)
         }
         is LoadState.Ready -> if (state.value.isEmpty()) {
             CenteredContent {
                 EmptyState(
                     Icons.AutoMirrored.Rounded.QueueMusic,
-                    "No playlists yet",
-                    "Tap + to create one, then add tracks from any song menu.",
+                    stringResource(R.string.library_no_playlists),
+                    stringResource(R.string.library_playlists_hint),
                 )
             }
         } else {
@@ -346,21 +355,24 @@ private fun PlaylistRow(
                 path = playlist.coverPath,
                 contentDescription = null,
                 modifier = Modifier.size(56.dp),
-                cornerRadius = 6.dp,
+                shape = MaterialTheme.shapes.small,
             )
         },
         headlineContent = { Text(playlist.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         supportingContent = {
-            Text("${playlist.trackCount} tracks · ${formatTotal(playlist.durationMs.toLong())}")
+            Text(
+                tracksText(playlist.trackCount.toInt()) + " · " +
+                    formatTotal(LocalContext.current, playlist.durationMs.toLong()),
+            )
         },
         trailingContent = {
             Box {
                 IconButton(onClick = { open = true }) {
-                    Icon(Icons.Rounded.MoreVert, contentDescription = "Playlist options")
+                    Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.cd_playlist_options))
                 }
                 DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
                     DropdownMenuItem(
-                        text = { Text("Rename") },
+                        text = { Text(stringResource(R.string.action_rename)) },
                         leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
                         onClick = {
                             open = false
@@ -368,7 +380,7 @@ private fun PlaylistRow(
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("Delete") },
+                        text = { Text(stringResource(R.string.action_delete)) },
                         leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null) },
                         onClick = {
                             open = false
@@ -382,9 +394,12 @@ private fun PlaylistRow(
 }
 
 /** Display name of a sort order. */
-private fun AlbumSort.label(): String = when (this) {
-    AlbumSort.ARTIST -> "Artist"
-    AlbumSort.TITLE -> "Title"
-    AlbumSort.YEAR -> "Year"
-    AlbumSort.RECENTLY_ADDED -> "Recently added"
-}
+@Composable
+private fun AlbumSort.label(): String = stringResource(
+    when (this) {
+        AlbumSort.ARTIST -> R.string.sort_artist
+        AlbumSort.TITLE -> R.string.sort_title
+        AlbumSort.YEAR -> R.string.sort_year
+        AlbumSort.RECENTLY_ADDED -> R.string.sort_recently_added
+    },
+)

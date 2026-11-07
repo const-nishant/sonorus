@@ -12,11 +12,12 @@ import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
-import androidx.core.net.toUri
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import dev.constnishant.sonorus.MainActivity
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.UploadJobInfo
 import dev.constnishant.sonorus.core.UploadState
@@ -95,7 +96,11 @@ class UploadService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val channel = NotificationChannel(CHANNEL_ID, "Uploads", NotificationManager.IMPORTANCE_LOW)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.notif_upload_channel),
+            NotificationManager.IMPORTANCE_LOW,
+        )
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
@@ -164,7 +169,7 @@ class UploadService : Service() {
                 val jobs = try {
                     repository.uploads()
                 } catch (e: CoreException) {
-                    e.userMessage("Could not read the upload queue.")
+                    e.userMessage(applicationContext, R.string.error_upload_queue)
                     emptyList()
                 }
                 val next = if (stopRequested) null else pick(jobs)
@@ -216,7 +221,7 @@ class UploadService : Service() {
             try {
                 repository.cancelUploadNow(job.id)
             } catch (e: CoreException) {
-                e.userMessage("Could not cancel the upload.")
+                e.userMessage(applicationContext, R.string.error_cancel_upload)
             }
             failedCount += 1
         } else {
@@ -231,7 +236,7 @@ class UploadService : Service() {
                 // reports the outcome.
                 Log.w(TAG, "upload job ${job.id} is already running")
             } catch (e: CoreException) {
-                e.userMessage("Upload failed.")
+                e.userMessage(applicationContext, R.string.error_upload_failed)
                 failedCount += 1
             }
         }
@@ -279,8 +284,8 @@ class UploadService : Service() {
     private fun postSummary(): Boolean {
         if (doneCount + failedCount == 0) return false
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .setContentTitle("Upload finished: $doneCount uploaded, $failedCount failed")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(resources.getQuantityString(R.plurals.notif_upload_finished, doneCount, doneCount, failedCount))
             .setContentIntent(openAppIntent())
             .setAutoCancel(true)
             .build()
@@ -309,13 +314,17 @@ class UploadService : Service() {
     private fun ongoingNotification(): Notification {
         val job = current
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("Uploading music")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.notif_upload_title))
             .setContentText(
-                if (job == null) "Preparing uploads" else "$position of $total · ${job.displayName}",
+                if (job == null) {
+                    getString(R.string.notif_upload_preparing)
+                } else {
+                    getString(R.string.notif_upload_position, position, total) + " · " + job.displayName
+                },
             )
             .setContentIntent(openAppIntent())
-            .addAction(0, "Cancel", cancelIntent())
+            .addAction(0, getString(R.string.action_cancel), cancelIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)

@@ -20,8 +20,8 @@ import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -32,18 +32,23 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.AlbumCard
 import dev.constnishant.sonorus.ui.components.BackButton
 import dev.constnishant.sonorus.ui.components.CenteredContent
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
+import dev.constnishant.sonorus.ui.components.albumsText
+import dev.constnishant.sonorus.ui.components.tracksText
 
 /**
  * The Artist screen: name, album and track counts, a Play all button, and the album grid.
@@ -58,7 +63,7 @@ fun ArtistScreen(artistId: Long, onAlbum: (Long) -> Unit, onBack: () -> Unit, mo
     val repository = LocalContext.current.repository
     val viewModel: ArtistViewModel = viewModel(
         key = "artist-$artistId",
-        factory = viewModelFactory { initializer { ArtistViewModel(repository, artistId) } },
+        factory = viewModelFactory { initializer { ArtistViewModel(checkNotNull(this[APPLICATION_KEY]), repository, artistId) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val title = (state as? LoadState.Ready)?.value?.artist?.name.orEmpty()
@@ -75,7 +80,7 @@ fun ArtistScreen(artistId: Long, onAlbum: (Long) -> Unit, onBack: () -> Unit, mo
         when (val s = state) {
             LoadState.Loading -> LoadingContent(Modifier.padding(padding))
             is LoadState.Failed -> CenteredContent(Modifier.padding(padding)) {
-                EmptyState(Icons.Rounded.ErrorOutline, "Couldn't open artist", s.message)
+                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.artist_open_failed), s.message)
             }
             is LoadState.Ready -> ArtistContent(
                 data = s.value,
@@ -106,7 +111,7 @@ private fun ArtistContent(
         item(key = "header", span = { GridItemSpan(maxLineSpan) }) {
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    "${artist.albumCount} albums · ${artist.trackCount} tracks",
+                    albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -117,7 +122,7 @@ private fun ArtistContent(
                 ) {
                     Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                     Spacer(Modifier.size(ButtonDefaults.IconSpacing))
-                    Text("Play all")
+                    Text(stringResource(R.string.action_play_all))
                 }
             }
         }
@@ -125,8 +130,8 @@ private fun ArtistContent(
             item(key = "empty", span = { GridItemSpan(maxLineSpan) }) {
                 EmptyState(
                     Icons.Rounded.Album,
-                    "No albums",
-                    "This artist has no albums in the library.",
+                    stringResource(R.string.artist_no_albums),
+                    stringResource(R.string.artist_no_albums_message),
                 )
             }
         }

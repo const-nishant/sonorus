@@ -1,8 +1,11 @@
 package dev.constnishant.sonorus.ui.settings
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.annotation.StringRes
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.BuildConfig
+import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CacheSettings
 import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.CoreException
@@ -28,15 +31,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Bucket provider presets. Picking one prefills the endpoint pattern and the region hint. */
-enum class BucketProvider(val label: String, val endpointPattern: String, val regionHint: String) {
+enum class BucketProvider(
+    @StringRes val labelRes: Int,
+    val endpointPattern: String,
+    val regionHint: String,
+) {
     /** Backblaze B2: replace `<region>` in the endpoint. */
-    B2("Backblaze B2", "https://s3.<region>.backblazeb2.com", "us-west-004"),
+    B2(R.string.provider_b2, "https://s3.<region>.backblazeb2.com", "us-west-004"),
 
     /** Cloudflare R2: replace `<account-id>` in the endpoint. */
-    R2("Cloudflare R2", "https://<account-id>.r2.cloudflarestorage.com", "auto"),
+    R2(R.string.provider_r2, "https://<account-id>.r2.cloudflarestorage.com", "auto"),
 
     /** Any other S3-compatible service. Nothing is prefilled. */
-    CUSTOM("Custom", "", ""),
+    CUSTOM(R.string.provider_custom, "", ""),
 }
 
 /** The bucket form. Holds the secret in memory only while the screen is alive. */
@@ -113,7 +120,11 @@ private fun buildDefaults(): BucketForm? {
  * State and actions for the settings screen. Core and settings access goes through the repository,
  * which runs it on IO. Field values are never logged.
  */
-class SettingsViewModel(private val repository: SonorusRepository) : ViewModel() {
+class SettingsViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val _state = MutableStateFlow(SettingsUiState())
 
     /** The screen state. */
@@ -238,9 +249,9 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                         saving = false,
                         hasSettings = true,
                         bucketMessage = when {
-                            found -> "Connected"
-                            where != null -> "Connected, but there are no files under \"$where\""
-                            else -> "Connected, but the bucket is empty"
+                            found -> context.getString(R.string.settings_connected)
+                            where != null -> context.getString(R.string.settings_connected_no_files, where)
+                            else -> context.getString(R.string.settings_connected_empty)
                         },
                         bucketFailed = !found,
                     )
@@ -250,7 +261,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                     it.copy(
                         saving = false,
                         hasSettings = it.hasSettings || stored,
-                        bucketMessage = e.userMessage("Could not connect to the bucket."),
+                        bucketMessage = e.userMessage(context, R.string.error_bucket_connect),
                         bucketFailed = true,
                     )
                 }
@@ -260,7 +271,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                 _state.update {
                     it.copy(
                         saving = false,
-                        bucketMessage = "Could not store the bucket settings securely.",
+                        bucketMessage = context.getString(R.string.error_bucket_store),
                         bucketFailed = true,
                     )
                 }
@@ -277,7 +288,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
             _state.update {
                 it.copy(
                     hasSettings = false,
-                    bucketMessage = "Disconnected. The change takes effect after restart.",
+                    bucketMessage = context.getString(R.string.settings_disconnected),
                     bucketFailed = false,
                 )
             }
@@ -306,7 +317,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                 repository.setBitPerfect(enabled)
             } catch (e: IllegalStateException) {
                 _state.update { it.copy(bitPerfect = previous) }
-                repository.events.emitError("Could not save the bit-perfect setting.")
+                repository.events.emitError(context.getString(R.string.error_save_bit_perfect))
             }
         }
     }
@@ -323,7 +334,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
             } catch (e: CoreException) {
                 val saved = withContext(Dispatchers.IO) { repository.output.load() }
                 _state.update { it.copy(output = saved) }
-                repository.events.emitError(e.userMessage("Could not change the output settings."))
+                repository.events.emitError(e.userMessage(context, R.string.error_output_settings))
             }
         }
     }
@@ -364,7 +375,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
 
     private fun revertCache(previous: CacheSettings) {
         _state.update { it.copy(cache = previous) }
-        repository.events.emitError("Could not save the cache settings.")
+        repository.events.emitError(context.getString(R.string.error_cache_save))
     }
 
     /** Deletes the unpinned cached songs and shows how much space was freed. */
@@ -374,13 +385,17 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
             try {
                 val freed = repository.clearCache()
                 _state.update {
-                    it.copy(clearing = false, cacheMessage = "Freed ${formatBytes(freed)}", cacheFailed = false)
+                    it.copy(
+                        clearing = false,
+                        cacheMessage = context.getString(R.string.cache_freed, formatBytes(context, freed)),
+                        cacheFailed = false,
+                    )
                 }
             } catch (e: CoreException) {
                 _state.update {
                     it.copy(
                         clearing = false,
-                        cacheMessage = e.userMessage("Could not clear the cache."),
+                        cacheMessage = e.userMessage(context, R.string.error_cache_clear),
                         cacheFailed = true,
                     )
                 }
@@ -403,8 +418,19 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                 _state.update {
                     it.copy(
                         syncing = false,
-                        syncMessage = "Applied ${summary.playlistsApplied} playlists, " +
-                            "${summary.favoritesApplied} favorites",
+                        syncMessage = context.getString(
+                            R.string.sync_applied,
+                            context.resources.getQuantityString(
+                                R.plurals.sync_playlists_count,
+                                summary.playlistsApplied.toInt(),
+                                summary.playlistsApplied.toInt(),
+                            ),
+                            context.resources.getQuantityString(
+                                R.plurals.sync_favorites_count,
+                                summary.favoritesApplied.toInt(),
+                                summary.favoritesApplied.toInt(),
+                            ),
+                        ),
                         syncFailed = false,
                     )
                 }
@@ -412,7 +438,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                 _state.update {
                     it.copy(
                         syncing = false,
-                        syncMessage = e.userMessage("Sync failed."),
+                        syncMessage = e.userMessage(context, R.string.error_sync),
                         syncFailed = true,
                     )
                 }
@@ -427,7 +453,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
             _state.update { it.copy(cacheUsage = usage) }
         } catch (e: CoreException) {
             _state.update {
-                it.copy(cacheMessage = e.userMessage("Could not read the cache."), cacheFailed = true)
+                it.copy(cacheMessage = e.userMessage(context, R.string.error_cache_read), cacheFailed = true)
             }
         }
     }
@@ -437,7 +463,7 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
             val stats = repository.call { it.stats() }
             _state.update { it.copy(stats = stats, statsError = null) }
         } catch (e: CoreException) {
-            _state.update { it.copy(statsError = e.userMessage("Could not read library stats.")) }
+            _state.update { it.copy(statsError = e.userMessage(context, R.string.error_stats)) }
         }
     }
 }

@@ -1,19 +1,20 @@
 package dev.constnishant.sonorus.ui.screens
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.SearchResult
 import dev.constnishant.sonorus.data.SonorusRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 
@@ -41,7 +42,11 @@ data class SearchUiState(
  * settled query (and again after catalogue changes), and a blank query yields no results.
  */
 @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
-class SearchViewModel(private val repository: SonorusRepository) : ViewModel() {
+class SearchViewModel(
+    application: Application,
+    private val repository: SonorusRepository,
+) : AndroidViewModel(application) {
+    private val context: Application = application
     private val query = MutableStateFlow("")
 
     private val results: Flow<Searched> = combine(
@@ -66,7 +71,7 @@ class SearchViewModel(private val repository: SonorusRepository) : ViewModel() {
         val result: LoadState<SearchResult> = try {
             LoadState.Ready(repository.call { core -> core.search(term, SEARCH_LIMIT) })
         } catch (e: CoreException) {
-            LoadState.Failed(e.displayMessage())
+            LoadState.Failed(e.displayMessage(context))
         }
         return Searched(term, result)
     }
