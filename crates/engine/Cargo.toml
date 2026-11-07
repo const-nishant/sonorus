@@ -1,0 +1,15 @@
+[package]
+name = "sonorus-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sonorus-storage = { workspace = true }
+symphonia = { workspace = true }
+rtrb = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+fastrand = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }

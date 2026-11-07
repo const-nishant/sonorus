@@ -122,6 +122,21 @@ impl Storage {
         &self.bucket
     }
 
+    /// Clone of this handle with the same bucket, but the underlying SDK client has its
+    /// retry policy disabled. Used by the streaming source, which owns its own retry loop.
+    pub fn without_sdk_retries(&self) -> Storage {
+        let config = self
+            .client
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        Storage {
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket: self.bucket.clone(),
+        }
+    }
+
     /// Lists all objects under `prefix` (ListObjectsV2, paginated to completion).
     /// Keys ending with `/` are skipped.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {

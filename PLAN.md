@@ -151,17 +151,121 @@ RequestChecksumCalculation, ResponseChecksumValidation, timeout::TimeoutConfig}`
 - [x] **1.R** Opus review, `cargo check --workspace`, `cargo clippy --workspace`, commit "Phase 1: workspace + sonorus-storage".
 
 ## Phase 2 — `sonorus-engine::source::RangeSource`
-- [ ] 2.1 `crates/engine` crate skeleton (Opus), deps: sonorus-storage, symphonia, tokio, bytes, rtrb, log.
-- [ ] 2.2 `source.rs`: `RemoteObject` trait `{ async fn size(); async fn get_range(start, len) -> Result<Bytes>; }`
-  (impl for `Storage`+key) so the fetcher is testable with an in-memory fake.
-- [ ] 2.3 `RangeSource::open(obj, rt: tokio::runtime::Handle) -> (RangeSource, BufferHandle)`;
-  `impl Read + Seek + MediaSource` (`is_seekable=true`, `byte_len=Some(size)`). Shared state:
-  `Mutex<Window>` + `Condvar` (decode thread only, never audio thread). Chunks 1 MiB keyed by index;
-  window = [pos_chunk-2, pos_chunk+24]; fetcher evicts outside window, never drops in-window chunks on error.
-  Retry: exponential backoff 250 ms → 8 s cap, full jitter, infinite while retryable; non-retryable → last_error +
-  wake reader with error. Seek updates pos + notifies fetcher (tokio `Notify`). Read blocks up to 45 s
-  with no progress → `io::ErrorKind::TimedOut`. Drop → cancel fetcher.
-- [ ] 2.4 `BufferHandle { is_buffering(), buffered_ahead_bytes(), last_error() -> Option<String> }` (atomics + small mutex).
+
+Opus did: `crates/engine` skeleton (deps: sonorus-storage, symphonia 0.6.1 [flac, pcm, wav, aiff, isomp4,
+alac, all-meta], rtrb, tokio, bytes, fastrand, log, thiserror). Symphonia 0.6 trait:
+`symphonia::core::io::MediaSource: Read + Seek + Send + Sync { fn is_seekable(&self) -> bool; fn byte_len(&self) -> Option<u64>; }`.
+
+- [x] **2.1 `crates/storage/src/client.rs`: `Storage::without_sdk_retries(&self) -> Storage`**
+  Clone with `self.client.config().to_builder().retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled()).build()`
+  → `Client::from_conf`. Same bucket. Doc: used by the streaming source, which owns its own retry loop.
+- [x] **2.2 `crates/engine/src/source.rs`** (+ `lib.rs`: `pub mod source;`)
+    ```rust
+    pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+    /// Object that can serve byte ranges. Impl'd for StorageObject; tests use an in-memory fake.
+    pub trait RemoteObject: Send + Sync + 'static {
+        fn get_range(&self, start: u64, len: u64) -> BoxFuture<'_, sonorus_storage::Result<bytes::Bytes>>;
+    }
+    pub struct StorageObject { pub storage: sonorus_storage::Storage, pub key: String }
+    impl RemoteObject for StorageObject { /* Box::pin(async move { self.storage.get_range(&self.key, start, len).await }) */ }
+
+    #[derive(Debug, Clone)]
+    pub struct SourceConfig {
+        pub chunk_size: u64,          // 1 MiB
+        pub chunks_ahead: u64,        // 24
+        pub chunks_behind: u64,       // 2
+        pub read_timeout: Duration,   // 45 s
+        pub backoff_base: Duration,   // 250 ms
+        pub backoff_cap: Duration,    // 8 s
+    }
+    impl Default for SourceConfig { /* values above */ }
+
+    pub struct RangeSource { shared: Arc<Shared>, task: tokio::task::JoinHandle<()> }
+    #[derive(Clone)]
+    pub struct BufferHandle { shared: Arc<Shared> }
+
+    impl RangeSource {
+        /// Spawns the fetcher on `rt`. `size` comes from list/head. Starts fetching chunk 0 immediately.
+        pub fn open(object: Arc<dyn RemoteObject>, size: u64, rt: &tokio::runtime::Handle, config: SourceConfig) -> (RangeSource, BufferHandle);
+        pub fn size(&self) -> u64;
+    }
+    impl std::io::Read for RangeSource {}   // blocking; NEVER call from a tokio worker or the audio thread
+    impl std::io::Seek for RangeSource {}
+    impl symphonia::core::io::MediaSource for RangeSource { is_seekable → true; byte_len → Some(size) }
+    impl Drop for RangeSource { /* state.closed = true; notify fetcher; task.abort() */ }
+
+    impl BufferHandle {
+        pub fn is_buffering(&self) -> bool;          // AtomicBool
+        pub fn buffered_ahead_bytes(&self) -> u64;   // contiguous bytes available from read_pos forward
+        pub fn last_error(&self) -> Option<String>;  // most recent fetch error (cleared on next success)
+        pub fn read_position(&self) -> u64;
+        pub fn size(&self) -> u64;
+    }
+    ```
+    Internal state (private):
+    ```rust
+    struct Shared {
+        size: u64, config: SourceConfig,
+        state: std::sync::Mutex<State>,
+        data_ready: std::sync::Condvar,        // reader waits here; fetcher notify_all()s
+        wake_fetcher: tokio::sync::Notify,     // reader/seek/drop → notify_one()
+        buffering: AtomicBool,
+    }
+    struct State {
+        chunks: BTreeMap<u64, Bytes>,          // chunk index → exactly expected_len(index) bytes
+        read_pos: u64,
+        failed: Option<(u64, String)>,         // non-retryable failure for a chunk index
+        last_error: Option<String>,
+        closed: bool,
+    }
+    ```
+    Definitions: `last_chunk = (size - 1) / chunk_size` (size == 0 → no chunks at all);
+    `expected_len(i) = min(chunk_size, size - i*chunk_size)`; for read position p: `cur = min(p / chunk_size, last_chunk)`;
+    window = `[cur.saturating_sub(behind), min(cur + ahead, last_chunk)]`.
+
+    Fetcher task (`async fn fetch_loop(shared, object)`), loop:
+    1. Lock. If closed → return. Evict chunks outside window. If `failed` is Some and its index is outside the
+       window, clear it. Pick target = first index in `cur..=window_end` not in `chunks` and not the failed index.
+       Unlock (never hold the std Mutex across `.await`).
+    2. No target → `shared.wake_fetcher.notified().await`; continue.
+    3. Fetch target: `let fut = object.get_range(target*chunk_size, expected_len(target)); tokio::pin!(fut);`
+       loop `select! { r = &mut fut => break r, _ = wake_fetcher.notified() => { lock; if closed return;
+       if target is outside the current window → drop fut, continue outer loop; else keep awaiting fut } }`.
+    4. Ok(bytes) with `bytes.len() as u64 == expected_len(target)`: lock; if target still in window insert;
+       `last_error = None`; reset attempt counter; unlock; `data_ready.notify_all()`.
+       Ok with wrong length → treat as a retryable error "short read: got X of Y bytes".
+    5. Err(e) retryable (`e.is_retryable()`): `last_error = Some(e.to_string())`, log::warn, attempt += 1,
+       sleep `fastrand` uniform in `0..=min(cap, base * 2^(attempt-1))` (full jitter, saturating), but the sleep
+       is a `select!` with `wake_fetcher.notified()` so a seek interrupts it. Never touch existing chunks.
+       Retryable errors retry forever (the reader's timeout decides when to give up).
+    6. Err(e) not retryable: lock; `failed = Some((target, e.to_string()))`, `last_error = Some(..)`; unlock;
+       `data_ready.notify_all()`.
+
+    `Read::read(buf)`: empty buf → Ok(0). Lock. `deadline = now + read_timeout`. Loop:
+    - `read_pos >= size` → buffering=false, Ok(0).
+    - `idx = read_pos / chunk_size`; chunk present → copy `n = min(buf.len(), chunk.len() - off)` from offset
+      `off = read_pos - idx*chunk_size`; `read_pos += n`; buffering = false; if `read_pos / chunk_size != idx`
+      notify fetcher (window moved); Ok(n). (One chunk per call is fine; Symphonia's MediaSourceStream buffers.)
+    - `failed == Some((idx, msg))` → Err(io::Error::other(msg)).
+    - `closed` → Err(io::ErrorKind::BrokenPipe).
+    - else buffering = true; notify fetcher; `wait_timeout(guard, deadline - now)`; if now >= deadline →
+      buffering stays true, Err(io::Error::new(TimedOut, "no data for {read_timeout:?}")).
+    Poisoned mutex → Err(io::Error::other("source state poisoned")) (no unwrap).
+
+    `Seek::seek`: Start(n) → n; Current(d)/End(d) relative to read_pos/size with checked i64 math; negative or
+    overflow → Err(InvalidInput). Positions past size are allowed (reads return 0). Set read_pos; if the new
+    position's chunk differs from `failed`'s index, clear `failed`; notify fetcher. Ok(new_pos).
+    `buffered_ahead_bytes`: sum from read_pos forward over consecutive present chunks (first one counted from
+    the in-chunk offset), stop at first gap.
+
+    Tests (`#[cfg(test)]`, plain `#[test]` + `tokio::runtime::Runtime::new()` whose handle is passed in; the
+    blocking reads run on the test thread, outside the runtime). Fake `MemObject { data: Bytes,
+    fail_plan: Mutex<VecDeque<StorageError>> }` pops one planned error per call before serving. Use small config
+    (chunk 1024, ahead 4, behind 1, timeout 2 s, backoff 1–10 ms). Cases: full sequential read of 10_000 random
+    bytes equals data (read_to_end); seek(Start(5000)) then read matches; SeekFrom::End(-10); 3 planned
+    Network errors then success still reads correctly and last_error is cleared; a planned NotFound → read
+    returns Err; size 0 → read returns 0 immediately; fake that never returns (pending forever) with
+    timeout 200 ms → read Err TimedOut and is_buffering() true.
 
 ## Phase 3 — `engine::decoder::TrackDecoder`
 - [ ] 3.1 `TrackDecoder::new(source: Box<dyn MediaSource>, ext_hint: Option<&str>) -> Result<Self>`; probe with hint,
@@ -189,7 +293,7 @@ RequestChecksumCalculation, ResponseChecksumValidation, timeout::TimeoutConfig}`
 
 ## Phase 6 — `sonorus-library`
 - [ ] 6.1 schema + migrations (rusqlite bundled): tracks, albums, artists, covers, scan_state.
-- [ ] 6.2 bucket scan: list_audio, diff by etag/size, fetch head bytes (first 1 MiB, + tail for m4a) → lofty tags.
+- [ ] 6.2 bucket scan under optional `SONORUS_S3_PREFIX` (bucket is shared with other files): list_audio, diff by etag/size, fetch head bytes (first 1 MiB, + tail for m4a) → lofty tags.
 - [ ] 6.3 cover art extract (embedded or `cover.jpg` in folder) → cache dir, thumbnail later in Kotlin.
 - [ ] 6.4 queries: albums, artists, tracks by album, search (FTS5 over title/artist/album).
 

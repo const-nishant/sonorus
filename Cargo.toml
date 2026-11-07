@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/storage"]
+members = ["crates/storage", "crates/engine"]
 
 [workspace.package]
 edition = "2024"
@@ -16,3 +16,6 @@ thiserror = "2"
 fastrand = "2"
 log = "0.4"
 dotenvy = "0.15"
+symphonia = { version = "0.6", default-features = false, features = ["flac", "pcm", "wav", "aiff", "isomp4", "alac", "all-meta", "opt-simd"] }
+rtrb = "0.4"
+sonorus-storage = { path = "crates/storage" }
