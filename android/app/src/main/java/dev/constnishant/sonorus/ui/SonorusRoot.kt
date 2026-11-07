@@ -42,6 +42,7 @@ import dev.constnishant.sonorus.ui.screens.LibraryScreen
 import dev.constnishant.sonorus.ui.screens.PlaylistScreen
 import dev.constnishant.sonorus.ui.screens.SearchScreen
 import dev.constnishant.sonorus.ui.settings.SettingsScreen
+import dev.constnishant.sonorus.ui.uploads.UploadsScreen
 
 private data class TopLevelTab(val route: String, val label: String, val icon: ImageVector)
 
@@ -175,7 +176,13 @@ fun SonorusRoot() {
                 )
             }
             composable(Routes.SETTINGS) {
-                SettingsScreen(onBack = { navController.popBackStack() })
+                SettingsScreen(
+                    onBack = { navController.popBackStack() },
+                    onUploads = { navController.navigate(Routes.UPLOADS) },
+                )
+            }
+            composable(Routes.UPLOADS) {
+                UploadsScreen(onBack = { navController.popBackStack() })
             }
         }
     }

@@ -7,6 +7,7 @@ object Routes {
     const val SEARCH = "search"
     const val NOW_PLAYING = "now_playing"
     const val SETTINGS = "settings"
+    const val UPLOADS = "uploads"
 
     const val ARG_ID = "id"
     const val ALBUM = "album/{$ARG_ID}"

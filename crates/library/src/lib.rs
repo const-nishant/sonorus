@@ -11,6 +11,7 @@ pub mod remote;
 pub mod scan;
 pub mod sync;
 pub mod tags;
+pub mod uploads;
 
 pub use db::Library;
 pub use error::{LibraryError, Result};

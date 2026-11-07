@@ -17,6 +17,8 @@ sonorus-library = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"

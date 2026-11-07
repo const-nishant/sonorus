@@ -2341,6 +2341,8 @@ name = "sonorus-core"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "blake3",
+ "bytes",
  "dotenvy",
  "log",
  "sonorus-engine",

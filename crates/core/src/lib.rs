@@ -12,6 +12,7 @@ pub mod error;
 pub mod events;
 pub mod router;
 pub mod types;
+mod upload;
 
 pub use crate::core::SonorusCore;
 pub use error::CoreError;

@@ -11,6 +11,7 @@
 //! - The `backend` lock is never held across a blocking call.
 
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -28,10 +29,11 @@ use sonorus_engine::player::{Player, PlayerConfig};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_engine::source::SourceConfig;
 use sonorus_library::sync::sync_user_data as run_user_data_sync;
+use sonorus_library::uploads;
 use sonorus_library::{
     BucketSource, BucketStore, DirSource, Library, MetaSource, ScanProgress, Track, scan,
 };
-use sonorus_storage::Storage;
+use sonorus_storage::{ObjectMeta, Storage};
 use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
@@ -43,6 +45,11 @@ use crate::types::{
     AlbumInfo, AlbumSort, ArtistInfo, Converter, CoreConfig, CoreEvent, LibraryStatsInfo,
     OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, RepeatMode, S3Settings,
     ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SyncSummary, TrackInfo,
+    UploadJobInfo,
+};
+use crate::upload::{
+    CancelRoute, RunEnv, UploadClaim, UploadControl, cancel_job, prepare_job, request_cancel,
+    run_job, take_fd,
 };
 
 /// Concurrent tag reads during a scan.
@@ -120,6 +127,8 @@ pub struct SonorusCore {
     router: Mutex<Option<Arc<dyn RoutePlanner>>>,
     /// Option only so that `Drop` can shut it down. Always `Some` while the core is alive.
     rt: Option<Runtime>,
+    /// Which upload jobs have a run or cancel in progress, and which were asked to stop.
+    upload_control: Mutex<UploadControl>,
 }
 
 #[uniffi::export]
@@ -150,6 +159,7 @@ impl SonorusCore {
             output: Mutex::new(OutputSettings::default()),
             router: Mutex::new(None),
             rt: Some(rt),
+            upload_control: Mutex::new(UploadControl::default()),
         }))
     }
 
@@ -434,6 +444,105 @@ impl SonorusCore {
         Ok(report.into())
     }
 
+    /// Adds a local audio file to the upload queue and returns its job. Blocking.
+    ///
+    /// `fd` is an open file descriptor for the file's content. The core takes ownership of it and
+    /// closes it when this call returns, on every path, so the caller must not close it again.
+    /// The core reads the tags, hashes the whole file and chooses the object key (the bucket
+    /// prefix, the artist, the album, then the track name). Nothing is uploaded yet: run the job
+    /// with `upload_run`. A file whose content is already in the bucket or the queue becomes a
+    /// `Duplicate` job. Fails with `NotConfigured` without a bucket, and with `InvalidConfig` for
+    /// a name that is not a supported audio file, an empty file, or a file that is not audio.
+    pub fn upload_prepare(
+        &self,
+        fd: i32,
+        source_uri: String,
+        display_name: String,
+    ) -> CoreResult<UploadJobInfo> {
+        let mut file = take_fd(fd)?;
+        let (storage, prefix) = self.upload_bucket()?;
+        let rt = self.runtime()?;
+        let mut head = |key: &str| -> CoreResult<Option<ObjectMeta>> {
+            Ok(rt.block_on(storage.head_object_meta(key))?)
+        };
+        prepare_job(
+            &self.library,
+            &prefix,
+            &mut file,
+            &source_uri,
+            &display_name,
+            &mut head,
+        )
+    }
+
+    /// Uploads a queued or failed job, or resumes it from the parts already stored. Blocking; can
+    /// take minutes. Returns the job as it stands afterwards: `Done`, `Duplicate` and `Cancelled`
+    /// jobs return at once. A storage or read error leaves the job `Failed` (not an error here),
+    /// so calling this again resumes it. Progress arrives as `UploadProgress` events and the end
+    /// as `UploadFinished`.
+    ///
+    /// `fd` is an open descriptor for the same file content as at `upload_prepare`; ownership
+    /// passes to the core, as there. Fails with `Busy` while another run or cancel holds the
+    /// job, `NotFound` for an unknown job, `NotConfigured` without a bucket. A source whose size
+    /// changed since preparation fails the job with "source changed".
+    pub fn upload_run(&self, job_id: i64, fd: i32) -> CoreResult<UploadJobInfo> {
+        let file: File = take_fd(fd)?;
+        let _claim =
+            UploadClaim::acquire(&self.upload_control, job_id).ok_or_else(|| CoreError::Busy {
+                detail: format!("upload job {job_id} is already running"),
+            })?;
+        let (storage, _prefix) = self.upload_bucket()?;
+        let env = RunEnv {
+            library: &self.library,
+            rt: self.runtime()?,
+            storage: &storage,
+            listener: &self.listener,
+            control: &self.upload_control,
+        };
+        run_job(&env, job_id, &file).map(UploadJobInfo::from)
+    }
+
+    /// Cancels an upload job. A running job stops at its next part boundary: its partial upload
+    /// is aborted and the job becomes `Cancelled` (this call returns before that). A job that is
+    /// not running is cancelled now, and its partial upload is aborted when a bucket is set (best
+    /// effort). Final jobs are left unchanged. Blocking for the abort. Fails with `NotFound` for
+    /// an unknown job.
+    pub fn upload_cancel(&self, job_id: i64) -> CoreResult<()> {
+        match request_cancel(&self.upload_control, job_id) {
+            CancelRoute::Requested => Ok(()),
+            CancelRoute::Claimed(_claim) => {
+                // Without a bucket the partial upload cannot be aborted here; `cancel_job`
+                // logs that and still marks the job cancelled.
+                let storage = match self.backend_snapshot() {
+                    Some(Backend::Bucket { storage, .. }) => Some(storage),
+                    _ => None,
+                };
+                cancel_job(
+                    &self.library,
+                    &self.listener,
+                    self.runtime()?,
+                    storage.as_ref(),
+                    job_id,
+                )
+            }
+        }
+    }
+
+    /// All upload jobs, newest first. Blocking.
+    pub fn uploads(&self) -> CoreResult<Vec<UploadJobInfo>> {
+        Ok(uploads::list(&self.library)?
+            .into_iter()
+            .map(UploadJobInfo::from)
+            .collect())
+    }
+
+    /// Deletes the upload jobs that are done, duplicate or cancelled, and returns how many were
+    /// deleted. Queued, uploading and failed jobs are kept (a failed job is retried with
+    /// `upload_run` or removed with `upload_cancel`, which aborts its partial upload). Blocking.
+    pub fn clear_finished_uploads(&self) -> CoreResult<u32> {
+        Ok(uploads::delete_finished(&self.library)?)
+    }
+
     /// Replaces the queue with `track_ids` and starts at `start_index` (clamped to the last
     /// index). Unknown ids are skipped. Blocking.
     pub fn play_tracks(&self, track_ids: Vec<i64>, start_index: u32) -> CoreResult<()> {
@@ -599,6 +708,14 @@ impl SonorusCore {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The bucket handle and key prefix uploads write to. `NotConfigured` for any other backend.
+    fn upload_bucket(&self) -> CoreResult<(Storage, String)> {
+        match self.backend_snapshot() {
+            Some(Backend::Bucket { storage, prefix }) => Ok((storage, prefix)),
+            _ => Err(CoreError::NotConfigured),
+        }
     }
 
     /// Fails with `NotConfigured` when no backend is set.

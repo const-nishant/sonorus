@@ -63,7 +63,8 @@ fun QueueSheet(viewModel: NowPlayingViewModel, onDismiss: () -> Unit) {
         LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 600.dp)) {
             itemsIndexed(
                 items = playback.queue,
-                key = { _, item -> item.entryId },
+                // Lazy keys must be Bundle-storable: ULong is not, so the id is passed as a Long.
+                key = { _, item -> item.entryId.toLong() },
             ) { index, item ->
                 val track = tracks[item.trackId]
                 val known = tracks.containsKey(item.trackId)

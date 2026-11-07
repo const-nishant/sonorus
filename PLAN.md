@@ -1150,9 +1150,23 @@ pauses playback (pulled forward from 12.2 so audio never jumps to the speaker).
   Bluetooth AVRCP, a phone call. Next-track start takes ~3 s for a 96 k file from the bucket (no prefetch yet).
 
 ## Phase 13 — Upload
-- [ ] 13.1 SAF picker → copy-free read via fd; lofty tags in Rust; BLAKE3 hash dedupe.
-- [ ] 13.2 upload queue table (upload_id, parts done) → resume via list_parts. Key `Artist/Album/NN - Title.ext`.
-- [ ] 13.3 foreground `UploadService` (dataSync) + progress UI.
+- [x] 13.1 SAF picker → copy-free read via fd; lofty tags in Rust; BLAKE3 hash dedupe.
+- [x] 13.2 upload queue table (upload_id, parts done) → resume via list_parts. Key `Artist/Album/NN - Title.ext`.
+- [x] 13.3 foreground `UploadService` (dataSync) + progress UI.
+  Opus decided: Kotlin detaches the SAF descriptor and the core owns it (`upload_prepare` / `upload_run(job, fd)`);
+  the core never inserts catalogue rows, the service runs the incremental scan once the queue drains. Dedupe: BLAKE3
+  of the whole file against the `uploads` table (done/queued/uploading) and the `x-amz-meta-blake3` of an object
+  already at the target key; a different object there gets ` (2)`, ` (3)`… Key components are sanitized (`/\:*?"<>|`
+  and control chars → `_`, 120-byte cap); `D-NN` when disc_total > 1. Storage failures leave the job Failed with its
+  upload id, so Retry resumes; "Clear finished" keeps failed jobs (they may own a partial multipart upload, which
+  only a retry or a cancel cleans up). `UploadJobInfo.source_uri` lets the service re-open the source after a
+  restart; MainActivity.onStart restarts pending jobs (dataSync may only start from the foreground).
+  Device test (vivo V2338, B2): 88 MB FLAC 24/96 uploaded in 11 parts to
+  `sonorus-test/Anuv Jain/Arz Kiya Hai _ Coke Studio Bharat/01 - … .flac` (`|` sanitized), scanned and played;
+  re-adding it after "Clear finished" → "already uploaded" via the bucket hash; a 68 MB FLAC force-stopped at
+  16 MiB (2 of 9 parts) and resumed on reopen to done, then scanned. Also fixed: the Up next sheet crashed on open
+  (a ULong LazyColumn key is not Bundle-storable).
+  Not tested: Android 15 dataSync timeout, a source deleted between prepare and run, cancel mid-upload.
 
 ## Phase 14 — Offline cache
 - [ ] 14.1 LRU disk cache of whole objects (size cap), RangeSource reads cache first.

@@ -15,6 +15,7 @@ use sonorus_engine::decoder::StreamInfo;
 use sonorus_engine::output::SampleKind;
 use sonorus_engine::player::{PlayerEvent, PlayerState};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
+use sonorus_library::uploads::{UploadRow, UploadState as LibraryUploadState};
 use sonorus_library::{
     Album, AlbumSort as LibraryAlbumSort, Artist, Library, LibraryStats, Playlist, PlaylistEntry,
     ScanProgress, ScanReport, SearchResults, SyncReport, Track,
@@ -360,6 +361,46 @@ pub struct SyncSummary {
     pub favorites_pushed: bool,
 }
 
+/// Where an upload job stands. `Done`, `Duplicate` and `Cancelled` are final; `Failed` jobs can be
+/// resumed by running them again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum UploadState {
+    /// Added, not started.
+    Queued,
+    /// A multipart upload is in progress.
+    Uploading,
+    /// The object is stored in the bucket.
+    Done,
+    /// The same content is already in the bucket or in the queue; nothing was uploaded.
+    Duplicate,
+    /// A storage or read error stopped the upload. Run the job again to resume it.
+    Failed,
+    /// The user cancelled; any partial upload was aborted.
+    Cancelled,
+}
+
+/// One upload job, as shown in the upload queue.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct UploadJobInfo {
+    /// Job id, stable across restarts.
+    pub id: i64,
+    /// File name as the user picked it.
+    pub display_name: String,
+    /// Object key in the bucket (for a duplicate, the key of the existing object).
+    pub key: String,
+    /// Size of the source file in bytes.
+    pub size: u64,
+    /// Bytes of the source stored in the bucket so far.
+    pub bytes_done: u64,
+    /// Current state.
+    pub state: UploadState,
+    /// Short description of the last failure, when the job failed.
+    pub error: Option<String>,
+    /// Where the source was read from (the app's content URI), so the app can re-open it to run
+    /// or resume the job.
+    pub source_uri: String,
+}
+
 /// Events pushed to the foreign `EventListener` by the core's event pump.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreEvent {
@@ -439,6 +480,22 @@ pub enum CoreEvent {
     ScanFailed {
         /// What went wrong.
         message: String,
+    },
+    /// An upload job stored more bytes. Sent after each part, so at most once per part.
+    UploadProgress {
+        /// Upload job id.
+        job_id: i64,
+        /// Source bytes stored in the bucket so far.
+        bytes_done: u64,
+        /// Source file size in bytes.
+        total: u64,
+    },
+    /// An upload run ended: the job is done, failed (resumable), or cancelled.
+    UploadFinished {
+        /// Upload job id.
+        job_id: i64,
+        /// The state the run ended in.
+        state: UploadState,
     },
 }
 
@@ -796,6 +853,34 @@ impl From<LibraryStats> for LibraryStatsInfo {
             artists: s.artists,
             total_bytes: s.total_bytes,
             total_duration_ms: s.total_duration_ms,
+        }
+    }
+}
+
+impl From<LibraryUploadState> for UploadState {
+    fn from(state: LibraryUploadState) -> Self {
+        match state {
+            LibraryUploadState::Queued => UploadState::Queued,
+            LibraryUploadState::Uploading => UploadState::Uploading,
+            LibraryUploadState::Done => UploadState::Done,
+            LibraryUploadState::Duplicate => UploadState::Duplicate,
+            LibraryUploadState::Failed => UploadState::Failed,
+            LibraryUploadState::Cancelled => UploadState::Cancelled,
+        }
+    }
+}
+
+impl From<UploadRow> for UploadJobInfo {
+    fn from(row: UploadRow) -> Self {
+        UploadJobInfo {
+            id: row.id,
+            display_name: row.display_name,
+            key: row.key,
+            size: row.size,
+            bytes_done: row.bytes_done,
+            state: row.state.into(),
+            error: row.error,
+            source_uri: row.source_uri,
         }
     }
 }

@@ -1,5 +1,6 @@
 package dev.constnishant.sonorus.ui.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,6 +16,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
@@ -55,11 +57,12 @@ import dev.constnishant.sonorus.ui.components.formatKhz
 import dev.constnishant.sonorus.ui.components.label
 
 /**
- * Settings: bucket connection, library scan and stats, playlist and favorite sync, and about
- * information. [onBack] returns to the previous screen.
+ * Settings: bucket connection, library scan and stats, music uploads, playlist and favorite sync,
+ * and about information. [onBack] returns to the previous screen; [onUploads] opens the uploads
+ * screen.
  */
 @Composable
-fun SettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun SettingsScreen(onBack: () -> Unit, onUploads: () -> Unit, modifier: Modifier = Modifier) {
     val repository = LocalContext.current.repository
     val viewModel: SettingsViewModel = viewModel { SettingsViewModel(repository) }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -87,6 +90,7 @@ fun SettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             viewModel = viewModel,
         )
         LibrarySection(state = state, scan = scan, onScan = viewModel::startScan)
+        UploadsSection(onUploads = onUploads)
         OutputSection(state = state, viewModel = viewModel)
         SyncSection(state = state, onSync = viewModel::syncUserData)
         AboutSection(version = state.version)
@@ -366,6 +370,33 @@ private fun outputLine(info: OutputInfo): String {
     return "${backendLabel(info.backend)} · ${formatKhz(info.sampleRate)} kHz · ${info.channels} ch · " +
         "$format · $mode$lowLatency · device ${info.deviceId} · burst ${info.framesPerBurst} · " +
         "buffer ${info.bufferFrames} · xruns ${info.xruns}"
+}
+
+@Composable
+private fun UploadsSection(onUploads: () -> Unit) {
+    SectionTitle("Uploads")
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onUploads)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(text = "Upload music", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "Copy songs from this phone to your bucket",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Icon(
+            Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable

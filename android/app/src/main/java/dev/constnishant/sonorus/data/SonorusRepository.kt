@@ -1,6 +1,10 @@
 package dev.constnishant.sonorus.data
 
 import android.content.Context
+import android.content.Intent
+import android.database.Cursor
+import android.net.Uri
+import android.provider.OpenableColumns
 import dev.constnishant.sonorus.core.CoreConfig
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.OutputInfo
@@ -9,10 +13,13 @@ import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.core.SonorusCore
 import dev.constnishant.sonorus.core.SyncSummary
+import dev.constnishant.sonorus.core.UploadJobInfo
+import dev.constnishant.sonorus.core.UploadState
 import dev.constnishant.sonorus.data.audio.UsbAudioRouter
 import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.playback.AudioFocusGuard
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +30,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/**
+ * The outcome of [SonorusRepository.prepareUploads]: how many files were queued, how many were
+ * already in the bucket or the queue, and why each other file was skipped.
+ */
+data class PrepareResult(
+    val queued: Int,
+    val duplicates: Int,
+    /** One user-facing reason per skipped file. */
+    val skipped: List<String>,
+)
 
 /**
  * Entry point to the Rust core for the UI layer.
@@ -188,5 +206,104 @@ class SonorusRepository(private val app: Context) {
      */
     fun notifyLibraryChanged() {
         events.emitLibraryChanged()
+    }
+
+    /**
+     * Adds local audio files to the upload queue. Each file is read and hashed by the core; files
+     * that are already in the bucket or the queue are counted as duplicates. A file that cannot be
+     * added is skipped with its reason, and the others are still added. Blocking reads run on
+     * [Dispatchers.IO].
+     */
+    suspend fun prepareUploads(uris: List<Uri>): PrepareResult = withContext(Dispatchers.IO) {
+        val sonorus = core.await()
+        var queued = 0
+        var duplicates = 0
+        val skipped = mutableListOf<String>()
+        for (uri in uris) {
+            val name = displayName(uri)
+            try {
+                takeReadPermission(uri)
+                val pfd = app.contentResolver.openFileDescriptor(uri, "r")
+                    ?: throw IOException("no descriptor for $name")
+                // The core owns the descriptor from here on, on every path.
+                val job = sonorus.uploadPrepare(pfd.detachFd(), uri.toString(), name)
+                if (job.state == UploadState.DUPLICATE) duplicates++ else queued++
+            } catch (e: CoreException) {
+                skipped += e.userMessage("Could not add $name.")
+            } catch (e: IOException) {
+                skipped += "Could not read $name."
+            } catch (e: SecurityException) {
+                skipped += "Could not read $name."
+            }
+        }
+        PrepareResult(queued, duplicates, skipped)
+    }
+
+    /** All upload jobs, newest first. */
+    suspend fun uploads(): List<UploadJobInfo> = call { it.uploads() }
+
+    /** True when at least one upload is queued or was interrupted while uploading. */
+    suspend fun hasPendingUploads(): Boolean = try {
+        uploads().any { it.state == UploadState.QUEUED || it.state == UploadState.UPLOADING }
+    } catch (e: CoreException) {
+        false
+    }
+
+    /** Deletes the finished upload jobs (done, duplicate or cancelled). Returns how many. */
+    suspend fun clearFinishedUploads(): UInt = call { it.clearFinishedUploads() }
+
+    /**
+     * Cancels an upload job. A running job stops after its current part and then reports
+     * [UploadEvent.Finished]; a queued or failed job is cancelled now. Runs in the background; a
+     * failure is shown through [CoreEvents.errors].
+     */
+    fun cancelUpload(id: Long) {
+        command { sonorus ->
+            sonorus.uploadCancel(id)
+            events.emitUploadsChanged()
+        }
+    }
+
+    /**
+     * Runs upload job [jobId] from the descriptor [fd], which the core takes ownership of. Blocks
+     * for the whole upload; the returned job is `Done`, `Failed`, `Cancelled` or `Duplicate`.
+     */
+    suspend fun runUpload(jobId: Long, fd: Int): UploadJobInfo = call { it.uploadRun(jobId, fd) }
+
+    /**
+     * Cancels job [jobId] and waits until the core has done so, then tells the upload screens.
+     * Throws a [CoreException].
+     */
+    suspend fun cancelUploadNow(jobId: Long) {
+        call { it.uploadCancel(jobId) }
+        events.emitUploadsChanged()
+    }
+
+    /** The name of a picked file: its display name, else the last segment of its URI. */
+    private fun displayName(uri: Uri): String {
+        val queried = try {
+            app.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor: Cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+        } catch (e: SecurityException) {
+            null
+        }
+        return queried?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+            ?: "audio file"
+    }
+
+    /**
+     * Keeps read access to [uri] across restarts, so an interrupted upload can be resumed. Providers
+     * that do not allow it leave the access for this session only.
+     */
+    private fun takeReadPermission(uri: Uri) {
+        try {
+            app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: SecurityException) {
+            // Not persistable: the source may be unreadable after a restart. The job is then
+            // cancelled when it runs.
+        }
     }
 }

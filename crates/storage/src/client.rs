@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use aws_sdk_s3::config::timeout::TimeoutConfig;
@@ -37,6 +38,8 @@ pub struct ObjectMeta {
     pub content_type: Option<String>,
     /// Unix seconds.
     pub last_modified: Option<i64>,
+    /// User metadata (`x-amz-meta-*` headers), keys without the prefix, as stored by the service.
+    pub metadata: HashMap<String, String>,
 }
 
 /// Audio file extensions recognized by [`is_audio_key`] (lowercase, without the dot).
@@ -217,7 +220,18 @@ impl Storage {
             etag: output.e_tag().map(str::to_string),
             content_type: output.content_type().map(str::to_string),
             last_modified: output.last_modified().map(|d| d.secs()),
+            metadata: output.metadata().cloned().unwrap_or_default(),
         })
+    }
+
+    /// [`Storage::head`] with a missing key as `Ok(None)` instead of an error. Other failures
+    /// (network, credentials) are still errors.
+    pub async fn head_object_meta(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        match self.head(key).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
     }
 
     /// Fetches `len` bytes starting at `start` (HTTP Range `bytes=start-(start+len-1)`).

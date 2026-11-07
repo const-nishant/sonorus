@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -100,6 +100,27 @@ CREATE TABLE history (
 );
 CREATE INDEX history_played ON history(played_at);
 CREATE INDEX history_key ON history(track_key);
+";
+
+/// v3: the upload queue. One row per file sent to the bucket from this device. Timestamps are
+/// Unix milliseconds. `state` values are listed in `uploads::UploadState`.
+const SCHEMA_V3: &str = "
+CREATE TABLE uploads (
+    id           INTEGER PRIMARY KEY,
+    source_uri   TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    blake3       TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    upload_id    TEXT,
+    state        TEXT NOT NULL CHECK (state IN ('queued', 'uploading', 'done', 'duplicate', 'failed', 'cancelled')),
+    bytes_done   INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX uploads_blake3 ON uploads(blake3);
 ";
 
 const UPSERT_TRACK_SQL: &str = "
@@ -372,7 +393,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             )),
         )));
     }
-    for (target, sql) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+    for (target, sql) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
         if version < target {
             let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
@@ -927,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_upgrades_to_v2() {
+    fn v1_database_upgrades_to_latest() {
         let dir = TempDir::new();
         let db = dir.path().join("v1.db");
         {
@@ -940,11 +961,46 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, SCHEMA_VERSION);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM playlists", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3_keeping_its_rows() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v2.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO favorites (track_key, favorite, updated_at) VALUES ('a/b.flac', 1, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        let conn = lib.lock();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        let favorites: i64 = conn
+            .query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(favorites, 1);
+        let uploads: i64 = conn
+            .query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uploads, 0);
     }
 
     #[test]

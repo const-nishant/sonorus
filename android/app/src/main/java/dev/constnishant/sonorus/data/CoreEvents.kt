@@ -9,6 +9,7 @@ import dev.constnishant.sonorus.core.ScanProgressInfo
 import dev.constnishant.sonorus.core.ScanSummary
 import dev.constnishant.sonorus.core.StreamInfoRecord
 import dev.constnishant.sonorus.core.TrackInfo
+import dev.constnishant.sonorus.core.UploadState
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,6 +44,18 @@ data class ScanUi(
     val error: String? = null,
 )
 
+/** Upload queue changes as the UI sees them. Built from core events by [CoreEvents]. */
+sealed interface UploadEvent {
+    /** A running upload stored more bytes. */
+    data class Progress(val jobId: Long, val bytesDone: ULong, val total: ULong) : UploadEvent
+
+    /** An upload run ended in [state]: done, failed (resumable) or cancelled. */
+    data class Finished(val jobId: Long, val state: UploadState) : UploadEvent
+
+    /** The queue changed outside a run, for example a job was cancelled while not running. */
+    data object Changed : UploadEvent
+}
+
 /**
  * Receives core events on a Rust thread and turns them into UI state flows.
  *
@@ -76,6 +89,22 @@ class CoreEvents : EventListener {
 
     /** Emits when the catalogue changed (scan finished, sync applied, playlists edited). */
     val libraryChanged: SharedFlow<Unit> = _libraryChanged.asSharedFlow()
+
+    private val _uploadProgress = MutableStateFlow<Map<Long, Pair<ULong, ULong>>>(emptyMap())
+
+    /**
+     * Latest `bytesDone` to `total` for each upload job that is running. An entry is removed when
+     * the job's run ends.
+     */
+    val uploadProgress: StateFlow<Map<Long, Pair<ULong, ULong>>> = _uploadProgress.asStateFlow()
+
+    private val _uploadEvents = MutableSharedFlow<UploadEvent>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /** Upload progress and run ends, and queue changes made outside a run. */
+    val uploadEvents: SharedFlow<UploadEvent> = _uploadEvents.asSharedFlow()
 
     /** Applies a core event. Called on the core's thread; must stay fast and non-blocking. */
     override fun onEvent(event: CoreEvent) {
@@ -126,6 +155,14 @@ class CoreEvents : EventListener {
             is CoreEvent.ScanFailed -> _scan.update {
                 it.copy(running = false, error = it.error ?: event.message)
             }
+            is CoreEvent.UploadProgress -> {
+                _uploadProgress.update { it + (event.jobId to (event.bytesDone to event.total)) }
+                _uploadEvents.tryEmit(UploadEvent.Progress(event.jobId, event.bytesDone, event.total))
+            }
+            is CoreEvent.UploadFinished -> {
+                _uploadProgress.update { it - event.jobId }
+                _uploadEvents.tryEmit(UploadEvent.Finished(event.jobId, event.state))
+            }
         }
     }
 
@@ -158,5 +195,10 @@ class CoreEvents : EventListener {
     /** Publishes a library-changed notification to [libraryChanged]. */
     internal fun emitLibraryChanged() {
         _libraryChanged.tryEmit(Unit)
+    }
+
+    /** Publishes [UploadEvent.Changed] to [uploadEvents]. */
+    internal fun emitUploadsChanged() {
+        _uploadEvents.tryEmit(UploadEvent.Changed)
     }
 }

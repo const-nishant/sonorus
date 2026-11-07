@@ -38,15 +38,28 @@ fn part_count(size: u64) -> u32 {
 impl Storage {
     /// Starts a multipart upload and returns its upload id.
     pub async fn create_multipart(&self, key: &str, content_type: &str) -> Result<String> {
-        let output = self
+        self.create_multipart_with_meta(key, content_type, &[])
+            .await
+    }
+
+    /// Starts a multipart upload that stores the given user metadata (`(name, value)` pairs,
+    /// sent as `x-amz-meta-<name>`) with the object, and returns its upload id.
+    pub async fn create_multipart_with_meta(
+        &self,
+        key: &str,
+        content_type: &str,
+        meta: &[(&str, &str)],
+    ) -> Result<String> {
+        let mut request = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
-            .content_type(content_type)
-            .send()
-            .await
-            .map_err(|e| from_sdk(e, key))?;
+            .content_type(content_type);
+        for (name, value) in meta {
+            request = request.metadata(*name, *value);
+        }
+        let output = request.send().await.map_err(|e| from_sdk(e, key))?;
         output
             .upload_id()
             .map(str::to_string)
@@ -54,6 +67,39 @@ impl Storage {
                 status: None,
                 message: "missing upload id".into(),
             })
+    }
+
+    /// Lists the parts already stored for an upload, across all pages, in part-number order.
+    /// An unknown upload id (the upload was aborted or has expired) → `StorageError::NotFound`.
+    pub async fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>> {
+        let mut parts = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id);
+            if let Some(m) = marker.take() {
+                request = request.part_number_marker(m);
+            }
+            let output = request.send().await.map_err(|e| from_sdk(e, key))?;
+            for part in output.parts() {
+                let (Some(part_number), Some(etag)) = (part.part_number(), part.e_tag()) else {
+                    continue;
+                };
+                parts.push(UploadedPart {
+                    part_number,
+                    etag: etag.to_string(),
+                });
+            }
+            match (output.is_truncated(), output.next_part_number_marker()) {
+                (Some(true), Some(next)) if !next.is_empty() => marker = Some(next.to_string()),
+                _ => break,
+            }
+        }
+        Ok(parts)
     }
 
     /// Uploads one part. Retries up to `MAX_PART_ATTEMPTS` while the error is retryable,
