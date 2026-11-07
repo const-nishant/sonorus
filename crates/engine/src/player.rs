@@ -12,6 +12,10 @@
 //! controller crosses the boundary when the output reaches it. A queue change after the
 //! hand-off makes the boundary stale; playback then restarts on the queue's current entry.
 //!
+//! Recovery: a transient failure (see `EngineError::is_transient`) stops the session but keeps the
+//! queue and the current entry. The entry is reopened at the saved position after a backoff, with
+//! `Recovering` events and without `TrackChanged`, until playback resumes or the user moves on.
+//!
 //! Known limitation: a seek that arrives while the decode thread is blocked inside
 //! `next_block` (for example waiting on a network read) takes effect only after that read
 //! returns, which is bounded by the source's read timeout.
@@ -73,6 +77,14 @@ pub enum PlayerEvent {
         track_id: Option<String>,
         message: String,
     },
+    /// A transient failure stopped the current track. It is reopened at `position` after
+    /// `retry_in`. Emitted once per failed attempt; no `TrackChanged` accompanies it.
+    Recovering {
+        track_id: String,
+        attempt: u32,
+        position: Duration,
+        retry_in: Duration,
+    },
     /// The current queue entry changed (a track started, or the output moved to the next one).
     TrackChanged {
         entry_id: EntryId,
@@ -102,6 +114,10 @@ pub struct PlayerConfig {
     pub preload_lead: Duration,
     /// Seed for shuffle order. 0 seeds from the system clock.
     pub shuffle_seed: u64,
+    /// Delay before the second reopen attempt after a transient failure; doubles per attempt.
+    pub recovery_backoff_base: Duration,
+    /// Upper bound of the reopen delay after a transient failure.
+    pub recovery_backoff_cap: Duration,
 }
 
 impl Default for PlayerConfig {
@@ -113,6 +129,8 @@ impl Default for PlayerConfig {
             output_kind: SampleKind::F32,
             preload_lead: Duration::from_secs(15),
             shuffle_seed: 0,
+            recovery_backoff_base: Duration::from_secs(2),
+            recovery_backoff_cap: Duration::from_secs(30),
         }
     }
 }
@@ -149,6 +167,7 @@ impl Player {
             queue,
             preload: None,
             preload_failed: None,
+            recovery: None,
         };
         let thread = match thread::Builder::new()
             .name(PLAYER_THREAD.to_owned())
@@ -321,6 +340,8 @@ enum DecoderMsg {
     Failed {
         generation: u64,
         message: String,
+        /// `EngineError::is_transient` of the failure: the entry may be reopened.
+        transient: bool,
     },
     /// The decode thread switched to a queued track at the end of the previous one.
     Advanced {
@@ -400,6 +421,18 @@ enum PreloadState {
     HandedOff,
 }
 
+/// A transient failure whose entry is being reopened. No session exists while this is set,
+/// except between a reopen and its first `Playing`.
+struct Recovery {
+    entry_id: EntryId,
+    /// Position to reopen at. Captured at the first failure; later seeks update it.
+    position: Duration,
+    /// Failed attempts so far, counting the first failure as 1.
+    attempt: u32,
+    /// Earliest time of the next reopen.
+    retry_at: Instant,
+}
+
 /// A track the decode thread has switched to whose samples start at `at_samples` in the ring.
 struct Boundary {
     entry_id: EntryId,
@@ -467,6 +500,8 @@ struct Controller {
     preload: Option<Preload>,
     /// Entry whose preload failed; not retried (the cold open at the track's end reports it).
     preload_failed: Option<EntryId>,
+    /// Set while a transient failure is being retried.
+    recovery: Option<Recovery>,
 }
 
 impl Controller {
@@ -557,7 +592,8 @@ impl Controller {
             DecoderMsg::Failed {
                 generation,
                 message,
-            } => self.on_failed(generation, message),
+                transient,
+            } => self.on_failed(generation, message, transient),
             DecoderMsg::Advanced {
                 generation,
                 entry_id,
@@ -590,7 +626,11 @@ impl Controller {
     }
 
     fn on_previous(&mut self) {
-        if self.position().is_some_and(|p| p > RESTART_THRESHOLD) {
+        // While recovering there is no session; the saved recovery position stands in for it.
+        let position = self
+            .position()
+            .or_else(|| self.recovery.as_ref().map(|r| r.position));
+        if position.is_some_and(|p| p > RESTART_THRESHOLD) {
             self.on_seek(Duration::ZERO);
             return;
         }
@@ -667,6 +707,7 @@ impl Controller {
 
     fn on_seek(&mut self, to: Duration) {
         let Some(session) = self.session.as_mut() else {
+            self.seek_while_recovering(to);
             return;
         };
         if session.info.is_none() {
@@ -715,6 +756,10 @@ impl Controller {
             Some(to) => self.seek_to(to),
             None => self.begin_playback(),
         }
+        // A reopened track that settles while paused has recovered: nothing is left to retry.
+        if self.state == PlayerState::Paused {
+            self.recovery = None;
+        }
     }
 
     fn on_seeked(&mut self, generation: u64, seq: u64, position_frames: u64) {
@@ -741,11 +786,109 @@ impl Controller {
         }
     }
 
-    fn on_failed(&mut self, generation: u64, message: String) {
-        if self.current_mut(generation).is_none() {
+    /// A decode thread reported a failure. A permanent one ends playback. A transient one stops
+    /// the session and schedules a reopen of the same entry at the saved position.
+    fn on_failed(&mut self, generation: u64, message: String, transient: bool) {
+        let Some(session) = self.current_mut(generation) else {
+            return;
+        };
+        if !transient {
+            self.fail(message);
             return;
         }
-        self.fail(message);
+        let track_id = session.track.id.clone();
+        let entry_id = session.entry_id;
+        let pending = session.pending_seek;
+
+        let (position, attempt) = match self.recovery.as_ref().filter(|r| r.entry_id == entry_id) {
+            // A reopen is already running: keep the position captured at the first failure.
+            Some(running) => (running.position, running.attempt.saturating_add(1)),
+            None => (self.position().or(pending).unwrap_or_default(), 1),
+        };
+        let delay = self.backoff_delay(attempt);
+        log::warn!("transient failure on attempt {attempt}, retrying in {delay:?}: {message}");
+
+        self.stop_session();
+        self.recovery = Some(Recovery {
+            entry_id,
+            position,
+            attempt,
+            retry_at: Instant::now()
+                .checked_add(delay)
+                .unwrap_or_else(Instant::now),
+        });
+        let state = if self.want_play {
+            PlayerState::Buffering
+        } else {
+            PlayerState::Paused
+        };
+        self.set_state(state);
+        self.emit(PlayerEvent::Recovering {
+            track_id,
+            attempt,
+            position,
+            retry_in: delay,
+        });
+    }
+
+    /// Delay before the reopen for `attempt`: none for the first, then `base * 2^(attempt - 2)`,
+    /// capped. Saturates instead of overflowing.
+    fn backoff_delay(&self, attempt: u32) -> Duration {
+        if attempt <= 1 {
+            return Duration::ZERO;
+        }
+        let factor = 2u32.checked_pow(attempt - 2).unwrap_or(u32::MAX);
+        self.config
+            .recovery_backoff_base
+            .checked_mul(factor)
+            .unwrap_or(Duration::MAX)
+            .min(self.config.recovery_backoff_cap)
+    }
+
+    /// A seek during recovery has no session to aim at: it moves the position the reopen uses.
+    fn seek_while_recovering(&mut self, to: Duration) {
+        let Some(recovery) = self.recovery.as_mut() else {
+            return;
+        };
+        recovery.position = to;
+        let entry_id = recovery.entry_id;
+        let Some(track_id) = self.queue.get(entry_id).map(|e| e.track.id.clone()) else {
+            return;
+        };
+        self.emit(PlayerEvent::Position {
+            track_id,
+            position: to,
+            duration: None,
+        });
+    }
+
+    /// Reopens the entry being recovered once its backoff has elapsed and no session exists.
+    /// Returns true when it acted.
+    fn retry_recovery(&mut self) -> bool {
+        if self.session.is_some() {
+            return false;
+        }
+        let Some(recovery) = self.recovery.as_ref() else {
+            return false;
+        };
+        if Instant::now() < recovery.retry_at {
+            return false;
+        }
+        let (entry_id, position) = (recovery.entry_id, recovery.position);
+        let Some(entry) = self.queue.get(entry_id).cloned() else {
+            log::warn!("recovering entry {entry_id} is no longer queued");
+            self.go_idle();
+            return true;
+        };
+        if self.start_entry_quiet(entry, self.want_play, Some(position)) {
+            let state = if self.want_play {
+                PlayerState::Buffering
+            } else {
+                PlayerState::Paused
+            };
+            self.set_state(state);
+        }
+        true
     }
 
     /// The decode thread moved on to `entry_id`'s track at the end of the current one.
@@ -921,9 +1064,25 @@ impl Controller {
         }
     }
 
-    /// Starts `entry` as the current track. A Ready preload of the same entry is used as is;
-    /// anything else is opened. Stops the previous session first.
+    /// Starts `entry` as the current track and announces it with `TrackChanged`. Clears any
+    /// recovery: the user or the queue moved on, so the failed track is no longer retried.
     fn start_entry(&mut self, entry: QueueEntry, autoplay: bool, seek: Option<Duration>) {
+        self.recovery = None;
+        let entry_id = entry.id;
+        let track_id = entry.track.id.clone();
+        if self.start_entry_quiet(entry, autoplay, seek) {
+            self.emit(PlayerEvent::TrackChanged { entry_id, track_id });
+        }
+    }
+
+    /// `start_entry` without the announcement, keeping `recovery`: used to reopen the entry being
+    /// recovered. Returns false when the decode thread could not be started.
+    fn start_entry_quiet(
+        &mut self,
+        entry: QueueEntry,
+        autoplay: bool,
+        seek: Option<Duration>,
+    ) -> bool {
         // Taken before stop_session, which would drop it.
         let preload = self.preload.take();
         self.stop_session();
@@ -957,8 +1116,9 @@ impl Controller {
                 track_id: Some(track_id),
                 message: format!("failed to start decode thread: {e}"),
             });
+            self.recovery = None;
             self.set_state(PlayerState::Idle);
-            return;
+            return false;
         }
 
         self.want_play = autoplay;
@@ -981,19 +1141,21 @@ impl Controller {
             last_position_emit: Instant::now(),
         });
         self.set_state(PlayerState::Loading);
-        self.emit(PlayerEvent::TrackChanged { entry_id, track_id });
+        true
     }
 
     /// Reports `message` for the current track, drops the session and goes idle.
     fn fail(&mut self, message: String) {
+        self.recovery = None;
         let track_id = self.session.as_ref().map(|s| s.track.id.clone());
         self.emit(PlayerEvent::Error { track_id, message });
         self.stop_session();
         self.set_state(PlayerState::Idle);
     }
 
-    /// Stops the session and goes idle.
+    /// Stops the session, drops any recovery and goes idle.
     fn go_idle(&mut self) {
+        self.recovery = None;
         self.stop_session();
         self.set_state(PlayerState::Idle);
     }
@@ -1235,6 +1397,9 @@ impl Controller {
     /// end detection, preload start, position reporting. Does nothing without a session that
     /// has stats.
     fn tick(&mut self) {
+        if self.retry_recovery() {
+            return;
+        }
         if self.cross_boundaries() {
             return;
         }
@@ -1265,6 +1430,8 @@ impl Controller {
             }
             self.set_sink_playing(true);
             self.set_state(PlayerState::Playing);
+            // Playback resumed: any recovery has succeeded.
+            self.recovery = None;
         }
 
         if self.state == PlayerState::Playing {
@@ -1393,6 +1560,7 @@ impl DecodeLoop {
                             DecoderMsg::Failed {
                                 generation: self.generation,
                                 message: e.to_string(),
+                                transient: e.is_transient(),
                             },
                         );
                         return;
@@ -1522,6 +1690,7 @@ fn decode_main(
                     DecoderMsg::Failed {
                         generation,
                         message: e.to_string(),
+                        transient: e.is_transient(),
                     },
                 );
                 return;
@@ -1622,6 +1791,7 @@ fn seek_decoder(
                 DecoderMsg::Failed {
                     generation,
                     message: e.to_string(),
+                    transient: e.is_transient(),
                 },
             );
             false
@@ -1640,9 +1810,10 @@ mod tests {
     use crate::error::Result;
     use crate::opener::FileOpener;
     use crate::output::NullSink;
+    use std::collections::HashSet;
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use symphonia::core::io::MediaSource;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -1657,6 +1828,8 @@ mod tests {
             tick: Duration::from_millis(5),
             position_interval: Duration::from_millis(20),
             preload_lead: Duration::from_secs(10),
+            recovery_backoff_base: Duration::from_millis(10),
+            recovery_backoff_cap: Duration::from_millis(50),
             ..PlayerConfig::default()
         }
     }
@@ -2490,5 +2663,237 @@ mod tests {
         events.extend(collect_until(&rx, ends_idle));
         assert!(ends_idle(&events), "not idle at end: {events:#?}");
         assert_eq!(changed_ids(&events), vec![1, 3], "{events:#?}");
+    }
+
+    /// Reader over fixture bytes. With `fail_after` set, every read fails with `TimedOut` once
+    /// that many bytes were returned, as a dropped network stream does.
+    struct TimeoutReader {
+        inner: Cursor<Vec<u8>>,
+        read_total: u64,
+        fail_after: Option<u64>,
+    }
+
+    impl Read for TimeoutReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self
+                .fail_after
+                .is_some_and(|limit| self.read_total >= limit)
+            {
+                // A real read timeout only fails after waiting; the wait lets the output start
+                // on the audio decoded so far.
+                thread::sleep(TIMEOUT_STALL);
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            let cap = buf.len().min(READ_CHUNK);
+            let n = self.inner.read(&mut buf[..cap])?;
+            self.read_total += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for TimeoutReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl MediaSource for TimeoutReader {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            Some(self.inner.get_ref().len() as u64)
+        }
+    }
+
+    /// Bytes read from the fixture before the first open of a key times out.
+    const TIMEOUT_AFTER: u64 = 96 * 1024;
+    /// How long a timing-out read blocks before it fails.
+    const TIMEOUT_STALL: Duration = Duration::from_millis(150);
+
+    /// Opener whose first open of each key returns a reader that times out mid-stream; later
+    /// opens are normal. Counts every open.
+    struct FlakyOpener {
+        bytes: Vec<u8>,
+        seen: Mutex<HashSet<String>>,
+        opens: AtomicUsize,
+    }
+
+    impl FlakyOpener {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                seen: Mutex::new(HashSet::new()),
+                opens: AtomicUsize::new(0),
+            }
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::Acquire)
+        }
+    }
+
+    impl TrackOpener for FlakyOpener {
+        fn open(&self, track: &TrackRef) -> Result<OpenedSource> {
+            self.opens.fetch_add(1, Ordering::AcqRel);
+            let first = self
+                .seen
+                .lock()
+                .expect("seen lock")
+                .insert(track.key.clone());
+            Ok(OpenedSource {
+                source: Box::new(TimeoutReader {
+                    inner: Cursor::new(self.bytes.clone()),
+                    read_total: 0,
+                    fail_after: first.then_some(TIMEOUT_AFTER),
+                }),
+                ext_hint: Some("wav".to_string()),
+                buffer: None,
+            })
+        }
+    }
+
+    /// Opener whose first `refusals` opens fail at open time with a transient error; later opens
+    /// are normal. Counts every open.
+    struct RefusingOpener {
+        bytes: Vec<u8>,
+        refusals: usize,
+        opens: AtomicUsize,
+    }
+
+    impl RefusingOpener {
+        fn new(bytes: Vec<u8>, refusals: usize) -> Self {
+            Self {
+                bytes,
+                refusals,
+                opens: AtomicUsize::new(0),
+            }
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::Acquire)
+        }
+    }
+
+    impl TrackOpener for RefusingOpener {
+        fn open(&self, _track: &TrackRef) -> Result<OpenedSource> {
+            let n = self.opens.fetch_add(1, Ordering::AcqRel);
+            if n < self.refusals {
+                return Err(crate::error::EngineError::Io(io::Error::from(
+                    io::ErrorKind::TimedOut,
+                )));
+            }
+            Ok(OpenedSource {
+                source: Box::new(Cursor::new(self.bytes.clone())),
+                ext_hint: Some("wav".to_string()),
+                buffer: None,
+            })
+        }
+    }
+
+    #[test]
+    fn mid_track_timeout_resumes_at_position() {
+        let bytes = std::fs::read(format!("{FIXTURES}/{STALL_FIXTURE}")).expect("fixture");
+        let opener = Arc::new(FlakyOpener::new(bytes));
+        let sink = Box::new(NullSink::with_speed(4.0));
+        let (player, rx) = Player::new(sink, opener.clone(), test_config());
+        player.load(track(STALL_FIXTURE), true);
+        let events = collect_until(&rx, ends_idle);
+
+        let at = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::Recovering { attempt: 1, .. }))
+            .unwrap_or_else(|| panic!("no Recovering attempt 1: {events:#?}"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PlayerEvent::Error { .. })),
+            "{events:#?}"
+        );
+        let ended = events
+            .iter()
+            .rposition(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+            .expect("track ended");
+        assert!(
+            !events[..ended]
+                .iter()
+                .any(|e| is_state(e, PlayerState::Idle)),
+            "went idle before the end: {events:#?}"
+        );
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1], "{events:#?}");
+        assert_eq!(opener.opens(), 2);
+
+        let before = events[..at]
+            .iter()
+            .rev()
+            .find_map(position_of)
+            .expect("position before recovery");
+        let after = events[at..]
+            .iter()
+            .find_map(position_of)
+            .expect("position after recovery");
+        assert!(
+            after + Duration::from_millis(20) >= before,
+            "restarted instead of resuming: before {before:?}, after {after:?}"
+        );
+    }
+
+    #[test]
+    fn transient_open_failures_back_off_then_play() {
+        let bytes = std::fs::read(format!("{FIXTURES}/{STALL_FIXTURE}")).expect("fixture");
+        let opener = Arc::new(RefusingOpener::new(bytes, 3));
+        let sink = Box::new(NullSink::with_speed(4.0));
+        let (player, rx) = Player::new(sink, opener.clone(), test_config());
+        player.load(track(STALL_FIXTURE), true);
+        let events = collect_until(&rx, ends_idle);
+
+        let retries: Vec<(u32, Duration)> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::Recovering {
+                    attempt, retry_in, ..
+                } => Some((*attempt, *retry_in)),
+                _ => None,
+            })
+            .collect();
+        let attempts: Vec<u32> = retries.iter().map(|r| r.0).collect();
+        assert_eq!(attempts, vec![1, 2, 3], "{events:#?}");
+        assert!(
+            retries.windows(2).all(|w| w[0].1 <= w[1].1),
+            "retry delays decrease: {retries:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PlayerEvent::Error { .. })),
+            "{events:#?}"
+        );
+        assert!(has_ended(&events), "{events:#?}");
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(opener.opens(), 4);
+    }
+
+    #[test]
+    fn stop_during_recovery_goes_idle_and_stops_reopening() {
+        let bytes = std::fs::read(format!("{FIXTURES}/{STALL_FIXTURE}")).expect("fixture");
+        let opener = Arc::new(RefusingOpener::new(bytes, usize::MAX));
+        let sink = Box::new(NullSink::with_speed(4.0));
+        let (player, rx) = Player::new(sink, opener.clone(), test_config());
+        player.load(track(STALL_FIXTURE), true);
+        let _ = collect_until(&rx, |e| {
+            e.iter()
+                .any(|ev| matches!(ev, PlayerEvent::Recovering { attempt, .. } if *attempt >= 2))
+        });
+
+        player.stop();
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle after stop: {events:#?}");
+
+        thread::sleep(Duration::from_millis(200));
+        let settled = opener.opens();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(opener.opens(), settled, "reopened after stop");
     }
 }

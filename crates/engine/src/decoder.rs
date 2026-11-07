@@ -4,6 +4,9 @@
 //! [`TrackDecoder::next_block`]. Integer output is Symphonia's own conversion (lossless, no
 //! dither or scaling here).
 
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use symphonia::core::audio::conv::ConvertibleSample;
@@ -15,7 +18,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
 
-use crate::error::{EngineError, Result};
+use crate::error::{EngineError, Result, is_transient_io_kind};
 
 /// Number of consecutive undecodable packets tolerated before giving up.
 const MAX_CONSECUTIVE_BAD: u32 = 64;
@@ -84,6 +87,14 @@ impl TrackDecoder {
             hint.with_extension(ext);
         }
 
+        // Symphonia's header scan swallows read errors and then reports "no suitable format
+        // reader", which would turn a network timeout into a permanent failure. The tap records
+        // whether any read failed transiently so the probe error can be reported as I/O.
+        let saw_transient = Arc::new(AtomicBool::new(false));
+        let source = Box::new(ErrorTap {
+            inner: source,
+            saw_transient: Arc::clone(&saw_transient),
+        });
         let mss = MediaSourceStream::new(source, Default::default());
         let format = symphonia::default::get_probe()
             .probe(
@@ -92,7 +103,15 @@ impl TrackDecoder {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .map_err(|e| EngineError::Unsupported(e.to_string()))?;
+            .map_err(|e| match e {
+                // Keep the kind: a read timeout while probing must stay transient.
+                SymError::IoError(io) => EngineError::Io(io),
+                other if saw_transient.load(Ordering::Relaxed) => EngineError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("source read failed while probing: {other}"),
+                )),
+                other => EngineError::Unsupported(other.to_string()),
+            })?;
 
         let (track_id, codec_params, time_base, num_frames, duration_units) = {
             let track = format
@@ -277,6 +296,10 @@ impl TrackDecoder {
                 self.at_end = true;
                 return Ok(to);
             }
+            // A network timeout during the seek must stay transient so the player can retry.
+            Err(SymError::IoError(e)) if is_transient_io_kind(e.kind()) => {
+                return Err(EngineError::Io(e));
+            }
             Err(e) => return Err(EngineError::Seek(e.to_string())),
         };
         self.decoder.reset();
@@ -350,6 +373,40 @@ fn alac_bit_depth(mut cookie: &[u8]) -> Option<u32> {
     cookie.get(5).map(|&b| u32::from(b)).filter(|&b| b > 0)
 }
 
+/// Pass-through source that remembers whether a read failed with a transient I/O error.
+struct ErrorTap {
+    inner: Box<dyn MediaSource>,
+    saw_transient: Arc<AtomicBool>,
+}
+
+impl Read for ErrorTap {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buf);
+        if let Err(e) = &result
+            && is_transient_io_kind(e.kind())
+        {
+            self.saw_transient.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl Seek for ErrorTap {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl MediaSource for ErrorTap {
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.inner.byte_len()
+    }
+}
+
 /// Returns None for negative, NaN or overflowing values.
 fn secs_to_duration(secs: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
@@ -358,7 +415,7 @@ fn secs_to_duration(secs: f64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
 
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!(
@@ -534,7 +591,129 @@ mod tests {
         assert!(matches!(result, Err(EngineError::Unsupported(_))));
     }
 
-    // 7. format_khz
+    /// A seekable source of known length whose every read times out, like a stalled range read.
+    struct TimedOutSource;
+
+    impl Read for TimedOutSource {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::TimedOut))
+        }
+    }
+
+    impl Seek for TimedOutSource {
+        fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    impl MediaSource for TimedOutSource {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            Some(1 << 20)
+        }
+    }
+
+    // 7. a read timeout while probing is an I/O error, and transient
+    #[test]
+    fn probe_timeout_is_transient() {
+        let err = TrackDecoder::new(Box::new(TimedOutSource), Some("flac"))
+            .err()
+            .expect("probe must fail");
+        assert!(
+            matches!(&err, EngineError::Io(e) if e.kind() == ErrorKind::TimedOut),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
+    }
+
+    /// Non-seekable source whose reads time out: only Symphonia's header scan reads it, and that
+    /// scan swallows read errors. The error tap must still surface the timeout as transient.
+    struct UnseekableTimedOut;
+
+    impl Read for UnseekableTimedOut {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::TimedOut))
+        }
+    }
+
+    impl Seek for UnseekableTimedOut {
+        fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+            Err(io::Error::from(ErrorKind::Unsupported))
+        }
+    }
+
+    impl MediaSource for UnseekableTimedOut {
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn header_scan_timeout_is_transient() {
+        let err = TrackDecoder::new(Box::new(UnseekableTimedOut), Some("flac"))
+            .err()
+            .expect("probe must fail");
+        assert!(err.is_transient(), "{err:?}");
+    }
+
+    /// Serves `data` until `fail_after` reads have happened, then every read times out.
+    struct FailAfterReads {
+        inner: io::Cursor<Vec<u8>>,
+        reads: usize,
+        fail_after: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for FailAfterReads {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads > self.fail_after.load(Ordering::Relaxed) {
+                return Err(io::Error::from(ErrorKind::TimedOut));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailAfterReads {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl MediaSource for FailAfterReads {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            Some(self.inner.get_ref().len() as u64)
+        }
+    }
+
+    #[test]
+    fn seek_timeout_is_transient() {
+        let fail_after = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let source = FailAfterReads {
+            inner: io::Cursor::new(fixture("tone_24_96.flac")),
+            reads: 0,
+            fail_after: Arc::clone(&fail_after),
+        };
+        let mut dec = TrackDecoder::new(Box::new(source), Some("flac")).expect("open");
+        // From now on every read times out, so the seek cannot read its target.
+        fail_after.store(0, Ordering::Relaxed);
+        let err = dec
+            .seek(Duration::from_millis(200))
+            .expect_err("seek must fail");
+        assert!(err.is_transient(), "{err:?}");
+    }
+
+    // 8. format_khz
     #[test]
     fn format_khz_cases() {
         assert_eq!(format_khz(44_100), "44.1");

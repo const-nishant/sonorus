@@ -767,6 +767,58 @@ rtrb 0.4.1: `RingBuffer::<T>::new(cap) -> (Producer<T>, Consumer<T>)`; `slots()`
     6. all Phase 4 tests still pass (load() now goes through set_queue).
 - [x] **5.4** Opus review + commit.
 
+## Phase 5.5 — Auto-resume after long network drops
+
+Problem: a RangeSource read that gets no data for `read_timeout` (45 s) fails with `io::ErrorKind::TimedOut`;
+the player then emits Error, goes Idle and loses the position. Requirement: survive network loss of any length —
+keep the position, show Buffering, reopen + seek back, retry with backoff until it works or the user changes track.
+
+- [x] **5.5.1 `crates/engine/src/error.rs` + `decoder.rs`**
+  - `impl EngineError { pub fn is_transient(&self) -> bool }`: `Io(e)` with kind TimedOut, Interrupted,
+    ConnectionReset, ConnectionAborted or NotConnected → true (NOT BrokenPipe: that means we closed the source);
+    `Storage(e)` → `e.is_retryable()`; everything else false.
+  - `TrackDecoder::new`: a probe error that is `SymError::IoError(e)` must become `EngineError::Io(e)` (keeps the
+    kind, so a timeout while probing is transient); other probe errors stay `Unsupported`. Unit test: a source
+    whose `read` returns `Err(TimedOut)` → `new()` returns `Err(e)` with `e.is_transient()`.
+- [x] **5.5.2 `crates/engine/src/player.rs`**
+  - `DecoderMsg::Failed` gains `transient: bool` (= `err.is_transient()` at every send site; open failures included).
+  - `PlayerConfig` gains `recovery_backoff_base: Duration` (2 s) and `recovery_backoff_cap: Duration` (30 s).
+  - `PlayerEvent` gains `Recovering { track_id: String, attempt: u32, position: Duration, retry_in: Duration }`.
+  - Controller field `recovery: Option<Recovery>`; `struct Recovery { entry_id: EntryId, position: Duration,
+    attempt: u32, retry_at: Instant }`.
+  - `on_failed(generation, message, transient)`: not current → ignore. `!transient` → `fail(message)` as today
+    (also clears `recovery`). Transient:
+    - position = `recovery.position` if a recovery for this entry is already running, else the current output
+      position (`self.position()`), else the session's `pending_seek`, else 0.
+    - attempt = previous attempt + 1 (1 for a fresh failure). delay = 0 for attempt 1, else
+      `min(cap, base * 2^(attempt-2))` (saturating).
+    - log::warn (message + attempt, no URLs); stop_session() (keeps queue + current entry); recovery = Some{..,
+      retry_at: now + delay}; set_state(if want_play { Buffering } else { Paused }); emit Recovering.
+  - `tick()`: first thing — if recovery is Some and `now >= retry_at` and there is no session → look up the entry
+    (`queue.get(entry_id)`; gone → recovery = None, go Idle) and `start_entry_quiet(entry, want_play,
+    Some(position))`, then set_state(Buffering or Paused as above).
+  - Split `start_entry` into `start_entry(..)` (announces: emits TrackChanged, clears `recovery`) and
+    `start_entry_quiet(..)` (same, but emits no TrackChanged and keeps `recovery`) — recovery must not look like
+    a new play to history/UI. Every user action that starts another entry (set_queue, next, previous, jump_to,
+    remove-current, stop, drain-end advance, boundary stale restart) goes through the announcing path or
+    stop/fail, which clear `recovery`.
+  - Recovery succeeded: when the state reaches Playing (prefill met) for the recovered entry → recovery = None.
+    While paused, a reopened session that reaches Paused with info loaded also clears it.
+  - While recovering with no session, `Pause`/`Play` just update `want_play` and the visible state
+    (Paused ↔ Buffering); `Seek(to)` updates `recovery.position` and emits Position.
+  - Tests (test-only `FlakyOpener`: the FIRST open of a key returns a reader over tone_24_96.wav whose `read`
+    returns `Err(TimedOut)` after 96 KiB; later opens are normal; counts opens. Config: prefill 50 ms, backoff
+    base 10 ms, cap 50 ms, NullSink speed 4):
+    1. play through a mid-track timeout → events: Recovering{attempt 1}, no Error, no StateChanged(Idle) before the
+       final TrackEnded; exactly one TrackChanged for the entry; opens == 2; the first Position after recovery is
+       ≥ the last Position before it minus 20 ms (resumed, not restarted).
+    2. opener whose first THREE opens fail with a transient error at open time (e.g. returns
+       `Err(EngineError::Io(TimedOut))`) → Recovering attempts 1, 2, 3 with non-decreasing retry_in, then plays to
+       TrackEnded.
+    3. non-transient failure (missing file) still → Error + Idle (existing test keeps passing).
+    4. stop() during recovery → Idle, no further opens after 200 ms.
+- [x] **5.5.3** Opus review + commit.
+
 ## Phase 6 — `sonorus-library`
 - [ ] 6.1 schema + migrations (rusqlite bundled): tracks, albums, artists, covers, scan_state.
 - [ ] 6.2 bucket scan under optional `SONORUS_S3_PREFIX` (bucket is shared with other files): list_audio, diff by etag/size, fetch head bytes (first 1 MiB, + tail for m4a) → lofty tags.
