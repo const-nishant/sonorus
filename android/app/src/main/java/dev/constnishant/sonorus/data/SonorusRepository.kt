@@ -5,8 +5,11 @@ import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.provider.OpenableColumns
+import dev.constnishant.sonorus.core.CacheSettings
+import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.CoreConfig
 import dev.constnishant.sonorus.core.CoreException
+import dev.constnishant.sonorus.core.DownloadStatus
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSettings
 import dev.constnishant.sonorus.core.S3Settings
@@ -56,6 +59,9 @@ class SonorusRepository(private val app: Context) {
     /** Persisted output settings (sample format and exclusive mode). */
     val output = OutputSettingsStore(app)
 
+    /** Persisted offline cache settings (limit, expiry, downloads on mobile data). */
+    val cache = CacheSettingsStore(app)
+
     /** UI state built from core events. */
     val events = CoreEvents()
 
@@ -104,8 +110,21 @@ class SonorusRepository(private val app: Context) {
             it.setOutputRouter(router)
             it.setListener(events)
             it.setOutputSettings(output.load())
+            it.setCacheSettings(cache.load())
             _configured.value = it.isConfigured()
         }
+    }
+
+    /**
+     * Sends the network state to the core, which pauses or resumes downloads. Commands wait for the
+     * core, so the first report is applied once it is open.
+     */
+    private val networkMonitor = NetworkMonitor(app) { connected, metered ->
+        command { it.setNetworkState(connected, metered) }
+    }
+
+    init {
+        networkMonitor.start()
     }
 
     /**
@@ -200,6 +219,53 @@ class SonorusRepository(private val app: Context) {
 
     /** The output stream the core has open, or null when nothing is open. */
     suspend fun outputInfo(): OutputInfo? = call { it.outputInfo() }
+
+    /** The saved offline cache settings. Reads the preferences; blocking reads run on IO. */
+    suspend fun cacheSettings(): CacheSettings = withContext(Dispatchers.IO) { cache.load() }
+
+    /**
+     * Applies the offline cache settings in the core and persists them. Throws if the preferences
+     * cannot be written; the core keeps the new settings in that case until the app restarts.
+     */
+    suspend fun setCacheSettings(settings: CacheSettings) {
+        call { it.setCacheSettings(settings) }
+        withContext(Dispatchers.IO) { cache.save(settings) }
+    }
+
+    /** How much the offline cache holds, and the settings in effect. */
+    suspend fun cacheUsage(): CacheUsageInfo = call { it.cacheUsage() }
+
+    /**
+     * Deletes the cached tracks that are not pinned. Returns the bytes freed. Pinned albums and
+     * playlists stay. Throws a [CoreException].
+     */
+    suspend fun clearCache(): ULong = call { it.clearCache() }
+
+    /** Pins or unpins an album for offline download. Throws a [CoreException]. */
+    suspend fun setAlbumPinned(albumId: Long, pinned: Boolean) {
+        call { it.setAlbumPinned(albumId, pinned) }
+    }
+
+    /** Pins or unpins a playlist for offline download. Throws a [CoreException]. */
+    suspend fun setPlaylistPinned(playlistId: Long, pinned: Boolean) {
+        call { it.setPlaylistPinned(playlistId, pinned) }
+    }
+
+    /** Whether the album is pinned. Throws a [CoreException]. */
+    suspend fun isAlbumPinned(albumId: Long): Boolean = call { it.isAlbumPinned(albumId) }
+
+    /** Whether the playlist is pinned. Throws a [CoreException]. */
+    suspend fun isPlaylistPinned(playlistId: Long): Boolean = call { it.isPlaylistPinned(playlistId) }
+
+    /**
+     * How much of the album is on this device, including its pin state. Throws a [CoreException]
+     * (for example NotFound for an unknown album).
+     */
+    suspend fun downloadStatusAlbum(albumId: Long): DownloadStatus = call { it.downloadStatusAlbum(albumId) }
+
+    /** How much of the playlist is on this device, including its pin state. Throws a [CoreException]. */
+    suspend fun downloadStatusPlaylist(playlistId: Long): DownloadStatus =
+        call { it.downloadStatusPlaylist(playlistId) }
 
     /**
      * Tells observers that the catalogue changed. Call this after playlist or favorite edits.

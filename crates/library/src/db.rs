@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -121,6 +121,18 @@ CREATE TABLE uploads (
     updated_at   INTEGER NOT NULL
 );
 CREATE INDEX uploads_blake3 ON uploads(blake3);
+";
+
+/// v4: offline pins. One row per album or playlist the user keeps on this device. `ref_id` is an
+/// album id or a playlist id, so it cannot be a foreign key: pins are dropped by
+/// `pins::prune_pins` and when their playlist is deleted.
+const SCHEMA_V4: &str = "
+CREATE TABLE pins (
+    kind       TEXT NOT NULL CHECK(kind IN ('album','playlist')),
+    ref_id     INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(kind, ref_id)
+);
 ";
 
 const UPSERT_TRACK_SQL: &str = "
@@ -393,7 +405,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             )),
         )));
     }
-    for (target, sql) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
+    for (target, sql) in [
+        (1, SCHEMA_V1),
+        (2, SCHEMA_V2),
+        (3, SCHEMA_V3),
+        (4, SCHEMA_V4),
+    ] {
         if version < target {
             let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
@@ -992,7 +1009,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
         let favorites: i64 = conn
             .query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))
             .unwrap();
@@ -1001,6 +1018,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uploads, 0);
+    }
+
+    #[test]
+    fn v3_database_upgrades_to_v4_with_empty_pins() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v3.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO favorites (track_key, favorite, updated_at) VALUES ('a/b.flac', 1, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        let conn = lib.lock();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        let favorites: i64 = conn
+            .query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(favorites, 1);
+        let pins: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pins, 0);
     }
 
     #[test]

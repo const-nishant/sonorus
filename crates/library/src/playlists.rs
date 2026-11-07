@@ -157,6 +157,10 @@ impl Library {
             "UPDATE playlists SET deleted = 1 WHERE id = ?1",
             params![id],
         )?;
+        tx.execute(
+            "DELETE FROM pins WHERE kind = 'playlist' AND ref_id = ?1",
+            params![id],
+        )?;
         touch(&tx, id, prev)?;
         tx.commit()?;
         Ok(())

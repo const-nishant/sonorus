@@ -3,6 +3,8 @@ package dev.constnishant.sonorus.ui.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.BuildConfig
+import dev.constnishant.sonorus.core.CacheSettings
+import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.LibraryStatsInfo
 import dev.constnishant.sonorus.core.OutputInfo
@@ -10,9 +12,11 @@ import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.OutputSettings
 import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.coreVersion
+import dev.constnishant.sonorus.data.DEFAULT_CACHE_SETTINGS
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
+import dev.constnishant.sonorus.ui.components.formatBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -69,6 +73,14 @@ data class SettingsUiState(
     val bitPerfect: Boolean = true,
     /** Name of the connected USB DAC, or null when none is connected. */
     val dacName: String? = null,
+    /** Saved offline cache settings. */
+    val cache: CacheSettings = DEFAULT_CACHE_SETTINGS,
+    /** Cache usage, or null until the first successful read. */
+    val cacheUsage: CacheUsageInfo? = null,
+    /** Result of the last clear, or a failed read, shown inline. */
+    val cacheMessage: String? = null,
+    val cacheFailed: Boolean = false,
+    val clearing: Boolean = false,
     val version: String = "",
 )
 
@@ -158,6 +170,11 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
         viewModelScope.launch {
             val version = withContext(Dispatchers.IO) { coreVersion() }
             _state.update { it.copy(version = version) }
+        }
+        viewModelScope.launch {
+            val cache = repository.cacheSettings()
+            _state.update { it.copy(cache = cache) }
+            refreshCacheUsage()
         }
         viewModelScope.launch {
             refreshStats()
@@ -311,6 +328,67 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
         }
     }
 
+    /** Sets the cache size limit in bytes. */
+    fun setCacheLimit(limitBytes: ULong) {
+        applyCache(_state.value.cache.copy(limitBytes = limitBytes))
+    }
+
+    /** Sets how long unpinned cached songs are kept; null keeps them forever. */
+    fun setKeepDays(days: UInt?) {
+        applyCache(_state.value.cache.copy(ttlDays = days))
+    }
+
+    /** Turns downloads on mobile data on or off. Off means downloads wait for Wi-Fi. */
+    fun setDownloadOnMetered(enabled: Boolean) {
+        applyCache(_state.value.cache.copy(downloadOnMetered = enabled))
+    }
+
+    /**
+     * Shows [settings] at once, then applies and saves them. If the save fails, the previous
+     * settings are shown again and the reason is shown as an error.
+     */
+    private fun applyCache(settings: CacheSettings) {
+        val previous = _state.value.cache
+        _state.update { it.copy(cache = settings) }
+        viewModelScope.launch {
+            try {
+                repository.setCacheSettings(settings)
+                refreshCacheUsage()
+            } catch (e: CoreException) {
+                revertCache(previous)
+            } catch (e: IllegalStateException) {
+                revertCache(previous)
+            }
+        }
+    }
+
+    private fun revertCache(previous: CacheSettings) {
+        _state.update { it.copy(cache = previous) }
+        repository.events.emitError("Could not save the cache settings.")
+    }
+
+    /** Deletes the unpinned cached songs and shows how much space was freed. */
+    fun clearCache() {
+        _state.update { it.copy(clearing = true, cacheMessage = null, cacheFailed = false) }
+        viewModelScope.launch {
+            try {
+                val freed = repository.clearCache()
+                _state.update {
+                    it.copy(clearing = false, cacheMessage = "Freed ${formatBytes(freed)}", cacheFailed = false)
+                }
+            } catch (e: CoreException) {
+                _state.update {
+                    it.copy(
+                        clearing = false,
+                        cacheMessage = e.userMessage("Could not clear the cache."),
+                        cacheFailed = true,
+                    )
+                }
+            }
+            refreshCacheUsage()
+        }
+    }
+
     /** Starts a library scan. Does nothing while one is running. */
     fun startScan() {
         repository.startScan()
@@ -338,6 +416,18 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                         syncFailed = true,
                     )
                 }
+            }
+        }
+    }
+
+    /** Reads how much the cache holds. A failure is shown inline. */
+    private suspend fun refreshCacheUsage() {
+        try {
+            val usage = repository.cacheUsage()
+            _state.update { it.copy(cacheUsage = usage) }
+        } catch (e: CoreException) {
+            _state.update {
+                it.copy(cacheMessage = e.userMessage("Could not read the cache."), cacheFailed = true)
             }
         }
     }

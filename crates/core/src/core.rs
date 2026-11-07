@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "android")]
 use sonorus_engine::aaudio::{AAudioHandle, AAudioSink};
 use sonorus_engine::aaudio::{DefaultPlanner, RoutePlanner};
-use sonorus_engine::opener::{FileOpener, StorageOpener, TrackOpener, TrackRef};
+use sonorus_engine::opener::{CachingOpener, FileOpener, StorageOpener, TrackOpener, TrackRef};
 #[cfg(not(target_os = "android"))]
 use sonorus_engine::output::NullSink;
 use sonorus_engine::output::OutputSink;
@@ -31,21 +31,23 @@ use sonorus_engine::source::SourceConfig;
 use sonorus_library::sync::sync_user_data as run_user_data_sync;
 use sonorus_library::uploads;
 use sonorus_library::{
-    BucketSource, BucketStore, DirSource, Library, MetaSource, ScanProgress, Track, scan,
+    BucketSource, BucketStore, DirSource, Library, MetaSource, PinKind, ScanProgress, Track, pins,
+    scan,
 };
 use sonorus_storage::{ObjectMeta, Storage};
 use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventListener, ListenerSlot, spawn_pump};
+use crate::offline::{CACHE_DIR, Offline, cache_id_for};
 use crate::router::{OutputRouter, RouterPlanner};
 #[cfg(target_os = "android")]
 use crate::types::output_info_from;
 use crate::types::{
-    AlbumInfo, AlbumSort, ArtistInfo, Converter, CoreConfig, CoreEvent, LibraryStatsInfo,
-    OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, RepeatMode, S3Settings,
-    ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SyncSummary, TrackInfo,
-    UploadJobInfo,
+    AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, Converter, CoreConfig,
+    CoreEvent, DownloadStatus, LibraryStatsInfo, OutputInfo, OutputSettings, PlaylistEntryInfo,
+    PlaylistInfo, RepeatMode, S3Settings, ScanProgressInfo, ScanSummary, SearchResult,
+    SignalPathInfo, SyncSummary, TrackInfo, UploadJobInfo,
 };
 use crate::upload::{
     CancelRoute, RunEnv, UploadClaim, UploadControl, cancel_job, prepare_job, request_cancel,
@@ -62,8 +64,13 @@ const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
 /// Where the music comes from.
 #[derive(Clone)]
 enum Backend {
-    /// S3-compatible bucket; `prefix` is normalized (empty, or ending with '/').
-    Bucket { storage: Storage, prefix: String },
+    /// S3-compatible bucket; `prefix` is normalized (empty, or ending with '/'). `cache_id` names
+    /// the bucket's offline cache directory.
+    Bucket {
+        storage: Storage,
+        prefix: String,
+        cache_id: String,
+    },
     /// A local folder, used for development and tests. Keys are paths relative to `root`.
     Local { root: PathBuf },
 }
@@ -129,6 +136,8 @@ pub struct SonorusCore {
     rt: Option<Runtime>,
     /// Which upload jobs have a run or cancel in progress, and which were asked to stop.
     upload_control: Mutex<UploadControl>,
+    /// The offline cache, its pins and the download worker.
+    offline: Offline,
 }
 
 #[uniffi::export]
@@ -150,17 +159,30 @@ impl SonorusCore {
             "sonorus core opened (backend: {})",
             backend.as_ref().map_or("none", Backend::kind)
         );
-        Ok(Arc::new(Self {
-            library: Arc::new(library),
+        let library = Arc::new(library);
+        let listener = ListenerSlot::default();
+        let offline = Offline::new(
+            rt.handle(),
+            data_dir.join(CACHE_DIR),
+            Arc::clone(&library),
+            listener.clone(),
+            CacheSettings::default(),
+        );
+        offline.set_bucket(bucket_identity(backend.as_ref()));
+        let core = Arc::new(Self {
+            library,
             backend: RwLock::new(backend),
             player: Mutex::new(None),
-            listener: ListenerSlot::default(),
+            listener,
             scanning: AtomicBool::new(false),
             output: Mutex::new(OutputSettings::default()),
             router: Mutex::new(None),
             rt: Some(rt),
             upload_control: Mutex::new(UploadControl::default()),
-        }))
+            offline,
+        });
+        core.refresh_pins();
+        Ok(core)
     }
 
     /// Registers the listener for core events, replacing any previous one. Non-blocking.
@@ -189,9 +211,11 @@ impl SonorusCore {
     pub fn configure_s3(&self, settings: S3Settings) -> CoreResult<()> {
         let config = settings.to_storage_config();
         let storage = Storage::new(&config)?;
+        let cache_id = cache_id_for(&config);
         self.set_backend(Some(Backend::Bucket {
             storage,
             prefix: config.prefix,
+            cache_id,
         }));
         Ok(())
     }
@@ -203,9 +227,9 @@ impl SonorusCore {
         match self.backend_snapshot() {
             None => Err(CoreError::NotConfigured),
             Some(Backend::Local { root }) => Ok(std::fs::read_dir(&root)?.next().is_some()),
-            Some(Backend::Bucket { storage, prefix }) => {
-                Ok(self.runtime()?.block_on(storage.probe(&prefix))?)
-            }
+            Some(Backend::Bucket {
+                storage, prefix, ..
+            }) => Ok(self.runtime()?.block_on(storage.probe(&prefix))?),
         }
     }
 
@@ -321,6 +345,7 @@ impl SonorusCore {
                 },
             ))
         };
+        self.refresh_pins();
         match report {
             Ok(report) => {
                 let summary = ScanSummary::from(report);
@@ -363,7 +388,9 @@ impl SonorusCore {
 
     /// Deletes a playlist. Blocking.
     pub fn delete_playlist(&self, id: i64) -> CoreResult<()> {
-        Ok(self.library.delete_playlist(id)?)
+        self.library.delete_playlist(id)?;
+        self.refresh_pins();
+        Ok(())
     }
 
     /// The slots of a playlist in order. Blocking.
@@ -389,17 +416,23 @@ impl SonorusCore {
         if keys.is_empty() {
             return Err(no_tracks());
         }
-        Ok(self.library.add_to_playlist(id, &keys)?)
+        self.library.add_to_playlist(id, &keys)?;
+        self.refresh_pins();
+        Ok(())
     }
 
     /// Removes the slot at `position`. Blocking.
     pub fn remove_from_playlist(&self, id: i64, position: u32) -> CoreResult<()> {
-        Ok(self.library.remove_from_playlist(id, position)?)
+        self.library.remove_from_playlist(id, position)?;
+        self.refresh_pins();
+        Ok(())
     }
 
     /// Moves the slot at `from` to `to`. Blocking.
     pub fn move_in_playlist(&self, id: i64, from: u32, to: u32) -> CoreResult<()> {
-        Ok(self.library.move_in_playlist(id, from, to)?)
+        self.library.move_in_playlist(id, from, to)?;
+        self.refresh_pins();
+        Ok(())
     }
 
     /// Marks or unmarks a track as favorite. `NotFound` for an unknown track id. Blocking.
@@ -434,13 +467,17 @@ impl SonorusCore {
     /// Merges playlists and favorites with the bucket's copies of them. Bucket backend only.
     /// Blocking.
     pub fn sync_user_data(&self) -> CoreResult<SyncSummary> {
-        let Some(Backend::Bucket { storage, prefix }) = self.backend_snapshot() else {
+        let Some(Backend::Bucket {
+            storage, prefix, ..
+        }) = self.backend_snapshot()
+        else {
             return Err(CoreError::NotConfigured);
         };
         let store = BucketStore::new(storage, &prefix);
         let report = self
             .runtime()?
             .block_on(run_user_data_sync(&self.library, &store))?;
+        self.refresh_pins();
         Ok(report.into())
     }
 
@@ -699,6 +736,120 @@ impl SonorusCore {
     pub fn signal_path(&self) -> Option<SignalPathInfo> {
         self.aaudio_signal_path()
     }
+
+    /// Sets the offline cache settings and applies them now: the byte limit evicts down to it
+    /// and the expiry applies at once. The app stores the settings and sets them again at startup.
+    /// Blocking: it may scan the cache directory.
+    pub fn set_cache_settings(&self, settings: CacheSettings) {
+        log::info!("cache settings: {settings:?}");
+        self.offline.apply_settings(settings);
+    }
+
+    /// The offline cache settings in effect. Non-blocking.
+    pub fn cache_settings(&self) -> CacheSettings {
+        self.offline.settings()
+    }
+
+    /// The offline cache: bytes used and bytes kept by pins, the settings, and the number of
+    /// complete and partly downloaded tracks. Zero usage without a bucket. Blocking.
+    pub fn cache_usage(&self) -> CacheUsageInfo {
+        let settings = self.offline.settings();
+        let usage = self
+            .offline
+            .cache()
+            .map(|cache| cache.usage())
+            .unwrap_or_default();
+        CacheUsageInfo {
+            used_bytes: usage.total_bytes,
+            pinned_bytes: usage.pinned_bytes,
+            limit_bytes: settings.limit_bytes,
+            ttl_days: settings.ttl_days.filter(|days| *days > 0),
+            complete_tracks: usage.complete_files,
+            partial_tracks: usage.partial_files,
+        }
+    }
+
+    /// Deletes the cached tracks that are not pinned and returns the bytes freed. Pinned tracks
+    /// are kept. Blocking.
+    pub fn clear_cache(&self) -> CoreResult<u64> {
+        match self.offline.cache() {
+            Some(cache) => Ok(cache.clear_unpinned()?),
+            None => Ok(0),
+        }
+    }
+
+    /// Reports the connection: `connected` when the device is online, `metered` when that
+    /// connection is mobile data. Until the first call the core assumes a metered connection, so
+    /// nothing downloads. Pinned tracks download on an unmetered connection, or on a metered one
+    /// when `download_on_metered` is set. Non-blocking.
+    pub fn set_network_state(&self, connected: bool, metered: bool) {
+        self.offline.set_network(connected, metered);
+    }
+
+    /// Pins or unpins an album. A pinned album's tracks stay in the offline cache and download
+    /// while the network allows. Unpinning aborts the track in progress. NotFound for an unknown
+    /// album. Blocking.
+    pub fn set_album_pinned(&self, album_id: i64, pinned: bool) -> CoreResult<()> {
+        if pinned {
+            pins::pin(&self.library, PinKind::Album, album_id)?;
+        } else {
+            pins::unpin(&self.library, PinKind::Album, album_id)?;
+            self.offline.cancel_downloads();
+        }
+        self.refresh_pins();
+        Ok(())
+    }
+
+    /// Pins or unpins a playlist, like `set_album_pinned`. NotFound for an unknown or deleted
+    /// playlist when pinning. Blocking.
+    pub fn set_playlist_pinned(&self, playlist_id: i64, pinned: bool) -> CoreResult<()> {
+        if pinned {
+            pins::pin(&self.library, PinKind::Playlist, playlist_id)?;
+        } else {
+            pins::unpin(&self.library, PinKind::Playlist, playlist_id)?;
+            self.offline.cancel_downloads();
+        }
+        self.refresh_pins();
+        Ok(())
+    }
+
+    /// Whether the album is pinned. Blocking.
+    pub fn is_album_pinned(&self, album_id: i64) -> CoreResult<bool> {
+        Ok(pins::is_pinned(&self.library, PinKind::Album, album_id)?)
+    }
+
+    /// Whether the playlist is pinned. Blocking.
+    pub fn is_playlist_pinned(&self, playlist_id: i64) -> CoreResult<bool> {
+        Ok(pins::is_pinned(
+            &self.library,
+            PinKind::Playlist,
+            playlist_id,
+        )?)
+    }
+
+    /// How much of an album is on this device: its pin, its track and byte totals, and the
+    /// tracks completely in the offline cache. NotFound for an unknown album. Blocking.
+    pub fn download_status_album(&self, album_id: i64) -> CoreResult<DownloadStatus> {
+        self.library.album(album_id)?;
+        self.download_status(PinKind::Album, album_id)
+    }
+
+    /// How much of a playlist is on this device, like `download_status_album`. NotFound for an
+    /// unknown or deleted playlist. Blocking.
+    pub fn download_status_playlist(&self, playlist_id: i64) -> CoreResult<DownloadStatus> {
+        self.library.playlist(playlist_id)?;
+        self.download_status(PinKind::Playlist, playlist_id)
+    }
+}
+
+/// The offline cache identity and client of a bucket backend, `None` for other backends.
+fn bucket_identity(backend: Option<&Backend>) -> Option<(String, Storage)> {
+    match backend {
+        Some(Backend::Bucket {
+            storage, cache_id, ..
+        }) => Some((cache_id.clone(), storage.clone())),
+        _ => None,
+    }
 }
 
 impl SonorusCore {
@@ -713,7 +864,9 @@ impl SonorusCore {
     /// The bucket handle and key prefix uploads write to. `NotConfigured` for any other backend.
     fn upload_bucket(&self) -> CoreResult<(Storage, String)> {
         match self.backend_snapshot() {
-            Some(Backend::Bucket { storage, prefix }) => Ok((storage, prefix)),
+            Some(Backend::Bucket {
+                storage, prefix, ..
+            }) => Ok((storage, prefix)),
             _ => Err(CoreError::NotConfigured),
         }
     }
@@ -726,10 +879,46 @@ impl SonorusCore {
         }
     }
 
-    /// Replaces the backend, then drops the player so the next play uses the new one.
+    /// Replaces the backend, then drops the player so the next play uses the new one. The
+    /// offline cache follows the bucket: a different bucket (or none) deletes the old bucket's
+    /// cache directory; the same bucket keeps it.
     fn set_backend(&self, backend: Option<Backend>) {
+        let bucket = bucket_identity(backend.as_ref());
         *self.backend.write().unwrap_or_else(PoisonError::into_inner) = backend;
+        self.offline.set_bucket(bucket);
+        self.refresh_pins();
         self.stop_player();
+    }
+
+    /// Re-reads the pins after a change to the library or to the pins. Failures are logged, not
+    /// returned: the change that caused them has already been made.
+    fn refresh_pins(&self) {
+        if let Err(e) = self.offline.refresh_pins() {
+            log::warn!("could not refresh the offline pins: {e}");
+        }
+    }
+
+    /// How much of an album or playlist is in the offline cache. `pinned` and the totals come
+    /// from the library; the cached counts from the cache, zero without a bucket.
+    fn download_status(&self, kind: PinKind, ref_id: i64) -> CoreResult<DownloadStatus> {
+        let pinned = pins::is_pinned(&self.library, kind, ref_id)?;
+        let tracks = pins::tracks_of(&self.library, kind, ref_id)?;
+        let cache = self.offline.cache();
+        let mut status = DownloadStatus {
+            pinned,
+            total_tracks: u32::try_from(tracks.len()).unwrap_or(u32::MAX),
+            cached_tracks: 0,
+            total_bytes: 0,
+            cached_bytes: 0,
+        };
+        for (_, key, size) in &tracks {
+            status.total_bytes = status.total_bytes.saturating_add(*size);
+            if cache.as_ref().is_some_and(|c| c.is_complete(key, *size)) {
+                status.cached_tracks = status.cached_tracks.saturating_add(1);
+                status.cached_bytes = status.cached_bytes.saturating_add(*size);
+            }
+        }
+        Ok(status)
     }
 
     /// The AAudio stream state of the current player (Android only).
@@ -824,11 +1013,18 @@ impl SonorusCore {
     fn build_player(&self) -> CoreResult<PlayerSlot> {
         let backend = self.backend_snapshot().ok_or(CoreError::NotConfigured)?;
         let opener: Arc<dyn TrackOpener> = match backend {
-            Backend::Bucket { storage, .. } => Arc::new(StorageOpener::new(
-                storage,
-                self.runtime()?.handle().clone(),
-                SourceConfig::default(),
-            )),
+            Backend::Bucket { storage, .. } => {
+                let handle = self.runtime()?.handle().clone();
+                match self.offline.cache() {
+                    Some(cache) => Arc::new(CachingOpener::new(
+                        cache,
+                        storage,
+                        handle,
+                        SourceConfig::default(),
+                    )),
+                    None => Arc::new(StorageOpener::new(storage, handle, SourceConfig::default())),
+                }
+            }
             Backend::Local { root } => Arc::new(FileOpener::new(root)),
         };
         let settings = self.output_settings();
@@ -857,7 +1053,9 @@ impl SonorusCore {
     fn scan_source(&self) -> CoreResult<(Arc<dyn MetaSource>, String)> {
         let handle = self.runtime()?.handle().clone();
         match self.backend_snapshot() {
-            Some(Backend::Bucket { storage, prefix }) => {
+            Some(Backend::Bucket {
+                storage, prefix, ..
+            }) => {
                 let source: Arc<dyn MetaSource> = Arc::new(BucketSource::new(storage, handle));
                 Ok((source, prefix))
             }
@@ -908,6 +1106,8 @@ impl Drop for SonorusCore {
     fn drop(&mut self) {
         // The player first, outside the lock: its event thread may still be running a listener.
         self.stop_player();
+        // Stops the download worker and the purge. The runtime shutdown below ends their tasks.
+        self.offline.stop();
         if let Some(rt) = self.rt.take() {
             rt.shutdown_timeout(RUNTIME_SHUTDOWN);
         }
@@ -925,9 +1125,11 @@ fn backend_from_config(config: &CoreConfig) -> CoreResult<Option<Backend>> {
         Some(settings) => {
             let storage_config = settings.to_storage_config();
             let storage = Storage::new(&storage_config)?;
+            let cache_id = cache_id_for(&storage_config);
             Ok(Some(Backend::Bucket {
                 storage,
                 prefix: storage_config.prefix,
+                cache_id,
             }))
         }
         None => Ok(None),

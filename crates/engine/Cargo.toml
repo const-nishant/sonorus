@@ -10,6 +10,7 @@ symphonia = { workspace = true }
 rtrb = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+blake3 = { workspace = true }
 fastrand = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

@@ -2357,6 +2357,7 @@ dependencies = [
 name = "sonorus-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "fastrand",
  "log",

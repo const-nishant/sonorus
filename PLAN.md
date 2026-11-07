@@ -1169,9 +1169,59 @@ pauses playback (pulled forward from 12.2 so audio never jumps to the speaker).
   Not tested: Android 15 dataSync timeout, a source deleted between prepare and run, cancel mid-upload.
 
 ## Phase 14 — Offline cache
-- [ ] 14.1 LRU disk cache of whole objects (size cap), RangeSource reads cache first.
-- [ ] 14.2 per-album/playlist download toggle + pinned entries exempt from eviction.
+Opus decided: streamed chunks are tee'd into a sparse `.part` file through a `CachingObject` wrapping the
+`RemoteObject` (RangeSource unchanged); complete entries are read from disk with no network. LRU by mtime with a size
+cap, plus a TTL on unpinned entries (default 30 days; `Some(0)` = never). Pinned albums/playlists are never evicted or
+expired and are filled by a background download worker gated on network state (no downloads on metered networks
+unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|bucket|prefix)>`).
+- [x] 14.1 engine: `TrackCache` (LRU, TTL, pins, chunk map), `CachingObject`, `download`, `CachingOpener`.
+- [x] 14.2 core: cache settings, pins table (schema v4), download worker + network gating, purge every 6 h,
+  bucket-scoped cache dir, events `DownloadProgress` / `DownloadsIdle`.
+- [x] 14.3 Kotlin: Download toggle + status on Album/Playlist, Settings → Downloads & cache, NetworkCallback.
+- [x] 14.4 device test + commit. Vivo V2338 on Wi-Fi: pinning "Long Tones" downloaded both tracks into
+  `files/sonorus/cache/<bucket id>/` as complete `.audio` entries (2 805 174 + 14 189 480 bytes, matching the objects);
+  in airplane mode the pinned A440 track played from the cache. Not tested on device: TTL expiry and LRU eviction
+  (covered by engine unit tests with back-dated mtimes), metered gating (the user enabled downloads on mobile data).
 
-## Phase 15 — Polish
-- [ ] lyrics (.lrc sidecar, synced), sleep timer, signal-path screen, settings (bucket creds → Keystore,
-  cache size, output mode), adaptive icon, release build (R8, signing via env).
+## Phase 15 — Brand and design system
+- [ ] Adaptive "resonance rings" icon (gold dot + teal arcs on #0E1014; foreground/background/monochrome, 66dp safe
+  zone), notification icon, splash screen (core-splashscreen) + Material3 DayNight window theme.
+- [ ] Inter (bundled, OFL) typography scale, shape + spacing tokens, shared `SonorusChip` / `QualityBadge`.
+- [ ] All UI strings in `strings.xml`.
+
+## Phase 16 — UI/UX overhaul (artwork-tinted dark)
+- [ ] Single inset owner (fix double status-bar padding); palette-tinted gradients + blurred backdrop on Now Playing,
+  Album, Artist; Now Playing slide-up/swipe-down, swipe art to skip, haptics, landscape two-pane.
+- [ ] Mini player animation + swipe to skip; drag-to-reorder + swipe-to-remove (queue, playlists) with Undo;
+  swipeable Library tabs, A–Z fast scroll, pull-to-refresh → scan; artist cover collage.
+- [ ] Settings split into grouped subpages; nav transitions; accessibility semantics.
+
+## Phase 17 — Playback quality
+- [ ] Next-track prefetch (~20 s before end, fills the cache); gapless when formats match (same ring, no reopen).
+- [ ] ReplayGain (tags → schema, F32 only, off on integer/bit-perfect paths; Off/Track/Album + preamp).
+- [ ] Sleep timer (minutes / end of track; fade-out in F32, pause on integer paths).
+
+## Phase 18 — Lyrics
+- [ ] `.lrc` sidecars + embedded lyrics at scan; Rust LRC parser; `lyrics_synced`; Now Playing lyrics pane with
+  auto-scroll and tap-to-seek.
+
+## Phase 19 — Discovery and stats
+- [ ] Smart playlists (most played, recently added, hi-res only, never played, favorites); stats screen from
+  `history`; recent searches + format filters; folder view.
+
+## Phase 20 — Bucket manager (CRUD, confined to the configured prefix)
+- [ ] storage: `list_folder` (delimiter), `copy_object`, batch `delete_objects`, small `put_object`.
+- [ ] core: browse, rename/move (copy → verify → delete; catalogue key updated in place so favorites/playlists/
+  history survive; cache entry renamed/dropped), delete objects/folders (catalogue + cache + upload rows purged),
+  edit tags (download → lofty write → re-upload → rescan), set album cover; prefix guard on every key.
+- [ ] Android "Manage bucket": breadcrumb browser, multi-select, rename/move/edit tags/delete with confirmations
+  (typed name for folder deletes), "Upload here", entry points from Settings and long-press menus.
+
+## Phase 21 — CI/CD and releases (GitHub Actions)
+- [ ] Prerequisite: GitHub repo as `origin` (user creates it; push only with approval) after a full-history
+  secrets scan.
+- [ ] Conventional Commits from here on; `v0.13.0` anchor tag; versionName from the latest tag, versionCode =
+  major·1e6 + minor·1e3 + patch; release-please PR → tag + GitHub Release with CHANGELOG.
+- [ ] `ci.yml` (Rust fmt/clippy/test with a pinned `rust-toolchain.toml`; Android assembleDebug + lint with NDK
+  28.2.13676358); `release.yml` on release published: R8 release APK + AAB signed from secrets
+  (`ANDROID_KEYSTORE_B64` + 3 passwords/alias), credential-leak check on the dex, assets + SHA256SUMS attached.

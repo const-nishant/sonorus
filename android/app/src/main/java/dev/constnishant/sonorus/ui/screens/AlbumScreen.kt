@@ -38,12 +38,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.constnishant.sonorus.data.DownloadsUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.Artwork
 import dev.constnishant.sonorus.ui.components.BackButton
 import dev.constnishant.sonorus.ui.components.CenteredContent
+import dev.constnishant.sonorus.ui.components.DownloadStatusText
+import dev.constnishant.sonorus.ui.components.DownloadToggle
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
+import dev.constnishant.sonorus.ui.components.PinUi
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
 import dev.constnishant.sonorus.ui.components.formatTotal
@@ -69,6 +73,8 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
         factory = viewModelFactory { initializer { AlbumViewModel(repository, albumId) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val pin by viewModel.pin.collectAsStateWithLifecycle()
+    val downloads by viewModel.downloads.collectAsStateWithLifecycle()
     val currentId by rememberCurrentTrackId()
     val actions = rememberTrackActions()
     val title = (state as? LoadState.Ready)?.value?.album?.title.orEmpty()
@@ -94,6 +100,9 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
                 onArtist = onArtist,
                 onPlayAll = viewModel::playAll,
                 onPlayFrom = viewModel::playFrom,
+                pin = pin,
+                downloads = downloads,
+                onSetPinned = viewModel::setPinned,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -109,6 +118,9 @@ private fun AlbumContent(
     onArtist: (Long) -> Unit,
     onPlayAll: (Boolean) -> Unit,
     onPlayFrom: (Int) -> Unit,
+    pin: PinUi,
+    downloads: DownloadsUi,
+    onSetPinned: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val album = data.album
@@ -179,7 +191,9 @@ private fun AlbumContent(
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                         Text("Shuffle")
                     }
+                    DownloadToggle(state = pin, onSetPinned = onSetPinned)
                 }
+                DownloadStatusText(state = pin, downloads = downloads)
             }
         }
         tracks.forEachIndexed { index, track ->

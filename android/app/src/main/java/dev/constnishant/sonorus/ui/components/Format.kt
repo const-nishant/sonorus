@@ -2,6 +2,8 @@ package dev.constnishant.sonorus.ui.components
 
 import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.TrackInfo
+import dev.constnishant.sonorus.data.GIB
+import kotlin.math.roundToLong
 
 /** `m:ss`, or `h:mm:ss` from one hour; "--:--" when unknown. */
 fun formatDuration(ms: Long?): String {
@@ -44,3 +46,20 @@ fun OutputSampleFormat.label(): String = when (this) {
 /** True for anything above CD quality (more than 16 bits or more than 48 kHz). */
 fun TrackInfo.isHiRes(): Boolean =
     (bitsPerSample?.toInt() ?: 0) > 16 || (sampleRate?.toInt() ?: 0) > 48_000
+
+/**
+ * A byte count for people: "1.2 GB", "4 GB", "412 MB", "820 KB". Units are binary (1 GB is 1024 MB).
+ * Gigabytes keep one decimal unless it is zero; megabytes and kilobytes are whole numbers.
+ */
+fun formatBytes(bytes: ULong): String {
+    val b = bytes.toDouble()
+    val mb = 1024.0 * 1024
+    return when {
+        b >= GIB -> gigabytes(b / GIB) + " GB"
+        b >= mb -> "${(b / mb).roundToLong()} MB"
+        else -> "${(b / 1024).roundToLong()} KB"
+    }
+}
+
+private fun gigabytes(value: Double): String =
+    if (value % 1.0 == 0.0) "%d".format(value.toLong()) else "%.1f".format(value)

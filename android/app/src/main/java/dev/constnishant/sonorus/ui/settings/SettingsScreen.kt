@@ -21,11 +21,17 @@ import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -36,6 +42,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -48,11 +55,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.ScanProgressInfo
+import dev.constnishant.sonorus.data.GIB
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.repository
+import dev.constnishant.sonorus.ui.components.ConfirmDialog
+import dev.constnishant.sonorus.ui.components.formatBytes
 import dev.constnishant.sonorus.ui.components.formatKhz
 import dev.constnishant.sonorus.ui.components.label
 
@@ -92,6 +103,7 @@ fun SettingsScreen(onBack: () -> Unit, onUploads: () -> Unit, modifier: Modifier
         LibrarySection(state = state, scan = scan, onScan = viewModel::startScan)
         UploadsSection(onUploads = onUploads)
         OutputSection(state = state, viewModel = viewModel)
+        DownloadsSection(state = state, viewModel = viewModel)
         SyncSection(state = state, onSync = viewModel::syncUserData)
         AboutSection(version = state.version)
     }
@@ -360,6 +372,137 @@ private fun OutputSection(state: SettingsUiState, viewModel: SettingsViewModel) 
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+/** Cache size choices: the limit in bytes, labelled in whole gigabytes. */
+private val CACHE_LIMIT_OPTIONS: List<Pair<ULong, String>> =
+    listOf(1L, 2L, 4L, 8L, 16L).map { gb -> (gb * GIB).toULong() to "$gb GB" }
+
+/** How long unpinned cached songs are kept; null keeps them forever. */
+private val KEEP_FOR_OPTIONS: List<Pair<UInt?, String>> = listOf(
+    7u to "7 days",
+    30u to "30 days",
+    90u to "90 days",
+    null to "Forever",
+)
+
+@Composable
+private fun DownloadsSection(state: SettingsUiState, viewModel: SettingsViewModel) {
+    var confirmingClear by remember { mutableStateOf(false) }
+    SectionTitle("Downloads & cache")
+    val usage = state.cacheUsage
+    if (usage != null) {
+        Text(
+            text = cacheUsageLine(usage),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    } else if (!state.cacheFailed) {
+        Text(
+            text = "Loading cache usage...",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    ChoiceDropdown(
+        label = "Cache size",
+        options = CACHE_LIMIT_OPTIONS,
+        selected = state.cache.limitBytes,
+        onSelect = viewModel::setCacheLimit,
+    )
+    ChoiceDropdown(
+        label = "Keep songs for",
+        options = KEEP_FOR_OPTIONS,
+        selected = state.cache.ttlDays,
+        onSelect = viewModel::setKeepDays,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(text = "Download on mobile data", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "Off: downloads wait for Wi-Fi",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = state.cache.downloadOnMetered,
+            onCheckedChange = viewModel::setDownloadOnMetered,
+        )
+    }
+    OutlinedButton(
+        onClick = { confirmingClear = true },
+        enabled = !state.clearing,
+    ) {
+        if (state.clearing) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            Spacer(Modifier.width(8.dp))
+        }
+        Text("Clear cache")
+    }
+    state.cacheMessage?.let { message ->
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (state.cacheFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        )
+    }
+    if (confirmingClear) {
+        ConfirmDialog(
+            title = "Clear cache?",
+            message = "Removes cached songs that aren't downloaded. Downloaded albums and playlists stay.",
+            confirmLabel = "Clear",
+            onConfirm = {
+                confirmingClear = false
+                viewModel.clearCache()
+            },
+            onDismiss = { confirmingClear = false },
+        )
+    }
+}
+
+/** "Using 1.2 GB of 4 GB · 85 songs offline (412 MB downloaded)" for the Downloads section. */
+private fun cacheUsageLine(usage: CacheUsageInfo): String =
+    "Using ${formatBytes(usage.usedBytes)} of ${formatBytes(usage.limitBytes)} · " +
+        "${usage.completeTracks} songs offline (${formatBytes(usage.pinnedBytes)} downloaded)"
+
+/** A dropdown that shows the label of the option equal to [selected]. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun <T> ChoiceDropdown(
+    label: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelect: (T) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = options.firstOrNull { it.first == selected }?.second.orEmpty(),
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, enabled = true)
+                .fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { (value, text) ->
+                DropdownMenuItem(
+                    text = { Text(text) },
+                    onClick = {
+                        expanded = false
+                        onSelect(value)
+                    },
+                )
+            }
+        }
+    }
 }
 
 /** One line describing an open output stream, for the Output section. */

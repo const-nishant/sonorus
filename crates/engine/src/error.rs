@@ -16,6 +16,8 @@ pub enum EngineError {
     Seek(String),
     #[error(transparent)]
     Storage(#[from] sonorus_storage::StorageError),
+    #[error("cache error: {0}")]
+    Cache(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

@@ -1,12 +1,14 @@
 //! Track openers: turn a [`TrackRef`] into a byte source the decoder can read.
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use symphonia::core::io::MediaSource;
 
+use crate::cache::{CachingObject, TrackCache};
 use crate::error::Result;
-use crate::source::{BufferHandle, RangeSource, SourceConfig, StorageObject};
+use crate::source::{BufferHandle, RangeSource, RemoteObject, SourceConfig, StorageObject};
 use sonorus_storage::Storage;
 
 /// A track to open. `key` is the storage object key (or path relative to a local root).
@@ -75,6 +77,70 @@ impl TrackOpener for StorageOpener {
     }
 }
 
+/// Opens tracks through the disk cache: a complete entry is read locally with no network;
+/// otherwise the track streams from storage and its chunks are recorded in the cache.
+pub struct CachingOpener {
+    cache: Arc<TrackCache>,
+    storage: Storage,
+    rt: tokio::runtime::Handle,
+    config: SourceConfig,
+}
+
+impl CachingOpener {
+    /// Builds the retry-free client once, like [`StorageOpener::new`].
+    pub fn new(
+        cache: Arc<TrackCache>,
+        storage: Storage,
+        rt: tokio::runtime::Handle,
+        config: SourceConfig,
+    ) -> Self {
+        Self {
+            cache,
+            storage: storage.without_sdk_retries(),
+            rt,
+            config,
+        }
+    }
+}
+
+impl TrackOpener for CachingOpener {
+    /// Blocking; must only run on the decode thread (never the controller or a tokio worker).
+    fn open(&self, track: &TrackRef) -> Result<OpenedSource> {
+        if let Some(path) = self.cache.lookup(&track.key, track.size) {
+            // A failed open (e.g. the entry was evicted just now) falls through to streaming.
+            if let Ok(file) = File::open(&path) {
+                return Ok(OpenedSource {
+                    source: Box::new(file),
+                    ext_hint: ext_of(&track.key),
+                    buffer: None,
+                });
+            }
+        }
+        let storage_object = Arc::new(StorageObject {
+            storage: self.storage.clone(),
+            key: track.key.clone(),
+        });
+        let object: Arc<dyn RemoteObject> =
+            if self.cache.caching_enabled_for(&track.key, track.size) {
+                match self.cache.writer(&track.key, track.size) {
+                    Ok(writer) => Arc::new(CachingObject::new(storage_object, writer)),
+                    Err(e) => {
+                        log::warn!("streaming {} without caching: {e}", track.key);
+                        storage_object
+                    }
+                }
+            } else {
+                storage_object
+            };
+        let (src, handle) = RangeSource::open(object, track.size, &self.rt, self.config.clone());
+        Ok(OpenedSource {
+            source: Box::new(src),
+            ext_hint: ext_of(&track.key),
+            buffer: Some(handle),
+        })
+    }
+}
+
 /// Local files: key is a filesystem path relative to `root`. open → std::fs::File (Io error on failure).
 pub struct FileOpener {
     root: PathBuf,
@@ -102,6 +168,7 @@ impl TrackOpener for FileOpener {
 mod tests {
     use super::*;
     use crate::decoder::TrackDecoder;
+    use sonorus_storage::StorageConfig;
 
     #[test]
     fn ext_of_cases() {
@@ -125,5 +192,43 @@ mod tests {
         assert!(opened.buffer.is_none());
         let decoder = TrackDecoder::new(opened.source, opened.ext_hint.as_deref()).unwrap();
         assert_eq!(decoder.info().sample_rate, 96_000);
+    }
+
+    #[test]
+    fn caching_opener_serves_complete_entry_locally() {
+        use crate::cache::testing::TempDir;
+        use std::io::Read;
+
+        let dir = TempDir::new();
+        let cache = TrackCache::open(dir.path(), u64::MAX, None).unwrap();
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let key = "music/tone.flac";
+        let size = data.len() as u64;
+        let writer = cache.writer(key, size).unwrap();
+        writer.write_chunk(0, &data).unwrap();
+        assert!(writer.is_complete());
+        drop(writer);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let storage = Storage::new(&StorageConfig::backblaze_b2(
+            "us-west-004",
+            "bucket",
+            "key-id",
+            "secret",
+        ))
+        .unwrap();
+        let opener =
+            CachingOpener::new(cache, storage, rt.handle().clone(), SourceConfig::default());
+        let track = TrackRef {
+            id: "tone".to_string(),
+            key: key.to_string(),
+            size,
+        };
+        let mut opened = opener.open(&track).unwrap();
+        assert!(opened.buffer.is_none());
+        assert_eq!(opened.ext_hint.as_deref(), Some("flac"));
+        let mut out = Vec::new();
+        opened.source.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
     }
 }

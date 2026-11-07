@@ -401,6 +401,68 @@ pub struct UploadJobInfo {
     pub source_uri: String,
 }
 
+/// Offline cache settings. They apply live, see `SonorusCore::set_cache_settings`. The app stores
+/// them and sets them again at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CacheSettings {
+    /// Byte limit of the cache. Pinned tracks are kept even above it. `0` disables caching of
+    /// tracks that are not pinned.
+    pub limit_bytes: u64,
+    /// Unpinned tracks not played or downloaded for this many days are deleted. `None`, or `0`,
+    /// means they never expire.
+    pub ttl_days: Option<u32>,
+    /// Download pinned tracks on a metered (mobile data) connection too.
+    pub download_on_metered: bool,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            limit_bytes: DEFAULT_CACHE_LIMIT_BYTES,
+            ttl_days: Some(DEFAULT_CACHE_TTL_DAYS),
+            download_on_metered: false,
+        }
+    }
+}
+
+/// Default offline cache limit: 4 GiB.
+pub const DEFAULT_CACHE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Default expiry of unpinned cached tracks, in days.
+pub const DEFAULT_CACHE_TTL_DAYS: u32 = 30;
+
+/// What the offline cache holds right now, see `SonorusCore::cache_usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CacheUsageInfo {
+    /// Bytes used by complete and partially downloaded tracks.
+    pub used_bytes: u64,
+    /// Bytes used by tracks covered by a pin.
+    pub pinned_bytes: u64,
+    /// The configured byte limit.
+    pub limit_bytes: u64,
+    /// The configured expiry of unpinned tracks in days; `None` when they never expire.
+    pub ttl_days: Option<u32>,
+    /// Complete tracks in the cache.
+    pub complete_tracks: u32,
+    /// Tracks that are partly downloaded.
+    pub partial_tracks: u32,
+}
+
+/// How much of an album or playlist is on this device. Totals count the catalogued tracks it
+/// covers, whether or not it is pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct DownloadStatus {
+    /// Whether the album or playlist is pinned.
+    pub pinned: bool,
+    /// Catalogued tracks it covers.
+    pub total_tracks: u32,
+    /// Of those, tracks completely in the cache.
+    pub cached_tracks: u32,
+    /// Bytes of all the covered tracks.
+    pub total_bytes: u64,
+    /// Bytes of the tracks completely in the cache.
+    pub cached_bytes: u64,
+}
+
 /// Events pushed to the foreign `EventListener` by the core's event pump.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreEvent {
@@ -496,6 +558,21 @@ pub enum CoreEvent {
         job_id: i64,
         /// The state the run ended in.
         state: UploadState,
+    },
+    /// A pinned track finished downloading into the offline cache.
+    DownloadProgress {
+        /// Library track id of the track that finished.
+        track_id: i64,
+        /// Pinned tracks complete in the cache, including this one.
+        done_tracks: u32,
+        /// Pinned tracks in total.
+        total_tracks: u32,
+    },
+    /// The download worker has nothing more it may do right now. `pending_tracks` above zero means
+    /// tracks still wait: for a Wi-Fi connection, or because a download failed (retried later).
+    DownloadsIdle {
+        /// Pinned tracks not yet complete in the cache.
+        pending_tracks: u32,
     },
 }
 

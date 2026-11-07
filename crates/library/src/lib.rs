@@ -5,6 +5,7 @@ pub mod error;
 pub mod favorites;
 pub mod history;
 pub mod model;
+pub mod pins;
 pub mod playlists;
 pub mod query;
 pub mod remote;
@@ -19,6 +20,7 @@ pub use model::{
     Album, AlbumSort, Artist, CoverImage, FavoriteRecord, LibraryStats, ObjectStamp, Playlist,
     PlaylistEntry, PlaylistRecord, PruneStats, SearchResults, Track, TrackMeta,
 };
+pub use pins::{Pin, PinKind, PinnedTrack};
 pub use remote::RemoteReader;
 pub use scan::{
     BoxFuture, BucketSource, DirSource, MetaSource, ScanFailure, ScanProgress, ScanReport, scan,

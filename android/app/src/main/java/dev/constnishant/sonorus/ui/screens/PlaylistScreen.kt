@@ -55,12 +55,16 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.constnishant.sonorus.core.PlaylistEntryInfo
+import dev.constnishant.sonorus.data.DownloadsUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.BackButton
 import dev.constnishant.sonorus.ui.components.CenteredContent
 import dev.constnishant.sonorus.ui.components.ConfirmDialog
+import dev.constnishant.sonorus.ui.components.DownloadStatusText
+import dev.constnishant.sonorus.ui.components.DownloadToggle
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
+import dev.constnishant.sonorus.ui.components.PinUi
 import dev.constnishant.sonorus.ui.components.PlaylistNameDialog
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
@@ -85,6 +89,8 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
         factory = viewModelFactory { initializer { PlaylistViewModel(repository, playlistId) } },
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val pin by viewModel.pin.collectAsStateWithLifecycle()
+    val downloads by viewModel.downloads.collectAsStateWithLifecycle()
     val currentId by rememberCurrentTrackId()
     val actions = rememberTrackActions()
     val data = (state as? LoadState.Ready)?.value
@@ -141,6 +147,9 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
                 onPlayFrom = viewModel::playFrom,
                 onRemove = viewModel::remove,
                 onMove = viewModel::move,
+                pin = pin,
+                downloads = downloads,
+                onSetPinned = viewModel::setPinned,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -183,6 +192,9 @@ private fun PlaylistContent(
     onPlayFrom: (UInt) -> Unit,
     onRemove: (UInt) -> Unit,
     onMove: (UInt, UInt) -> Unit,
+    pin: PinUi,
+    downloads: DownloadsUi,
+    onSetPinned: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val playlist = data.playlist
@@ -213,7 +225,9 @@ private fun PlaylistContent(
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                         Text("Shuffle")
                     }
+                    DownloadToggle(state = pin, onSetPinned = onSetPinned)
                 }
+                DownloadStatusText(state = pin, downloads = downloads)
             }
         }
         if (entries.isEmpty()) {

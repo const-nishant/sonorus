@@ -36,6 +36,18 @@ data class PlaybackUi(
     val recovery: Recovery? = null,
 )
 
+/**
+ * Offline download worker state as the UI sees it. [doneTracks] and [totalTracks] count the
+ * pinned tracks across all pins, not one album. [active] is true from a progress event until the
+ * worker reports idle.
+ */
+data class DownloadsUi(
+    val active: Boolean = false,
+    val doneTracks: UInt = 0u,
+    val totalTracks: UInt = 0u,
+    val pendingTracks: UInt = 0u,
+)
+
 /** Library scan state as the UI sees it. */
 data class ScanUi(
     val running: Boolean = false,
@@ -89,6 +101,14 @@ class CoreEvents : EventListener {
 
     /** Emits when the catalogue changed (scan finished, sync applied, playlists edited). */
     val libraryChanged: SharedFlow<Unit> = _libraryChanged.asSharedFlow()
+
+    private val _downloads = MutableStateFlow(DownloadsUi())
+
+    /**
+     * Offline download worker state. Every download progress event changes [DownloadsUi.doneTracks],
+     * so collectors see one emission per finished track.
+     */
+    val downloads: StateFlow<DownloadsUi> = _downloads.asStateFlow()
 
     private val _uploadProgress = MutableStateFlow<Map<Long, Pair<ULong, ULong>>>(emptyMap())
 
@@ -162,6 +182,16 @@ class CoreEvents : EventListener {
             is CoreEvent.UploadFinished -> {
                 _uploadProgress.update { it - event.jobId }
                 _uploadEvents.tryEmit(UploadEvent.Finished(event.jobId, event.state))
+            }
+            is CoreEvent.DownloadProgress -> _downloads.update {
+                it.copy(
+                    active = true,
+                    doneTracks = event.doneTracks,
+                    totalTracks = event.totalTracks,
+                )
+            }
+            is CoreEvent.DownloadsIdle -> _downloads.update {
+                it.copy(active = false, pendingTracks = event.pendingTracks)
             }
         }
     }
