@@ -65,6 +65,10 @@ data class SettingsUiState(
     val output: OutputSettings = OutputSettings(sampleFormat = OutputSampleFormat.FLOAT, exclusive = false),
     /** The output stream the core has open, or null when nothing is open. Refreshed every second. */
     val outputInfo: OutputInfo? = null,
+    /** Whether audio goes to a connected USB DAC bit-perfect. Applies on the next stream open. */
+    val bitPerfect: Boolean = true,
+    /** Name of the connected USB DAC, or null when none is connected. */
+    val dacName: String? = null,
     val version: String = "",
 )
 
@@ -143,6 +147,13 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                 _state.update { it.copy(outputInfo = info) }
                 delay(1_000)
             }
+        }
+        viewModelScope.launch {
+            val enabled = withContext(Dispatchers.IO) { repository.output.bitPerfect() }
+            _state.update { it.copy(bitPerfect = enabled) }
+        }
+        viewModelScope.launch {
+            repository.dac.collect { dac -> _state.update { it.copy(dacName = dac?.name) } }
         }
         viewModelScope.launch {
             val version = withContext(Dispatchers.IO) { coreVersion() }
@@ -264,6 +275,23 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
     /** Turns exclusive mode on or off and applies it. Playback stops if the value changed. */
     fun setExclusive(exclusive: Boolean) {
         applyOutput(_state.value.output.copy(exclusive = exclusive))
+    }
+
+    /**
+     * Turns bit-perfect output to a USB DAC on or off. Saved at once; it applies on the next stream
+     * open, so playback does not stop. If the save fails, the previous value is shown again.
+     */
+    fun setBitPerfect(enabled: Boolean) {
+        val previous = _state.value.bitPerfect
+        _state.update { it.copy(bitPerfect = enabled) }
+        viewModelScope.launch {
+            try {
+                repository.setBitPerfect(enabled)
+            } catch (e: IllegalStateException) {
+                _state.update { it.copy(bitPerfect = previous) }
+                repository.events.emitError("Could not save the bit-perfect setting.")
+            }
+        }
     }
 
     /**

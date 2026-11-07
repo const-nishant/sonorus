@@ -150,6 +150,10 @@ private fun NowPlayingBody(
     val quality = playback.stream?.label ?: track.qualityLabel()
     val busy = playback.state.isBusy()
     val playing = playback.state.showsPause()
+    val signalPath by viewModel.signalPath.collectAsStateWithLifecycle()
+    val dac by viewModel.dac.collectAsStateWithLifecycle()
+    var showSignalPath by rememberSaveable { mutableStateOf(false) }
+    val pathChip = signalPath?.takeIf { it.error == null }
 
     Spacer(Modifier.height(8.dp))
     Artwork(
@@ -213,21 +217,39 @@ private fun NowPlayingBody(
         }
     }
 
-    if (quality != null) {
+    if (quality != null || pathChip != null) {
         Spacer(Modifier.height(8.dp))
-        val tint = if (hiRes) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant
-        Surface(
-            shape = RoundedCornerShape(50),
-            color = Color.Transparent,
-            contentColor = tint,
-            border = BorderStroke(1.dp, tint),
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = quality,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.labelMedium,
-            )
+            if (quality != null) {
+                val tint = if (hiRes) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = Color.Transparent,
+                    contentColor = tint,
+                    border = BorderStroke(1.dp, tint),
+                ) {
+                    Text(
+                        text = quality,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+            }
+            if (pathChip != null) {
+                SignalPathChip(path = pathChip, onClick = { showSignalPath = true })
+            }
         }
+    }
+
+    if (showSignalPath && pathChip != null) {
+        SignalPathDialog(
+            path = pathChip,
+            dac = dac,
+            onDismiss = { showSignalPath = false },
+        )
     }
 
     Spacer(Modifier.height(16.dp))

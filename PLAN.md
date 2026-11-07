@@ -1096,14 +1096,41 @@ reopen the stream (player calls stop + start); measure on device before optimizi
   change 96 k → 44.1 k reopens in ~28 ms; I32 and I24_PACKED open as requested; Exclusive is granted as Shared
   (no MMAP for 44.1 k / I24 on this phone) — Phase 11 territory. Also: Settings shows "AAudio"; re-selecting a
   bottom tab returns to its top screen and the tab stays highlighted on detail screens.
-  Open: AudioPlaybackConfiguration lists content type UNKNOWN although MUSIC is set (cosmetic); the reopen after a
-  route change (headphones/USB unplug) is not yet exercised on a device.
+  Closed in Phase 11: the audio policy client attributes show CONTENT_TYPE_MUSIC / USAGE_MEDIA (UNKNOWN is only how
+  AudioPlaybackConfiguration reports AAudio players); the reopen after a USB DAC unplug was exercised (11.4).
 
 ## Phase 11 — Bit-perfect
-- [ ] 11.1 Kotlin `UsbAudioRouter`: find USB DAC `AudioDeviceInfo`, `getSupportedMixerAttributes`,
-  `setPreferredMixerAttributes(MIXER_BEHAVIOR_BIT_PERFECT)` matching file format/rate/channel mask.
-- [ ] 11.2 fallback chain bit-perfect → exclusive AAudio → shared mixer; `SignalPath` record + badge.
-- [ ] 11.3 bit-perfect mode disables volume/ReplayGain/EQ/crossfade; rubato resample only if DAC lacks rate.
+
+Opus decided: the AAudio sink asks a `RoutePlanner` (engine trait; implemented in Kotlin through a UniFFI foreign
+trait) for device id + sample kind + sharing before EVERY open (start, seek, track change, reopen after a
+disconnect), so the Kotlin side can set the USB mixer attributes for that exact format first; after the open the sink
+reports the resulting `SignalPath` back. The planner is called without the sink mutex held (it does binder calls).
+Bit-perfect uses integer sample kinds only (no volume is applied on those paths), which covers 11.3's "disables
+volume"; ReplayGain/EQ/crossfade do not exist yet. Rubato is deferred: when the DAC has no bit-perfect mode at the
+track's rate, the path falls back to the Android mixer (which resamples) and the badge says so. USB DAC detach
+pauses playback (pulled forward from 12.2 so audio never jumps to the speaker).
+
+- [x] 11.1 engine: `OutputFormat.source_bits`, `SampleKind::I16` + `render_i16`, `aaudio::{RoutePlanner,
+  RouteRequest, RoutePlan, SignalPath, PathMode}`, sink consults the planner on every open and reports `opened`.
+- [x] 11.2 core: foreign trait `OutputRouter` + records, `set_output_router`, `signal_path()`.
+- [x] 11.3 Kotlin `UsbAudioRouter`: USB DAC via `AudioDeviceCallback`, `getSupportedMixerAttributes` →
+  `setPreferredMixerAttributes(USAGE_MEDIA, dac, MIXER_BEHAVIOR_BIT_PERFECT)` matching rate/channels with the
+  narrowest lossless integer encoding; fallback bit-perfect → exclusive → mixer; "Bit-perfect to USB DAC" setting;
+  signal-path badge in Now Playing; detach → pause.
+- [x] 11.4 Opus review + on-device test with the user's USB DAC (bit-perfect open, format switches across tracks,
+  unplug → pause + reopen on speaker, replug) + commit.
+  Added in review: `RoutePlan.hold` / `RoutePlanInfo.hold` — for 3 s after the DAC disappears the router asks the
+  supervisor to reopen the stream stopped, so an unplug can never start the phone speaker even if the pause lands
+  late (it relied on the 100 ms retry backoff before). The signal-path dialog names the DAC for default-route
+  streams (Android moves them to a replugged DAC without a reopen, so the stream's device id goes stale).
+  Device test (vivo V2338, Android 16, KT02H20 HIFI Audio dongle: 16/24/32-bit at 48–384 kHz, no 44.1 k): this
+  phone's audio policy has NO bit-perfect mix port, so `getSupportedMixerAttributes` offers no
+  MIXER_BEHAVIOR_BIT_PERFECT entry and every track correctly falls back to Mixer. 24/96 plays through
+  `hifi_playback` at 96 kHz / PCM_32 to the DAC (native rate, only the stream volume applied); 44.1 k is resampled
+  by the mixer (the DAC lacks 44.1 k). Unplug while playing: DISCONNECTED → DAC removed (+24 ms) → pause (+32 ms) →
+  held reopen on the speaker (+145 ms), speaker player stays idle, UI shows paused. Replug while paused: Android
+  reroutes the paused stream to the new USB port; play resumes on the DAC. Not verifiable here: the bit-perfect
+  branch itself (needs a phone whose HAL declares a bit-perfect output, e.g. Pixel 8+ on Android 14+).
 
 ## Phase 12 — Background playback
 - [ ] 12.1 `PlaybackService : MediaSessionService` (foregroundServiceType mediaPlayback), Media3 `SimpleBasePlayer`

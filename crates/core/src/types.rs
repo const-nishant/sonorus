@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
-use sonorus_engine::aaudio::{AAudioConfig, Performance, Sharing, StreamInfo as AAudioStreamInfo};
+use sonorus_engine::aaudio::{
+    AAudioConfig, PathMode, Performance, RoutePlan, RouteRequest, Sharing, SignalPath,
+    StreamInfo as AAudioStreamInfo,
+};
 use sonorus_engine::decoder::StreamInfo;
 use sonorus_engine::output::SampleKind;
 use sonorus_engine::player::{PlayerEvent, PlayerState};
@@ -449,6 +452,8 @@ pub enum OutputSampleFormat {
     Int32,
     /// 24-bit packed integers, bit-perfect (for 24-bit DACs).
     Int24Packed,
+    /// 16-bit integers, bit-perfect (for 16-bit DAC modes; lossless for 16-bit sources only).
+    Int16,
 }
 
 /// User output settings. They apply to the next player, see `SonorusCore::set_output_settings`.
@@ -485,6 +490,66 @@ pub struct OutputInfo {
     pub xruns: i32,
 }
 
+/// How the audio reaches the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OutputPathMode {
+    /// Integer samples reach the device unchanged (bit-perfect).
+    BitPerfect,
+    /// Exclusive device access, but not bit-perfect.
+    Exclusive,
+    /// Shared Android mixer, which may resample and apply volume.
+    Mixer,
+}
+
+/// The format the engine is about to open, passed to `OutputRouter::plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RouteRequestInfo {
+    /// Sample rate of the source in Hz (the rate the stream is opened at).
+    pub sample_rate: u32,
+    /// Channel count of the source.
+    pub channels: u32,
+    /// Bit depth of the decoded source, when known.
+    pub source_bits: Option<u32>,
+    /// Sample format the player asks for.
+    pub requested: OutputSampleFormat,
+    /// Whether the user asked for exclusive device access.
+    pub exclusive: bool,
+}
+
+/// How to open the stream, returned by `OutputRouter::plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RoutePlanInfo {
+    /// Device to open, or `None` for the default device.
+    pub device_id: Option<i32>,
+    /// Sample format to open the stream with.
+    pub sample_format: OutputSampleFormat,
+    /// Whether to request exclusive sharing (the performance mode follows from it).
+    pub exclusive: bool,
+    /// Whether the route is meant to be bit-perfect.
+    pub bit_perfect: bool,
+    /// Open the stream but do not restart it automatically after a disconnect reopen; an explicit
+    /// play still starts it. Set by a router while the output device has just been removed and
+    /// the app is pausing.
+    pub hold: bool,
+}
+
+/// What the engine opened, passed to `OutputRouter::opened` and returned by `SonorusCore::signal_path`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SignalPathInfo {
+    /// The path the audio takes (`Mixer` when the open failed).
+    pub mode: OutputPathMode,
+    /// The plan the open was attempted with.
+    pub plan: RoutePlanInfo,
+    /// The negotiated stream, `None` when the open failed.
+    pub stream: Option<OutputInfo>,
+    /// The open error message, `None` on success.
+    pub error: Option<String>,
+    /// Sample rate of the source in Hz.
+    pub source_rate: u32,
+    /// Bit depth of the source, when known.
+    pub source_bits: Option<u32>,
+}
+
 impl OutputSettings {
     /// The AAudio configuration for these settings. Performance is `PowerSaving`; the engine
     /// forces low latency for exclusive streams. The device is the default one.
@@ -507,6 +572,7 @@ impl From<OutputSampleFormat> for SampleKind {
             OutputSampleFormat::Float => SampleKind::F32,
             OutputSampleFormat::Int32 => SampleKind::I32,
             OutputSampleFormat::Int24Packed => SampleKind::I24Packed,
+            OutputSampleFormat::Int16 => SampleKind::I16,
         }
     }
 }
@@ -517,6 +583,7 @@ impl From<SampleKind> for OutputSampleFormat {
             SampleKind::F32 => OutputSampleFormat::Float,
             SampleKind::I32 => OutputSampleFormat::Int32,
             SampleKind::I24Packed => OutputSampleFormat::Int24Packed,
+            SampleKind::I16 => OutputSampleFormat::Int16,
         }
     }
 }
@@ -536,6 +603,89 @@ pub(crate) fn output_info_from(info: AAudioStreamInfo, xruns: i32) -> OutputInfo
         frames_per_burst: info.frames_per_burst,
         buffer_frames: info.buffer_frames,
         xruns,
+    }
+}
+
+impl From<PathMode> for OutputPathMode {
+    fn from(m: PathMode) -> Self {
+        match m {
+            PathMode::BitPerfect => OutputPathMode::BitPerfect,
+            PathMode::Exclusive => OutputPathMode::Exclusive,
+            PathMode::Mixer => OutputPathMode::Mixer,
+        }
+    }
+}
+
+impl From<OutputPathMode> for PathMode {
+    fn from(m: OutputPathMode) -> Self {
+        match m {
+            OutputPathMode::BitPerfect => PathMode::BitPerfect,
+            OutputPathMode::Exclusive => PathMode::Exclusive,
+            OutputPathMode::Mixer => PathMode::Mixer,
+        }
+    }
+}
+
+impl From<RouteRequest> for RouteRequestInfo {
+    /// Exclusive is taken from the user's sharing mode; the other fields map one to one.
+    fn from(r: RouteRequest) -> Self {
+        RouteRequestInfo {
+            sample_rate: r.sample_rate,
+            channels: u32::from(r.channels),
+            source_bits: r.source_bits,
+            requested: r.requested.into(),
+            exclusive: r.config.sharing == Sharing::Exclusive,
+        }
+    }
+}
+
+impl From<RoutePlanInfo> for RoutePlan {
+    /// Exclusive selects `Sharing::Exclusive` with `Performance::LowLatency` (the MMAP path needs
+    /// it); otherwise the stream is shared and power saving.
+    fn from(p: RoutePlanInfo) -> Self {
+        RoutePlan {
+            device_id: p.device_id,
+            sample: p.sample_format.into(),
+            sharing: if p.exclusive {
+                Sharing::Exclusive
+            } else {
+                Sharing::Shared
+            },
+            performance: if p.exclusive {
+                Performance::LowLatency
+            } else {
+                Performance::PowerSaving
+            },
+            bit_perfect: p.bit_perfect,
+            hold: p.hold,
+        }
+    }
+}
+
+impl From<RoutePlan> for RoutePlanInfo {
+    /// Only the sharing mode is exported; the performance mode is implied by it.
+    fn from(p: RoutePlan) -> Self {
+        RoutePlanInfo {
+            device_id: p.device_id,
+            sample_format: p.sample.into(),
+            exclusive: p.sharing == Sharing::Exclusive,
+            bit_perfect: p.bit_perfect,
+            hold: p.hold,
+        }
+    }
+}
+
+impl From<SignalPath> for SignalPathInfo {
+    /// The stream's xruns are not part of the path, so the exported stream has `xruns` 0.
+    fn from(p: SignalPath) -> Self {
+        SignalPathInfo {
+            mode: p.mode.into(),
+            plan: p.plan.into(),
+            stream: p.stream.map(|s| output_info_from(s, 0)),
+            error: p.error,
+            source_rate: p.source_rate,
+            source_bits: p.source_bits,
+        }
     }
 }
 
@@ -1006,6 +1156,7 @@ mod tests {
             (OutputSampleFormat::Float, SampleKind::F32),
             (OutputSampleFormat::Int32, SampleKind::I32),
             (OutputSampleFormat::Int24Packed, SampleKind::I24Packed),
+            (OutputSampleFormat::Int16, SampleKind::I16),
         ] {
             assert_eq!(SampleKind::from(format), kind);
             assert_eq!(OutputSampleFormat::from(kind), format);
@@ -1088,6 +1239,210 @@ mod tests {
         assert!(!out.low_latency);
         assert_eq!(out.sample_format, OutputSampleFormat::Float);
         assert_eq!(out.xruns, 0);
+    }
+
+    #[test]
+    fn path_mode_maps_both_ways() {
+        for (mode, out) in [
+            (PathMode::BitPerfect, OutputPathMode::BitPerfect),
+            (PathMode::Exclusive, OutputPathMode::Exclusive),
+            (PathMode::Mixer, OutputPathMode::Mixer),
+        ] {
+            assert_eq!(OutputPathMode::from(mode), out);
+            assert_eq!(PathMode::from(out), mode);
+        }
+    }
+
+    #[test]
+    fn route_request_maps_fields_and_exclusive_from_sharing() {
+        let request = |sharing| RouteRequest {
+            sample_rate: 96_000,
+            channels: 2,
+            source_bits: Some(24),
+            requested: SampleKind::I24Packed,
+            config: AAudioConfig {
+                sharing,
+                performance: Performance::None,
+                device_id: Some(5),
+            },
+        };
+        assert_eq!(
+            RouteRequestInfo::from(request(Sharing::Exclusive)),
+            RouteRequestInfo {
+                sample_rate: 96_000,
+                channels: 2,
+                source_bits: Some(24),
+                requested: OutputSampleFormat::Int24Packed,
+                exclusive: true,
+            }
+        );
+        assert!(!RouteRequestInfo::from(request(Sharing::Shared)).exclusive);
+    }
+
+    #[test]
+    fn route_plan_info_to_plan_sets_sharing_and_performance() {
+        let info = |exclusive| RoutePlanInfo {
+            device_id: Some(9),
+            sample_format: OutputSampleFormat::Int16,
+            exclusive,
+            bit_perfect: true,
+            hold: true,
+        };
+        assert_eq!(
+            RoutePlan::from(info(true)),
+            RoutePlan {
+                device_id: Some(9),
+                sample: SampleKind::I16,
+                sharing: Sharing::Exclusive,
+                performance: Performance::LowLatency,
+                bit_perfect: true,
+                hold: true,
+            }
+        );
+        assert_eq!(
+            RoutePlan::from(info(false)),
+            RoutePlan {
+                device_id: Some(9),
+                sample: SampleKind::I16,
+                sharing: Sharing::Shared,
+                performance: Performance::PowerSaving,
+                bit_perfect: true,
+                hold: true,
+            }
+        );
+    }
+
+    #[test]
+    fn route_plan_to_info_keeps_sharing_as_exclusive_flag() {
+        let plan = |sharing, performance| RoutePlan {
+            device_id: None,
+            sample: SampleKind::I32,
+            sharing,
+            performance,
+            bit_perfect: false,
+            hold: false,
+        };
+        let exclusive = RoutePlanInfo::from(plan(Sharing::Exclusive, Performance::LowLatency));
+        assert_eq!(
+            exclusive,
+            RoutePlanInfo {
+                device_id: None,
+                sample_format: OutputSampleFormat::Int32,
+                exclusive: true,
+                bit_perfect: false,
+                hold: false,
+            }
+        );
+        assert!(!RoutePlanInfo::from(plan(Sharing::Shared, Performance::None)).exclusive);
+    }
+
+    #[test]
+    fn route_plan_to_info_exports_hold() {
+        let held = RoutePlan {
+            device_id: Some(4),
+            sample: SampleKind::I32,
+            sharing: Sharing::Shared,
+            performance: Performance::PowerSaving,
+            bit_perfect: false,
+            hold: true,
+        };
+        assert!(RoutePlanInfo::from(held).hold);
+    }
+
+    #[test]
+    fn route_plan_info_round_trips_through_plan() {
+        for exclusive in [true, false] {
+            for hold in [true, false] {
+                let info = RoutePlanInfo {
+                    device_id: Some(2),
+                    sample_format: OutputSampleFormat::Int24Packed,
+                    exclusive,
+                    bit_perfect: true,
+                    hold,
+                };
+                assert_eq!(RoutePlanInfo::from(RoutePlan::from(info)), info);
+            }
+        }
+    }
+
+    #[test]
+    fn signal_path_info_exports_stream_with_zero_xruns() {
+        let path = SignalPath {
+            mode: PathMode::BitPerfect,
+            plan: RoutePlan {
+                device_id: Some(7),
+                sample: SampleKind::I24Packed,
+                sharing: Sharing::Exclusive,
+                performance: Performance::LowLatency,
+                bit_perfect: true,
+                hold: false,
+            },
+            stream: Some(AAudioStreamInfo {
+                sample_rate: 96_000,
+                channels: 2,
+                sample: SampleKind::I24Packed,
+                sharing: Sharing::Exclusive,
+                performance: Performance::LowLatency,
+                device_id: 7,
+                frames_per_burst: 192,
+                buffer_frames: 768,
+            }),
+            error: None,
+            source_rate: 96_000,
+            source_bits: Some(24),
+        };
+        assert_eq!(
+            SignalPathInfo::from(path),
+            SignalPathInfo {
+                mode: OutputPathMode::BitPerfect,
+                plan: RoutePlanInfo {
+                    device_id: Some(7),
+                    sample_format: OutputSampleFormat::Int24Packed,
+                    exclusive: true,
+                    bit_perfect: true,
+                    hold: false,
+                },
+                stream: Some(OutputInfo {
+                    backend: "aaudio".to_owned(),
+                    sample_rate: 96_000,
+                    channels: 2,
+                    sample_format: OutputSampleFormat::Int24Packed,
+                    exclusive: true,
+                    low_latency: true,
+                    device_id: 7,
+                    frames_per_burst: 192,
+                    buffer_frames: 768,
+                    xruns: 0,
+                }),
+                error: None,
+                source_rate: 96_000,
+                source_bits: Some(24),
+            }
+        );
+    }
+
+    #[test]
+    fn signal_path_info_keeps_error_when_open_failed() {
+        let path = SignalPath {
+            mode: PathMode::Mixer,
+            plan: RoutePlan {
+                device_id: None,
+                sample: SampleKind::F32,
+                sharing: Sharing::Shared,
+                performance: Performance::None,
+                bit_perfect: false,
+                hold: false,
+            },
+            stream: None,
+            error: Some("device gone".to_owned()),
+            source_rate: 44_100,
+            source_bits: None,
+        };
+        let info = SignalPathInfo::from(path);
+        assert_eq!(info.mode, OutputPathMode::Mixer);
+        assert_eq!(info.stream, None);
+        assert_eq!(info.error.as_deref(), Some("device gone"));
+        assert_eq!(info.source_bits, None);
     }
 
     #[test]

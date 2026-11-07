@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sonorus_core::router::OutputRouter;
 use sonorus_core::types::{
     AlbumInfo, AlbumSort, CoreConfig, CoreEvent, OutputSampleFormat, OutputSettings, PlaybackState,
-    S3Settings, TrackInfo,
+    RoutePlanInfo, RouteRequestInfo, S3Settings, SignalPathInfo, TrackInfo,
 };
 use sonorus_core::{CoreError, EventListener, SonorusCore};
 
@@ -546,4 +547,65 @@ fn playback_works_with_each_output_format() {
         );
         core.stop();
     }
+}
+
+/// Plans every open as the default route for the requested format. Its only purpose is to be
+/// set on the core and called by the engine (on Android).
+struct PassthroughRouter;
+
+impl OutputRouter for PassthroughRouter {
+    fn plan(&self, request: RouteRequestInfo) -> RoutePlanInfo {
+        RoutePlanInfo {
+            device_id: None,
+            sample_format: request.requested,
+            exclusive: request.exclusive,
+            bit_perfect: false,
+            hold: false,
+        }
+    }
+
+    fn opened(&self, _path: SignalPathInfo) {}
+}
+
+#[test]
+fn output_router_set_and_clear_keeps_playback_working() {
+    let dir = TempDir::new("router");
+    let (core, _rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+
+    let album = album_by_title(&core, "Album One");
+    let first = core
+        .album_tracks(album.id)
+        .expect("album tracks")
+        .first()
+        .expect("first track")
+        .id;
+
+    // Set before any player exists: the next player is built with the router.
+    core.set_output_router(Arc::new(PassthroughRouter));
+    // No AAudio stream exists off Android, so there is no signal path to report.
+    assert!(core.signal_path().is_none());
+
+    let rec = Arc::new(Recorder::default());
+    core.set_listener(rec.clone());
+    core.play_album(album.id, 0).expect("play with router");
+    rec.wait_for(
+        |e| matches!(e, CoreEvent::Position { track_id, .. } if *track_id == first),
+        "position with router set",
+    );
+    core.stop();
+
+    // Clear while a player exists: it goes back to the default planner.
+    core.clear_output_router();
+    assert!(core.signal_path().is_none());
+
+    let rec = Arc::new(Recorder::default());
+    core.set_listener(rec.clone());
+    core.play_album(album.id, 0).expect("play after clear");
+    rec.wait_for(
+        |e| matches!(e, CoreEvent::Position { track_id, .. } if *track_id == first),
+        "position after clearing the router",
+    );
+    core.stop();
+    core.clear_output_router(); // idempotent
 }

@@ -108,6 +108,110 @@ pub(crate) fn check_negotiated(
     ))
 }
 
+/// What kind of path the audio takes to the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMode {
+    /// Integer samples copied unchanged to the device (see [`path_mode`]).
+    BitPerfect,
+    /// Exclusive device access, but not bit-perfect.
+    Exclusive,
+    /// Shared mixer.
+    Mixer,
+}
+
+/// Asked before each stream open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRequest {
+    /// Sample rate of the source (the rate the stream is opened at).
+    pub sample_rate: u32,
+    /// Channel count of the source.
+    pub channels: u16,
+    /// Bit depth of the decoded source, when known.
+    pub source_bits: Option<u32>,
+    /// Sample kind the player asks for.
+    pub requested: SampleKind,
+    /// The user's AAudio configuration.
+    pub config: AAudioConfig,
+}
+
+/// How to open the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutePlan {
+    /// Device to open, or `None` for the default device.
+    pub device_id: Option<i32>,
+    /// Sample representation to open the stream with.
+    pub sample: SampleKind,
+    /// Sharing mode to request.
+    pub sharing: Sharing,
+    /// Performance mode to request (already adjusted for the sharing mode).
+    pub performance: Performance,
+    /// Whether the route is meant to be bit-perfect.
+    pub bit_perfect: bool,
+    /// Open the stream but do not restart it automatically after a disconnect reopen; an explicit
+    /// play still starts it. Set by a router while the output device has just been removed and
+    /// the app is pausing.
+    pub hold: bool,
+}
+
+/// What actually happened, reported after each open attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalPath {
+    /// Path the audio takes (`Mixer` when the open failed).
+    pub mode: PathMode,
+    /// The plan the open was attempted with.
+    pub plan: RoutePlan,
+    /// Negotiated stream, `None` when the open failed.
+    pub stream: Option<StreamInfo>,
+    /// Open error message, `None` on success.
+    pub error: Option<String>,
+    /// Sample rate of the source.
+    pub source_rate: u32,
+    /// Bit depth of the source, when known.
+    pub source_bits: Option<u32>,
+}
+
+/// Chooses the route for each open. Called off the audio thread, without the sink lock held; may
+/// block briefly (binder calls).
+pub trait RoutePlanner: Send + Sync {
+    /// Plans the open for `request`.
+    fn plan(&self, request: &RouteRequest) -> RoutePlan;
+    /// Reports the outcome of an open attempt made with the planner's plan.
+    fn opened(&self, path: &SignalPath);
+}
+
+/// The planner used when none is set: the user's config and requested sample kind, no device
+/// preference.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPlanner;
+
+impl RoutePlanner for DefaultPlanner {
+    fn plan(&self, request: &RouteRequest) -> RoutePlan {
+        RoutePlan {
+            device_id: request.config.device_id,
+            sample: request.requested,
+            sharing: request.config.sharing,
+            performance: request.config.effective_performance(),
+            bit_perfect: false,
+            hold: false,
+        }
+    }
+
+    fn opened(&self, _path: &SignalPath) {}
+}
+
+/// Classifies an opened stream. `BitPerfect` requires `plan.bit_perfect`, an integer sample kind
+/// (not `F32`) and that the device got exactly the planned kind; otherwise `Exclusive` when the
+/// stream is exclusive, else `Mixer`.
+pub fn path_mode(plan: &RoutePlan, stream: &StreamInfo) -> PathMode {
+    if plan.bit_perfect && stream.sample != SampleKind::F32 && stream.sample == plan.sample {
+        PathMode::BitPerfect
+    } else if stream.sharing == Sharing::Exclusive {
+        PathMode::Exclusive
+    } else {
+        PathMode::Mixer
+    }
+}
+
 /// Output latency of one buffer: `buffer_frames / sample_rate`. A zero rate gives zero.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn latency_for(buffer_frames: u32, sample_rate: u32) -> Duration {
@@ -126,7 +230,152 @@ mod tests {
             sample_rate: 96_000,
             channels: 2,
             sample: SampleKind::I32,
+            source_bits: None,
         }
+    }
+
+    fn stream(sample: SampleKind, sharing: Sharing) -> StreamInfo {
+        StreamInfo {
+            sample_rate: 96_000,
+            channels: 2,
+            sample,
+            sharing,
+            performance: Performance::LowLatency,
+            device_id: 7,
+            frames_per_burst: 192,
+            buffer_frames: 768,
+        }
+    }
+
+    fn plan(sample: SampleKind, bit_perfect: bool) -> RoutePlan {
+        RoutePlan {
+            device_id: None,
+            sample,
+            sharing: Sharing::Shared,
+            performance: Performance::None,
+            bit_perfect,
+            hold: false,
+        }
+    }
+
+    fn request(config: AAudioConfig) -> RouteRequest {
+        RouteRequest {
+            sample_rate: 96_000,
+            channels: 2,
+            source_bits: Some(24),
+            requested: SampleKind::I24Packed,
+            config,
+        }
+    }
+
+    #[test]
+    fn default_planner_uses_config_and_requested_kind() {
+        let config = AAudioConfig {
+            sharing: Sharing::Shared,
+            performance: Performance::None,
+            device_id: Some(3),
+        };
+        let p = DefaultPlanner.plan(&request(config));
+        assert_eq!(
+            p,
+            RoutePlan {
+                device_id: Some(3),
+                sample: SampleKind::I24Packed,
+                sharing: Sharing::Shared,
+                performance: Performance::None,
+                bit_perfect: false,
+                hold: false,
+            }
+        );
+    }
+
+    #[test]
+    fn default_planner_never_holds() {
+        let config = AAudioConfig {
+            sharing: Sharing::Exclusive,
+            performance: Performance::PowerSaving,
+            device_id: Some(5),
+        };
+        assert!(!DefaultPlanner.plan(&request(config)).hold);
+    }
+
+    #[test]
+    fn default_planner_applies_effective_performance() {
+        let config = AAudioConfig {
+            sharing: Sharing::Exclusive,
+            performance: Performance::PowerSaving,
+            device_id: None,
+        };
+        let p = DefaultPlanner.plan(&request(config));
+        assert_eq!(p.sharing, Sharing::Exclusive);
+        assert_eq!(p.performance, Performance::LowLatency);
+        assert!(!p.bit_perfect);
+        assert_eq!(p.device_id, None);
+    }
+
+    #[test]
+    fn default_planner_opened_is_a_no_op() {
+        let path = SignalPath {
+            mode: PathMode::Mixer,
+            plan: plan(SampleKind::F32, false),
+            stream: None,
+            error: Some("gone".to_owned()),
+            source_rate: 44_100,
+            source_bits: None,
+        };
+        DefaultPlanner.opened(&path);
+    }
+
+    #[test]
+    fn path_mode_bit_perfect_needs_integer_kind_matching_plan() {
+        let s = stream(SampleKind::I32, Sharing::Shared);
+        assert_eq!(
+            path_mode(&plan(SampleKind::I32, true), &s),
+            PathMode::BitPerfect
+        );
+        // Bit-perfect wins over exclusive.
+        let ex = stream(SampleKind::I24Packed, Sharing::Exclusive);
+        assert_eq!(
+            path_mode(&plan(SampleKind::I24Packed, true), &ex),
+            PathMode::BitPerfect
+        );
+    }
+
+    #[test]
+    fn path_mode_float_is_never_bit_perfect() {
+        let s = stream(SampleKind::F32, Sharing::Shared);
+        assert_eq!(path_mode(&plan(SampleKind::F32, true), &s), PathMode::Mixer);
+        let ex = stream(SampleKind::F32, Sharing::Exclusive);
+        assert_eq!(
+            path_mode(&plan(SampleKind::F32, true), &ex),
+            PathMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn path_mode_kind_mismatch_falls_through() {
+        // Device gave I32 although I16 was planned: not bit-perfect.
+        let s = stream(SampleKind::I32, Sharing::Shared);
+        assert_eq!(path_mode(&plan(SampleKind::I16, true), &s), PathMode::Mixer);
+        let ex = stream(SampleKind::I32, Sharing::Exclusive);
+        assert_eq!(
+            path_mode(&plan(SampleKind::I16, true), &ex),
+            PathMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn path_mode_without_bit_perfect_flag() {
+        let shared = stream(SampleKind::I32, Sharing::Shared);
+        assert_eq!(
+            path_mode(&plan(SampleKind::I32, false), &shared),
+            PathMode::Mixer
+        );
+        let ex = stream(SampleKind::I32, Sharing::Exclusive);
+        assert_eq!(
+            path_mode(&plan(SampleKind::I32, false), &ex),
+            PathMode::Exclusive
+        );
     }
 
     #[test]

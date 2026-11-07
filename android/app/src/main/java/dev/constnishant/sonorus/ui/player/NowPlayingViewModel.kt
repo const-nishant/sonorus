@@ -4,8 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.RepeatMode
+import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.PlaybackUi
+import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +28,12 @@ data class FavoriteOverride(val trackId: Long, val favorite: Boolean)
 class NowPlayingViewModel(private val repository: SonorusRepository) : ViewModel() {
     /** Playback state from the core. */
     val playback: StateFlow<PlaybackUi> = repository.events.playback
+
+    /** The signal path of the last stream open, or null before the first one. */
+    val signalPath: StateFlow<SignalPathInfo?> = repository.signalPath
+
+    /** The connected USB DAC, or null when none is connected. */
+    val dac: StateFlow<UsbDac?> = repository.dac
 
     private val _favoriteOverride = MutableStateFlow<FavoriteOverride?>(null)
 

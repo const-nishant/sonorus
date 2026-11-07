@@ -1,5 +1,6 @@
 package dev.constnishant.sonorus.ui.components
 
+import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.TrackInfo
 
 /** `m:ss`, or `h:mm:ss` from one hour; "--:--" when unknown. */
@@ -30,6 +31,14 @@ fun TrackInfo.qualityLabel(): String? {
     val rate = sampleRate ?: return codec
     val bits = bitsPerSample
     return if (bits != null) "$codec $bits/${formatKhz(rate)}" else "$codec ${formatKhz(rate)} kHz"
+}
+
+/** Short label for an output sample format, such as "24-bit". */
+fun OutputSampleFormat.label(): String = when (this) {
+    OutputSampleFormat.FLOAT -> "Float"
+    OutputSampleFormat.INT32 -> "32-bit"
+    OutputSampleFormat.INT24_PACKED -> "24-bit"
+    OutputSampleFormat.INT16 -> "16-bit"
 }
 
 /** True for anything above CD quality (more than 16 bits or more than 48 kHz). */

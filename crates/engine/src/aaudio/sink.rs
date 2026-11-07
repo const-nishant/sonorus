@@ -3,6 +3,10 @@
 //!
 //! One mutex guards the session state. The data and error callbacks never touch it. A supervisor
 //! thread ("sonorus-aaudio") reopens the stream after an error reported by the error callback.
+//!
+//! Every open is two-phase: the [`RoutePlanner`] is asked for a plan without the lock held, then
+//! the stream is opened under the lock with that plan. The outcome is stored for
+//! [`AAudioHandle::signal_path`] and reported to the planner after the lock is released.
 
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -10,7 +14,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::stream::{CallbackState, ErrorContext, Stream, SupervisorMsg, error_text};
-use super::{AAudioConfig, StreamInfo, latency_for};
+use super::{
+    AAudioConfig, DefaultPlanner, PathMode, RoutePlan, RoutePlanner, RouteRequest, SignalPath,
+    StreamInfo, latency_for, path_mode,
+};
 use crate::error::{EngineError, Result};
 use crate::output::{OutputFormat, OutputSink};
 use crate::render::RingStats;
@@ -35,46 +42,144 @@ struct Inner {
     generation: u64,
     info: Option<StreamInfo>,
     tx: SyncSender<SupervisorMsg>,
+    /// Chooses the route for each open.
+    planner: Arc<dyn RoutePlanner>,
+    /// Plan of the current or parked stream.
+    plan: Option<RoutePlan>,
+    /// Outcome of the last open attempt.
+    last_path: Option<SignalPath>,
 }
 
 fn lock(shared: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Opens the stream for the current format. On success the stream is stored (stopped). On
-/// failure the state is parked for a later reopen and the message is returned.
-fn open_locked(inner: &mut Inner, state: Box<CallbackState>) -> std::result::Result<(), String> {
-    let Some(format) = inner.format else {
-        return Err("no output format".to_owned());
-    };
+/// Asks `planner` for the route of `format`. Must be called without the sink lock.
+fn plan_route(planner: &dyn RoutePlanner, format: OutputFormat, config: AAudioConfig) -> RoutePlan {
+    planner.plan(&RouteRequest {
+        sample_rate: format.sample_rate,
+        channels: format.channels,
+        source_bits: format.source_bits,
+        requested: format.sample,
+        config,
+    })
+}
+
+/// Path record for an attempt that did not open a stream.
+fn failed_path(
+    plan: RoutePlan,
+    source_rate: u32,
+    source_bits: Option<u32>,
+    error: String,
+) -> SignalPath {
+    SignalPath {
+        mode: PathMode::Mixer,
+        plan,
+        stream: None,
+        error: Some(error),
+        source_rate,
+        source_bits,
+    }
+}
+
+/// Opens the stream for the session format with `plan`. On success the stream is stored (stopped).
+/// On failure the state is parked for a later reopen. The outcome is stored in `last_path` and
+/// returned; the caller reports it to the planner after releasing the lock.
+fn open_with_plan(inner: &mut Inner, state: Box<CallbackState>, plan: RoutePlan) -> SignalPath {
     inner.info = None;
-    inner.generation = inner.generation.wrapping_add(1);
-    let err = Box::new(ErrorContext {
-        generation: inner.generation,
-        tx: inner.tx.clone(),
-    });
-    match Stream::open(format, &inner.config, state, err) {
-        Ok(stream) => {
-            let info = stream.info();
+    inner.plan = Some(plan);
+    let source = inner.format;
+    let (source_rate, source_bits) = source.map_or((0, None), |f| (f.sample_rate, f.source_bits));
+    let path = match source {
+        None => {
+            inner.parked = Some(state);
+            failed_path(
+                plan,
+                source_rate,
+                source_bits,
+                "no output format".to_owned(),
+            )
+        }
+        Some(format) => {
+            inner.generation = inner.generation.wrapping_add(1);
             log::info!(
-                "aaudio: opened {} Hz, {} ch, {:?}, {:?}/{:?}, device {}, burst {}, buffer {}",
-                info.sample_rate,
-                info.channels,
-                info.sample,
-                info.sharing,
-                info.performance,
-                info.device_id,
-                info.frames_per_burst,
-                info.buffer_frames
+                "aaudio: plan device {:?}, {:?}, {:?}/{:?}, bit-perfect {}",
+                plan.device_id,
+                plan.sample,
+                plan.sharing,
+                plan.performance,
+                plan.bit_perfect
             );
-            inner.info = Some(info);
-            inner.stream = Some(stream);
-            Ok(())
+            let err = Box::new(ErrorContext {
+                generation: inner.generation,
+                tx: inner.tx.clone(),
+            });
+            match Stream::open(format, &plan, state, err) {
+                Ok(stream) => {
+                    let info = stream.info();
+                    log::info!(
+                        "aaudio: opened {} Hz, {} ch, {:?}, {:?}/{:?}, device {}, burst {}, buffer {}",
+                        info.sample_rate,
+                        info.channels,
+                        info.sample,
+                        info.sharing,
+                        info.performance,
+                        info.device_id,
+                        info.frames_per_burst,
+                        info.buffer_frames
+                    );
+                    let mode = path_mode(&plan, &info);
+                    inner.info = Some(info);
+                    inner.stream = Some(stream);
+                    SignalPath {
+                        mode,
+                        plan,
+                        stream: Some(info),
+                        error: None,
+                        source_rate,
+                        source_bits,
+                    }
+                }
+                Err((state, msg)) => {
+                    inner.parked = state;
+                    failed_path(plan, source_rate, source_bits, msg)
+                }
+            }
         }
-        Err((state, msg)) => {
-            inner.parked = state;
-            Err(msg)
+    };
+    inner.last_path = Some(path.clone());
+    path
+}
+
+/// Opens the parked state (after a failed open or reopen) with a fresh plan, if a stream is wanted
+/// and not open. The planner runs without the lock.
+fn reopen_parked(shared: &Mutex<Inner>) {
+    let (planner, format, config) = {
+        let inner = lock(shared);
+        if inner.stream.is_some() || inner.parked.is_none() {
+            return;
         }
+        let Some(format) = inner.format else {
+            return;
+        };
+        (Arc::clone(&inner.planner), format, inner.config)
+    };
+    let plan = plan_route(planner.as_ref(), format, config);
+    let path = {
+        let mut guard = lock(shared);
+        let inner = &mut *guard;
+        // Stopped, or reopened by another caller while planning: nothing to do.
+        if inner.stream.is_some() || inner.format != Some(format) {
+            return;
+        }
+        let Some(state) = inner.parked.take() else {
+            return;
+        };
+        open_with_plan(inner, state, plan)
+    };
+    planner.opened(&path);
+    if let Some(msg) = &path.error {
+        log::warn!("aaudio: reopen on play failed: {msg}");
     }
 }
 
@@ -90,7 +195,8 @@ fn supervise(shared: Arc<Mutex<Inner>>, rx: Receiver<SupervisorMsg>) {
     }
 }
 
-/// Reopens the stream after an error from `generation`. The lock is released while sleeping.
+/// Reopens the stream after an error from `generation`. The lock is released while sleeping and
+/// while the planner runs. The state is parked during planning so `stop` and `play` see it.
 fn reopen(shared: &Mutex<Inner>, generation: u64, error: i32) {
     log::warn!(
         "aaudio: stream error {error} ({}), reopening",
@@ -100,40 +206,74 @@ fn reopen(shared: &Mutex<Inner>, generation: u64, error: i32) {
     for (attempt, delay) in RETRY_BACKOFF_MS.iter().enumerate() {
         thread::sleep(Duration::from_millis(*delay));
 
-        let mut guard = lock(shared);
-        let inner = &mut *guard;
-        // Stopped or replaced since the error: nothing left to reopen.
-        if inner.generation != expected || (inner.stream.is_none() && inner.parked.is_none()) {
-            return;
-        }
-        let state = match inner.stream.take() {
-            Some(stream) => stream.close(),
-            None => inner.parked.take(),
-        };
-        let Some(state) = state else {
-            log::error!("aaudio: the ring was lost with the old stream; cannot reopen");
-            return;
-        };
-
-        match open_locked(inner, state) {
-            Ok(()) => {
-                if inner.playing
-                    && let Some(stream) = inner.stream.as_ref()
-                    && let Err(msg) = stream.request_start()
-                {
-                    log::warn!("aaudio: restart after reopen failed: {msg}");
-                }
+        // Phase 1 (locked): close the old stream or take the parked state, and park it again.
+        let (planner, format, config) = {
+            let mut guard = lock(shared);
+            let inner = &mut *guard;
+            // Stopped or replaced since the error: nothing left to reopen.
+            if inner.generation != expected || (inner.stream.is_none() && inner.parked.is_none()) {
                 return;
             }
-            Err(msg) => {
-                expected = inner.generation;
-                log::warn!(
-                    "aaudio: reopen attempt {} of {} failed: {msg}",
-                    attempt + 1,
-                    RETRY_BACKOFF_MS.len()
-                );
+            let Some(format) = inner.format else {
+                return;
+            };
+            let state = match inner.stream.take() {
+                Some(stream) => stream.close(),
+                None => inner.parked.take(),
+            };
+            let Some(state) = state else {
+                log::error!("aaudio: the ring was lost with the old stream; cannot reopen");
+                return;
+            };
+            inner.parked = Some(state);
+            (Arc::clone(&inner.planner), format, inner.config)
+        };
+
+        // Phase 2 (unlocked): the device may be gone, so plan again on every attempt.
+        let plan = plan_route(planner.as_ref(), format, config);
+
+        // Phase 3 (locked): open with the plan.
+        let path = {
+            let mut guard = lock(shared);
+            let inner = &mut *guard;
+            // Stopped, or replaced by `play` while planning: leave it to the new owner.
+            if inner.generation != expected
+                || inner.stream.is_some()
+                || inner.format != Some(format)
+            {
+                return;
             }
-        }
+            let Some(state) = inner.parked.take() else {
+                return;
+            };
+            let hold = plan.hold;
+            let path = open_with_plan(inner, state, plan);
+            if hold {
+                // Stays stopped until an explicit play, even if the open failed and retries.
+                inner.playing = false;
+                if path.error.is_none() {
+                    log::info!("aaudio: reopened held (output device removed); waiting for play");
+                }
+            } else if path.error.is_none()
+                && inner.playing
+                && let Some(stream) = inner.stream.as_ref()
+                && let Err(msg) = stream.request_start()
+            {
+                log::warn!("aaudio: restart after reopen failed: {msg}");
+            }
+            expected = inner.generation;
+            path
+        };
+        planner.opened(&path);
+
+        let Some(msg) = path.error else {
+            return;
+        };
+        log::warn!(
+            "aaudio: reopen attempt {} of {} failed: {msg}",
+            attempt + 1,
+            RETRY_BACKOFF_MS.len()
+        );
     }
     log::error!("aaudio: could not reopen the output; will retry on play");
 }
@@ -147,6 +287,7 @@ pub struct AAudioSink {
 
 impl AAudioSink {
     /// Creates the sink and starts its supervisor thread. No stream is opened until `start`.
+    /// The planner is [`DefaultPlanner`] until one is set.
     pub fn new(config: AAudioConfig) -> Result<AAudioSink> {
         let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
         let shared = Arc::new(Mutex::new(Inner {
@@ -158,6 +299,9 @@ impl AAudioSink {
             generation: 0,
             info: None,
             tx: tx.clone(),
+            planner: Arc::new(DefaultPlanner),
+            plan: None,
+            last_path: None,
         }));
         let supervisor_shared = Arc::clone(&shared);
         let supervisor = thread::Builder::new()
@@ -168,6 +312,16 @@ impl AAudioSink {
             tx,
             supervisor: Some(supervisor),
         })
+    }
+
+    /// Like [`AAudioSink::new`], with `planner` installed before the first open.
+    pub fn with_planner(
+        config: AAudioConfig,
+        planner: Arc<dyn RoutePlanner>,
+    ) -> Result<AAudioSink> {
+        let sink = AAudioSink::new(config)?;
+        lock(&sink.shared).planner = planner;
+        Ok(sink)
     }
 
     /// Cloneable handle for reading and changing configuration and stream info.
@@ -198,28 +352,37 @@ impl OutputSink for AAudioSink {
             channels: usize::from(format.channels),
             sample: format.sample,
         });
-        let mut guard = lock(&self.shared);
-        let inner = &mut *guard;
-        inner.format = Some(format);
-        inner.playing = false;
-        if let Err(msg) = open_locked(inner, state) {
-            inner.parked = None;
-            inner.format = None;
+        // Phase 1 (unlocked): plan the route.
+        let (planner, config) = {
+            let inner = lock(&self.shared);
+            (Arc::clone(&inner.planner), inner.config)
+        };
+        let plan = plan_route(planner.as_ref(), format, config);
+
+        // Phase 2 (locked): open with the plan.
+        let path = {
+            let mut guard = lock(&self.shared);
+            let inner = &mut *guard;
+            inner.format = Some(format);
+            inner.playing = false;
+            let path = open_with_plan(inner, state, plan);
+            if path.error.is_some() {
+                inner.parked = None;
+                inner.format = None;
+            }
+            path
+        };
+        planner.opened(&path);
+        if let Some(msg) = path.error {
             return Err(EngineError::Unsupported(format!("AAudio: {msg}")));
         }
         Ok(())
     }
 
     fn play(&mut self) -> Result<()> {
+        reopen_parked(&self.shared);
         let mut guard = lock(&self.shared);
         let inner = &mut *guard;
-        if inner.stream.is_none()
-            && inner.format.is_some()
-            && let Some(state) = inner.parked.take()
-            && let Err(msg) = open_locked(inner, state)
-        {
-            log::warn!("aaudio: reopen on play failed: {msg}");
-        }
         let Some(stream) = inner.stream.as_ref() else {
             return Err(EngineError::Unsupported(
                 "AAudio stream is not open".to_string(),
@@ -250,12 +413,13 @@ impl OutputSink for AAudioSink {
         if let Some(stream) = inner.stream.take() {
             let xruns = stream.xruns();
             let state = stream.close();
-            log::info!("aaudio: closed, xruns {xruns}");
+            log::info!("aaudio: closed, xruns {xruns}, plan {:?}", inner.plan);
             drop(state);
         }
         inner.parked = None;
         inner.format = None;
         inner.info = None;
+        inner.plan = None;
         inner.playing = false;
     }
 
@@ -303,6 +467,16 @@ impl AAudioHandle {
     /// Stores a new configuration for the next open. Does not reopen a live stream.
     pub fn set_config(&self, config: AAudioConfig) {
         lock(&self.shared).config = config;
+    }
+
+    /// Planner used by the next open (and every reopen).
+    pub fn set_planner(&self, planner: Arc<dyn RoutePlanner>) {
+        lock(&self.shared).planner = planner;
+    }
+
+    /// Outcome of the last open attempt, `None` before the first one.
+    pub fn signal_path(&self) -> Option<SignalPath> {
+        lock(&self.shared).last_path.clone()
     }
 
     /// Xrun count of the open stream, `None` when closed.

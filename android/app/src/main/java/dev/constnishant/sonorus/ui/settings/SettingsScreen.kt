@@ -52,6 +52,7 @@ import dev.constnishant.sonorus.core.ScanProgressInfo
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.formatKhz
+import dev.constnishant.sonorus.ui.components.label
 
 /**
  * Settings: bucket connection, library scan and stats, playlist and favorite sync, and about
@@ -326,6 +327,30 @@ private fun OutputSection(state: SettingsUiState, viewModel: SettingsViewModel) 
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(text = "Bit-perfect to USB DAC", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "Sends each track to the DAC in its own format, untouched. Other sounds are " +
+                    "muted on the DAC while it plays.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = state.bitPerfect,
+            onCheckedChange = viewModel::setBitPerfect,
+        )
+    }
+    Text(
+        text = state.dacName?.let { "USB DAC: $it" } ?: "No USB DAC connected",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
     Text(
         text = state.outputInfo?.let(::outputLine) ?: "No active output stream",
         style = MaterialTheme.typography.bodySmall,
@@ -335,11 +360,7 @@ private fun OutputSection(state: SettingsUiState, viewModel: SettingsViewModel) 
 
 /** One line describing an open output stream, for the Output section. */
 private fun outputLine(info: OutputInfo): String {
-    val format = when (info.sampleFormat) {
-        OutputSampleFormat.FLOAT -> "Float"
-        OutputSampleFormat.INT32 -> "32-bit"
-        OutputSampleFormat.INT24_PACKED -> "24-bit"
-    }
+    val format = info.sampleFormat.label()
     val mode = if (info.exclusive) "Exclusive" else "Shared"
     val lowLatency = if (info.lowLatency) ", low latency" else ""
     return "${backendLabel(info.backend)} · ${formatKhz(info.sampleRate)} kHz · ${info.channels} ch · " +

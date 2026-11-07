@@ -175,6 +175,50 @@ pub fn render_i32(
     frames
 }
 
+/// Callback renderer for 16-bit integer outputs. Same contract as [`render_i32`], except that each
+/// sample keeps only its top 16 bits (`(s >> 16) as i16`, truncated, no rounding, no volume).
+#[deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+pub fn render_i16(
+    consumer: &mut rtrb::Consumer<i32>,
+    out: &mut [i16],
+    channels: usize,
+    stats: &RingStats,
+) -> usize {
+    if channels == 0 {
+        out.iter_mut().for_each(|x| *x = 0);
+        return 0;
+    }
+    let frames_wanted = out.len() / channels;
+    let frames_avail = consumer.slots() / channels;
+    let n = frames_wanted.min(frames_avail);
+
+    let mut frames = 0;
+    if n > 0
+        && let Ok(chunk) = consumer.read_chunk(n.saturating_mul(channels))
+    {
+        let (a, b) = chunk.as_slices();
+        for (dst, &s) in out.iter_mut().zip(a.iter().chain(b.iter())) {
+            *dst = (s >> 16) as i16;
+        }
+        chunk.commit_all();
+        frames = n;
+    }
+
+    let written = frames.saturating_mul(channels);
+    if let Some(tail) = out.get_mut(written..) {
+        tail.iter_mut().for_each(|x| *x = 0);
+    }
+    if written > 0 {
+        stats
+            .samples_played
+            .fetch_add(written as u64, Ordering::Release);
+    }
+    if frames < frames_wanted && !stats.decoder_done.load(Ordering::Acquire) {
+        stats.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+    frames
+}
+
 /// Callback renderer for 24-bit packed outputs. `out` holds little-endian packed samples, 3 bytes
 /// each; `out.len() / 3` is the sample capacity. Same contract as [`render_i32`] otherwise:
 /// samples are bit-perfect (no volume), the top three bytes of each left-justified `i32` are
@@ -313,6 +357,60 @@ mod tests {
         let mut out = [0i32; 6];
         assert_eq!(render_i32(&mut c, &mut out, CH, &stats), 6);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn render_i16_keeps_top_sixteen_bits() {
+        let stats = RingStats::new();
+        stats.set_volume(0.1); // must be ignored on the integer path
+        let (mut p, mut c) = ring(16);
+        let src = [
+            i32::MIN,      // -> i16::MIN
+            i32::MAX,      // -> i16::MAX
+            -1 << 16,      // -> -1
+            -1,            // -> -1 (arithmetic shift)
+            (1 << 16) - 1, // -> 0 (truncation, no rounding)
+            0x1234_5678,   // -> 0x1234
+            1 << 16,       // -> 1
+            0,             // -> 0
+        ];
+        assert_eq!(push_frames(&mut p, &src, CH, &stats), src.len());
+        let mut out = [0i16; 8];
+        assert_eq!(render_i16(&mut c, &mut out, CH, &stats), 8);
+        assert_eq!(out, [i16::MIN, i16::MAX, -1, -1, 0, 0x1234, 1, 0]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.samples_played.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn render_i16_short_counts_underrun_and_zero_fills_tail() {
+        let stats = RingStats::new();
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[0x0A0B_0000, 0x0C0D_0000], 2, &stats);
+        let mut out = [0x7777i16; 6];
+        assert_eq!(render_i16(&mut c, &mut out, 2, &stats), 1);
+        assert_eq!(out, [0x0A0B, 0x0C0D, 0, 0, 0, 0]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.samples_played.load(Ordering::Relaxed), 2);
+
+        // Decoder finished: the same shortfall is not an underrun.
+        stats.decoder_done.store(true, Ordering::Release);
+        let mut out2 = [0x7777i16; 2];
+        assert_eq!(render_i16(&mut c, &mut out2, 2, &stats), 0);
+        assert_eq!(out2, [0, 0]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn render_i16_channels_zero_is_safe() {
+        let stats = RingStats::new();
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[1 << 16, 2 << 16], CH, &stats);
+        let mut out = [0x7777i16; 2];
+        assert_eq!(render_i16(&mut c, &mut out, 0, &stats), 0);
+        assert_eq!(out, [0, 0]);
+        assert_eq!(stats.samples_played.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "android")]
 use sonorus_engine::aaudio::{AAudioHandle, AAudioSink};
+use sonorus_engine::aaudio::{DefaultPlanner, RoutePlanner};
 use sonorus_engine::opener::{FileOpener, StorageOpener, TrackOpener, TrackRef};
 #[cfg(not(target_os = "android"))]
 use sonorus_engine::output::NullSink;
@@ -35,12 +36,13 @@ use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventListener, ListenerSlot, spawn_pump};
+use crate::router::{OutputRouter, RouterPlanner};
 #[cfg(target_os = "android")]
 use crate::types::output_info_from;
 use crate::types::{
     AlbumInfo, AlbumSort, ArtistInfo, Converter, CoreConfig, CoreEvent, LibraryStatsInfo,
     OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, RepeatMode, S3Settings,
-    ScanProgressInfo, ScanSummary, SearchResult, SyncSummary, TrackInfo,
+    ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SyncSummary, TrackInfo,
 };
 
 /// Concurrent tag reads during a scan.
@@ -113,6 +115,9 @@ pub struct SonorusCore {
     scanning: AtomicBool,
     /// Output settings applied to the next player.
     output: Mutex<OutputSettings>,
+    /// The route planner (the [`RouterPlanner`] adapter) set by `set_output_router`. `None` means
+    /// the default planner. Lock order: never held while the `player` mutex is taken.
+    router: Mutex<Option<Arc<dyn RoutePlanner>>>,
     /// Option only so that `Drop` can shut it down. Always `Some` while the core is alive.
     rt: Option<Runtime>,
 }
@@ -143,6 +148,7 @@ impl SonorusCore {
             listener: ListenerSlot::default(),
             scanning: AtomicBool::new(false),
             output: Mutex::new(OutputSettings::default()),
+            router: Mutex::new(None),
             rt: Some(rt),
         }))
     }
@@ -563,6 +569,27 @@ impl SonorusCore {
     pub fn output_info(&self) -> Option<OutputInfo> {
         self.aaudio_output_info()
     }
+
+    /// Sets the router that chooses the output route for each stream the engine opens (USB DAC,
+    /// bit-perfect format). It applies to the next open, including one on the current player.
+    /// Non-blocking, but a router call may block briefly on the audio side.
+    pub fn set_output_router(&self, router: Arc<dyn OutputRouter>) {
+        let planner: Arc<dyn RoutePlanner> = Arc::new(RouterPlanner::new(router));
+        *self.router.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&planner));
+        self.apply_planner(planner);
+    }
+
+    /// Removes the output router. The next open uses the default route. Non-blocking.
+    pub fn clear_output_router(&self) {
+        *self.router.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.apply_planner(Arc::new(DefaultPlanner));
+    }
+
+    /// What the engine last opened or tried to open: mode, plan, stream and error. `None` before
+    /// the first open, when there is no player, or when not running on Android.
+    pub fn signal_path(&self) -> Option<SignalPathInfo> {
+        self.aaudio_signal_path()
+    }
 }
 
 impl SonorusCore {
@@ -601,6 +628,42 @@ impl SonorusCore {
     #[cfg(not(target_os = "android"))]
     fn aaudio_output_info(&self) -> Option<OutputInfo> {
         None
+    }
+
+    /// The outcome of the current player's last open attempt (Android only).
+    #[cfg(target_os = "android")]
+    fn aaudio_signal_path(&self) -> Option<SignalPathInfo> {
+        let guard = self.lock_player();
+        let slot = guard.as_ref()?;
+        slot.aaudio.signal_path().map(SignalPathInfo::from)
+    }
+
+    /// Other platforms have no AAudio stream.
+    #[cfg(not(target_os = "android"))]
+    fn aaudio_signal_path(&self) -> Option<SignalPathInfo> {
+        None
+    }
+
+    /// Installs `planner` on the current player's AAudio sink, so its next open uses it (Android
+    /// only; other platforms have no sink to configure).
+    #[cfg(target_os = "android")]
+    fn apply_planner(&self, planner: Arc<dyn RoutePlanner>) {
+        if let Some(slot) = self.lock_player().as_ref() {
+            slot.aaudio.set_planner(planner);
+        }
+    }
+
+    /// Other platforms have no AAudio sink.
+    #[cfg(not(target_os = "android"))]
+    fn apply_planner(&self, _planner: Arc<dyn RoutePlanner>) {}
+
+    /// The planner new sinks are built with: the stored router, else the default planner.
+    fn current_planner(&self) -> Arc<dyn RoutePlanner> {
+        self.router
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Arc::new(DefaultPlanner))
     }
 
     fn runtime(&self) -> CoreResult<&Runtime> {
@@ -657,7 +720,7 @@ impl SonorusCore {
             ..PlayerConfig::default()
         };
         #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
-        let (sink, handle) = make_sink(settings)?;
+        let (sink, handle) = make_sink(settings, self.current_planner())?;
         let (player, events) = Player::new(sink, opener, config);
         let pump =
             spawn_pump(events, Arc::clone(&self.library), self.listener.clone()).map_err(|e| {
@@ -760,20 +823,26 @@ type SinkHandle = AAudioHandle;
 #[cfg(not(target_os = "android"))]
 type SinkHandle = ();
 
-/// Output sink for the player, opened with `settings`, and the handle that reads its state.
-/// Android opens the AAudio sink; other platforms use a `NullSink`.
-fn make_sink(settings: OutputSettings) -> CoreResult<(Box<dyn OutputSink>, SinkHandle)> {
+/// Output sink for the player, opened with `settings` and `planner`, and the handle that reads its
+/// state. Android opens the AAudio sink; other platforms use a `NullSink`, which ignores the
+/// planner.
+fn make_sink(
+    settings: OutputSettings,
+    planner: Arc<dyn RoutePlanner>,
+) -> CoreResult<(Box<dyn OutputSink>, SinkHandle)> {
     #[cfg(target_os = "android")]
     {
-        let sink = AAudioSink::new(settings.aaudio_config()).map_err(|e| CoreError::Internal {
-            detail: format!("audio output: {e}"),
+        let sink = AAudioSink::with_planner(settings.aaudio_config(), planner).map_err(|e| {
+            CoreError::Internal {
+                detail: format!("audio output: {e}"),
+            }
         })?;
         let handle = sink.handle();
         Ok((Box::new(sink), handle))
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = settings;
+        let _ = (settings, planner);
         Ok((Box::new(NullSink::new()), ()))
     }
 }

@@ -6,8 +6,11 @@ import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSettings
 import dev.constnishant.sonorus.core.S3Settings
+import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.core.SonorusCore
 import dev.constnishant.sonorus.core.SyncSummary
+import dev.constnishant.sonorus.data.audio.UsbAudioRouter
+import dev.constnishant.sonorus.data.audio.UsbDac
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -39,6 +42,23 @@ class SonorusRepository(private val app: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /**
+     * Chooses the output route for each stream open: bit-perfect to a USB DAC when enabled, the
+     * mixer otherwise. Playback pauses when the DAC is unplugged so audio never jumps to the phone
+     * speaker.
+     */
+    private val router = UsbAudioRouter(
+        app,
+        bitPerfectEnabled = { output.bitPerfect() },
+        onDacDetached = { command { it.pause() } },
+    )
+
+    /** The connected USB DAC, or null when none is connected. */
+    val dac: StateFlow<UsbDac?> get() = router.dac
+
+    /** The signal path of the last stream open, or null before the first one. */
+    val signalPath: StateFlow<SignalPathInfo?> get() = router.signalPath
+
     private val _configured = MutableStateFlow(false)
 
     /**
@@ -56,6 +76,7 @@ class SonorusRepository(private val app: Context) {
                 localMusicDir = null,
             ),
         ).also {
+            it.setOutputRouter(router)
             it.setListener(events)
             it.setOutputSettings(output.load())
             _configured.value = it.isConfigured()
@@ -142,6 +163,14 @@ class SonorusRepository(private val app: Context) {
         call { it.setOutputSettings(settings) }
         withContext(Dispatchers.IO) { output.save(settings) }
         events.resetPlayback()
+    }
+
+    /**
+     * Stores the bit-perfect setting. It applies on the next stream open; the current stream is not
+     * reopened. Throws if the setting cannot be saved.
+     */
+    suspend fun setBitPerfect(enabled: Boolean) {
+        withContext(Dispatchers.IO) { output.setBitPerfect(enabled) }
     }
 
     /** The output stream the core has open, or null when nothing is open. */

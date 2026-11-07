@@ -1054,6 +1054,7 @@ impl Controller {
             sample_rate: info.sample_rate,
             channels: info.channels,
             sample: self.config.output_kind,
+            source_bits: info.bits_per_sample,
         };
         match self.sink.start(format, consumer, Arc::clone(&stats)) {
             Ok(()) => Some((producer, stats)),

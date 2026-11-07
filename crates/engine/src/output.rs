@@ -21,6 +21,9 @@ pub enum SampleKind {
     I32,
     /// 24-bit little-endian packed integers, 3 bytes per sample (bit-perfect path for 24-bit DACs).
     I24Packed,
+    /// 16-bit integers; lossless only for sources of 16 bits or less — used for bit-perfect output
+    /// to 16-bit DAC modes.
+    I16,
 }
 
 /// Format the output is opened with.
@@ -29,6 +32,8 @@ pub struct OutputFormat {
     pub sample_rate: u32,
     pub channels: u16,
     pub sample: SampleKind,
+    /// Bit depth of the decoded source, when known. Lets the output pick a lossless integer width.
+    pub source_bits: Option<u32>,
 }
 
 /// A destination that consumes an rtrb ring of left-justified `i32` samples.
@@ -215,6 +220,12 @@ fn spawn_pacer(
                     render::render_i24_packed(&mut consumer, &mut buf, channels, &stats);
                 });
             }
+            SampleKind::I16 => {
+                let mut buf = vec![0i16; samples];
+                pace(&quit, &playing, period, || {
+                    render::render_i16(&mut consumer, &mut buf, channels, &stats);
+                });
+            }
         })
 }
 
@@ -258,6 +269,7 @@ mod tests {
             sample_rate: RATE,
             channels: CH,
             sample,
+            source_bits: None,
         }
     }
 
@@ -316,6 +328,7 @@ mod tests {
             sample_rate: 0,
             channels: CH,
             sample: SampleKind::F32,
+            source_bits: None,
         };
         assert!(matches!(
             sink.start(bad_rate, c, s),
@@ -326,6 +339,7 @@ mod tests {
             sample_rate: RATE,
             channels: 0,
             sample: SampleKind::F32,
+            source_bits: None,
         };
         assert!(matches!(
             sink.start(bad_ch, c, s),
@@ -361,6 +375,18 @@ mod tests {
         let (c, stats) = preloaded();
         let mut sink = NullSink::new();
         sink.start(fmt(SampleKind::I24Packed), c, Arc::clone(&stats))
+            .unwrap();
+        sink.play().unwrap();
+        thread::sleep(Duration::from_millis(60));
+        sink.stop();
+        assert!(played(&stats) > 0);
+    }
+
+    #[test]
+    fn i16_format_consumes() {
+        let (c, stats) = preloaded();
+        let mut sink = NullSink::new();
+        sink.start(fmt(SampleKind::I16), c, Arc::clone(&stats))
             .unwrap();
         sink.play().unwrap();
         thread::sleep(Duration::from_millis(60));

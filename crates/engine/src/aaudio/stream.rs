@@ -18,25 +18,25 @@ use std::sync::mpsc::SyncSender;
 
 use ndk_sys::{
     AAUDIO_CALLBACK_RESULT_CONTINUE, AAUDIO_CONTENT_TYPE_MUSIC, AAUDIO_DIRECTION_OUTPUT,
-    AAUDIO_FORMAT_PCM_FLOAT, AAUDIO_FORMAT_PCM_I24_PACKED, AAUDIO_FORMAT_PCM_I32, AAUDIO_OK,
-    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY, AAUDIO_PERFORMANCE_MODE_NONE,
-    AAUDIO_PERFORMANCE_MODE_POWER_SAVING, AAUDIO_SHARING_MODE_EXCLUSIVE,
-    AAUDIO_SHARING_MODE_SHARED, AAUDIO_UNSPECIFIED, AAUDIO_USAGE_MEDIA, AAudio_convertResultToText,
-    AAudio_createStreamBuilder, AAudioStream, AAudioStream_close,
-    AAudioStream_getBufferSizeInFrames, AAudioStream_getChannelCount, AAudioStream_getDeviceId,
-    AAudioStream_getFormat, AAudioStream_getFramesPerBurst, AAudioStream_getPerformanceMode,
-    AAudioStream_getSampleRate, AAudioStream_getSharingMode, AAudioStream_getXRunCount,
-    AAudioStream_requestPause, AAudioStream_requestStart, AAudioStream_requestStop,
-    AAudioStreamBuilder, AAudioStreamBuilder_delete, AAudioStreamBuilder_openStream,
-    AAudioStreamBuilder_setChannelCount, AAudioStreamBuilder_setContentType,
-    AAudioStreamBuilder_setDataCallback, AAudioStreamBuilder_setDeviceId,
-    AAudioStreamBuilder_setDirection, AAudioStreamBuilder_setErrorCallback,
-    AAudioStreamBuilder_setFormat, AAudioStreamBuilder_setPerformanceMode,
-    AAudioStreamBuilder_setSampleRate, AAudioStreamBuilder_setSharingMode,
-    AAudioStreamBuilder_setUsage,
+    AAUDIO_FORMAT_PCM_FLOAT, AAUDIO_FORMAT_PCM_I16, AAUDIO_FORMAT_PCM_I24_PACKED,
+    AAUDIO_FORMAT_PCM_I32, AAUDIO_OK, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+    AAUDIO_PERFORMANCE_MODE_NONE, AAUDIO_PERFORMANCE_MODE_POWER_SAVING,
+    AAUDIO_SHARING_MODE_EXCLUSIVE, AAUDIO_SHARING_MODE_SHARED, AAUDIO_UNSPECIFIED,
+    AAUDIO_USAGE_MEDIA, AAudio_convertResultToText, AAudio_createStreamBuilder, AAudioStream,
+    AAudioStream_close, AAudioStream_getBufferSizeInFrames, AAudioStream_getChannelCount,
+    AAudioStream_getDeviceId, AAudioStream_getFormat, AAudioStream_getFramesPerBurst,
+    AAudioStream_getPerformanceMode, AAudioStream_getSampleRate, AAudioStream_getSharingMode,
+    AAudioStream_getXRunCount, AAudioStream_requestPause, AAudioStream_requestStart,
+    AAudioStream_requestStop, AAudioStreamBuilder, AAudioStreamBuilder_delete,
+    AAudioStreamBuilder_openStream, AAudioStreamBuilder_setChannelCount,
+    AAudioStreamBuilder_setContentType, AAudioStreamBuilder_setDataCallback,
+    AAudioStreamBuilder_setDeviceId, AAudioStreamBuilder_setDirection,
+    AAudioStreamBuilder_setErrorCallback, AAudioStreamBuilder_setFormat,
+    AAudioStreamBuilder_setPerformanceMode, AAudioStreamBuilder_setSampleRate,
+    AAudioStreamBuilder_setSharingMode, AAudioStreamBuilder_setUsage,
 };
 
-use super::{AAudioConfig, Performance, Sharing, StreamInfo, check_negotiated};
+use super::{Performance, RoutePlan, Sharing, StreamInfo, check_negotiated};
 use crate::output::{OutputFormat, SampleKind};
 use crate::render::{self, RingStats};
 
@@ -82,20 +82,27 @@ pub(crate) struct Stream {
 unsafe impl Send for Stream {}
 
 impl Stream {
-    /// Opens an output stream for `format` with `config`, without starting it.
+    /// Opens an output stream for `format` (rate and channels) with `plan` (sample kind, sharing,
+    /// performance and device), without starting it. The callback renders `plan.sample`.
     ///
     /// On failure the `state` box is returned to the caller so the ring consumer is not lost
     /// (`None` only if the stream opened but then failed to close, see the module docs). On
     /// success the stream owns both boxes until it is closed.
     pub(crate) fn open(
         format: OutputFormat,
-        config: &AAudioConfig,
-        state: Box<CallbackState>,
+        plan: &RoutePlan,
+        mut state: Box<CallbackState>,
         err: Box<ErrorContext>,
     ) -> Result<Stream, (Option<Box<CallbackState>>, String)> {
         let rate = match i32::try_from(format.sample_rate) {
             Ok(rate) => rate,
             Err(_) => return Err((Some(state), "sample rate out of range".to_owned())),
+        };
+        // The ring is left-justified i32 whatever the device format, so any kind can render it.
+        state.sample = plan.sample;
+        let requested = OutputFormat {
+            sample: plan.sample,
+            ..format
         };
 
         let mut builder: *mut AAudioStreamBuilder = ptr::null_mut();
@@ -114,17 +121,14 @@ impl Stream {
             AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT as i32);
             AAudioStreamBuilder_setSampleRate(builder, rate);
             AAudioStreamBuilder_setChannelCount(builder, i32::from(format.channels));
-            AAudioStreamBuilder_setFormat(builder, format_code(format.sample));
-            AAudioStreamBuilder_setSharingMode(builder, sharing_code(config.sharing));
-            AAudioStreamBuilder_setPerformanceMode(
-                builder,
-                performance_code(config.effective_performance()),
-            );
+            AAudioStreamBuilder_setFormat(builder, format_code(plan.sample));
+            AAudioStreamBuilder_setSharingMode(builder, sharing_code(plan.sharing));
+            AAudioStreamBuilder_setPerformanceMode(builder, performance_code(plan.performance));
             AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA as i32);
             AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC as i32);
             AAudioStreamBuilder_setDeviceId(
                 builder,
-                config.device_id.unwrap_or(AAUDIO_UNSPECIFIED as i32),
+                plan.device_id.unwrap_or(AAUDIO_UNSPECIFIED as i32),
             );
         }
 
@@ -184,7 +188,7 @@ impl Stream {
         };
         let rate = u32::try_from(actual_rate).unwrap_or(0);
         let channels = u16::try_from(actual_channels).unwrap_or(0);
-        match check_negotiated(format, rate, channels, sample_from_code(actual_format)) {
+        match check_negotiated(requested, rate, channels, sample_from_code(actual_format)) {
             Ok(()) => Ok(stream),
             Err(msg) => {
                 let state = stream.close();
@@ -332,6 +336,12 @@ unsafe extern "C" fn data_callback(
             };
             render::render_i24_packed(&mut state.consumer, out, state.channels, &state.stats);
         }
+        SampleKind::I16 => {
+            // SAFETY: a PCM_I16 stream buffer holds `frames * channels` i16 values, valid for the
+            // duration of this callback.
+            let out = unsafe { std::slice::from_raw_parts_mut(audio_data as *mut i16, samples) };
+            render::render_i16(&mut state.consumer, out, state.channels, &state.stats);
+        }
     }
     cont
 }
@@ -386,6 +396,7 @@ fn format_code(sample: SampleKind) -> i32 {
         SampleKind::F32 => AAUDIO_FORMAT_PCM_FLOAT,
         SampleKind::I32 => AAUDIO_FORMAT_PCM_I32,
         SampleKind::I24Packed => AAUDIO_FORMAT_PCM_I24_PACKED,
+        SampleKind::I16 => AAUDIO_FORMAT_PCM_I16,
     }
 }
 
@@ -397,6 +408,8 @@ fn sample_from_code(code: i32) -> Option<SampleKind> {
         Some(SampleKind::I32)
     } else if code == AAUDIO_FORMAT_PCM_I24_PACKED {
         Some(SampleKind::I24Packed)
+    } else if code == AAUDIO_FORMAT_PCM_I16 {
+        Some(SampleKind::I16)
     } else {
         None
     }
