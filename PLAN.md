@@ -388,13 +388,229 @@ Symphonia 0.6.1 facts (verified in source):
     7. format_khz cases listed above.
 
 ## Phase 4 — Playback pipeline
-- [ ] 4.1 `engine::ring`: rtrb `Producer/Consumer<f32>` sized 2 s @ max rate; `OutputSink` trait
-  (`start(format, consumer)`, `stop`, `latency`) with a `NullSink` (real-time paced thread) for desktop.
-- [ ] 4.2 `engine::player::Player` command channel (`Play(track), Pause, Resume, Stop, Seek, SetQueue…`)
-  + event broadcast (`State(Playing|Paused|Buffering|Stopped)`, `Position`, `TrackChanged`, `Error`).
-- [ ] 4.3 decode thread: pulls blocks, pushes into ring, flushes ring on seek (generation counter).
-- [ ] 4.4 underrun detection in consumer (atomic counter, no alloc) → controller emits Buffering, resumes at threshold.
-- [ ] 4.5 position = frames consumed (AtomicU64) / rate, reported every 250 ms.
+
+Architecture (threads):
+```
+controller thread "sonorus-player"  ── owns PlayerState, the OutputSink, emits PlayerEvent
+   │  DecoderCmd (std mpsc)          ▲ DecoderMsg (std mpsc)
+   ▼                                 │
+decode thread "sonorus-decode" (one per loaded track): TrackOpener::open → TrackDecoder → next_block::<i32>
+   │  rtrb::Producer<i32>  (left-justified i32 samples, interleaved — lossless up to 32-bit)
+   ▼
+output callback (NullSink thread now, AAudio in Phase 10): render_f32 / render_i32 from rtrb::Consumer<i32>
+shared: Arc<RingStats> (atomics only) — pushed/played sample counters, underruns, volume, decoder_done
+```
+Rules: a NEW ring + RingStats is created for every load and every seek (sink.stop(); sink.start(new consumer)),
+so nothing ever has to flush a ring the callback is reading. The callback never locks, allocates, logs or blocks.
+rtrb 0.4.1: `RingBuffer::<T>::new(cap) -> (Producer<T>, Consumer<T>)`; `slots()`; `Producer::write_chunk_uninit(n)
+-> Result<WriteChunkUninit, ChunkError>` + `.fill_from_iter(iter) -> usize` (commits what it wrote);
+`Consumer::read_chunk(n) -> Result<ReadChunk, ChunkError>` + `.as_slices() -> (&[T], &[T])` + `.commit_all()`.
+
+- [x] **4.1 `crates/engine/src/render.rs`** (AUDIO-THREAD CODE — reviewed line by line)
+    ```rust
+    pub const RING_SECONDS: usize = 2;
+    /// Shared between decode thread (producer side), callback (consumer side) and controller (reader).
+    #[derive(Debug)]
+    pub struct RingStats {
+        pub samples_pushed: AtomicU64,   // decode thread: fetch_add after each committed write
+        pub samples_played: AtomicU64,   // callback: fetch_add after each read commit
+        pub underruns: AtomicU64,        // callback: +1 per callback that had to zero-fill while !decoder_done
+        pub decoder_done: AtomicBool,    // decode thread: true after the last sample is pushed (EOF)
+        volume_bits: AtomicU32,          // f32 bits, default 1.0
+    }
+    impl RingStats {
+        pub fn new() -> Self;                       // all zero/false, volume 1.0
+        pub fn set_volume(&self, v: f32);           // clamp to 0.0..=1.0, NaN → 1.0; store bits (Relaxed)
+        pub fn volume(&self) -> f32;
+        pub fn buffered_samples(&self) -> u64;      // pushed.saturating_sub(played) (Acquire loads)
+    }
+    impl Default for RingStats { fn default() -> Self { Self::new() } }
+    /// Capacity = sample_rate * channels * RING_SECONDS (min 4096).
+    pub fn new_ring(sample_rate: u32, channels: u16) -> (rtrb::Producer<i32>, rtrb::Consumer<i32>);
+    /// Callback renderer for float outputs. `out` is interleaved with `channels` channels.
+    /// frames_wanted = out.len() / channels; frames_avail = consumer.slots() / channels (whole frames only);
+    /// n = min. read_chunk(n * channels) (cannot fail since n*channels <= slots; on Err treat n = 0);
+    /// convert each sample `(s as f32) * (1.0 / 2147483648.0) * volume` into out[..n*channels] walking both
+    /// slices; commit_all; zero-fill out[n*channels..]; samples_played.fetch_add(n*channels, Release);
+    /// if n < frames_wanted && !decoder_done.load(Acquire) → underruns.fetch_add(1, Relaxed).
+    /// channels == 0 → zero-fill and return. Returns n (frames rendered).
+    pub fn render_f32(consumer: &mut rtrb::Consumer<i32>, out: &mut [f32], channels: usize, stats: &RingStats) -> usize;
+    /// Same contract, integer output, NO volume, samples copied verbatim (bit-perfect path).
+    pub fn render_i32(consumer: &mut rtrb::Consumer<i32>, out: &mut [i32], channels: usize, stats: &RingStats) -> usize;
+    /// Decode-thread helper: writes as much of `samples` as fits, returns samples written (may be 0).
+    /// Writes only whole frames: n = min(samples.len(), producer.slots()) rounded down to a multiple of channels.
+    /// Uses write_chunk_uninit(n).fill_from_iter(samples[..n].iter().copied()); then samples_pushed.fetch_add(n, Release).
+    pub fn push_frames(producer: &mut rtrb::Producer<i32>, samples: &[i32], channels: usize, stats: &RingStats) -> usize;
+    ```
+    No allocation, no locks, no `log::`, no panicking index ops in render_*/push_frames (use iterators/zip or
+    `get`). Tests: push then render_f32 converts i32::MIN → -1.0 and (1<<30) → 0.5 exactly; volume 0.5 halves;
+    render_i32 is bit-exact; partial availability zero-fills the tail and counts one underrun; with decoder_done
+    set, zero-fill counts NO underrun; wrap-around (capacity small, push/render repeatedly past capacity) stays
+    in order; push_frames never writes a partial frame; buffered_samples tracks push - play.
+- [x] **4.2 `crates/engine/src/output.rs`** (parallel with 4.1/4.3; uses render.rs signatures above)
+    ```rust
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SampleKind { F32, I32 }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OutputFormat { pub sample_rate: u32, pub channels: u16, pub sample: SampleKind }
+    pub trait OutputSink: Send {
+        /// Open/prepare the output for `format`, taking ownership of the ring consumer. Starts PAUSED (silent,
+        /// not consuming). Calling start while started = stop() first.
+        fn start(&mut self, format: OutputFormat, consumer: rtrb::Consumer<i32>, stats: Arc<RingStats>) -> Result<()>;
+        fn play(&mut self) -> Result<()>;   // begin consuming
+        fn pause(&mut self) -> Result<()>;  // stop consuming, keep consumer and position
+        fn stop(&mut self);                 // close; drops the consumer. Idempotent.
+        fn latency(&self) -> Duration;      // best estimate of output latency (NullSink: period)
+        fn name(&self) -> &str;
+    }
+    /// Desktop/test sink: a thread that, while playing, every `period` (10 ms) renders
+    /// sample_rate * period frames via render_f32/render_i32 into a buffer preallocated in start(),
+    /// paced by an absolute deadline (next += period; sleep until next; if behind by > 100 ms, resync) so
+    /// it consumes in real time × `speed`. Controls via Arc<AtomicBool> playing + Arc<AtomicBool> quit;
+    /// stop() sets quit and joins the thread.
+    pub struct NullSink { /* speed: f32, period: Duration, thread: Option<JoinHandle<()>>, playing, quit */ }
+    impl NullSink {
+        pub fn new() -> Self;              // speed 1.0
+        pub fn with_speed(speed: f32) -> Self; // tests use e.g. 4.0; speed <= 0 or NaN → 1.0
+    }
+    impl Default for NullSink;  impl Drop for NullSink { stop() }
+    ```
+    Tests: start+play for 0.25 s at speed 1 with 1 s of pushed samples → samples_played within 20 % of
+    0.25 s worth; pause stops consumption (played unchanged over 100 ms); stop is idempotent; start twice OK.
+- [x] **4.3 `crates/engine/src/opener.rs`** (parallel)
+    ```rust
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TrackRef { pub id: String, pub key: String, pub size: u64 }
+    pub struct OpenedSource { pub source: Box<dyn MediaSource>, pub ext_hint: Option<String>, pub buffer: Option<BufferHandle> }
+    pub trait TrackOpener: Send + Sync + 'static {
+        /// Blocking; called on the decode thread (never the controller or a tokio worker).
+        fn open(&self, track: &TrackRef) -> Result<OpenedSource>;
+    }
+    /// Lowercased text after the last '.' of the last '/' segment; None if absent.
+    pub fn ext_of(key: &str) -> Option<String>;
+    pub struct StorageOpener { storage: Storage, rt: tokio::runtime::Handle, config: SourceConfig }
+    impl StorageOpener { pub fn new(storage: Storage, rt: tokio::runtime::Handle, config: SourceConfig) -> Self; }
+    // open: RangeSource::open(Arc::new(StorageObject::new(&storage, &track.key)), track.size, &rt, config.clone())
+    //       → OpenedSource { source: Box::new(src), ext_hint: ext_of(key), buffer: Some(handle) }
+    /// Local files: key is a filesystem path relative to `root`. open → std::fs::File (Io error on failure).
+    pub struct FileOpener { root: PathBuf }
+    impl FileOpener { pub fn new(root: impl Into<PathBuf>) -> Self; }
+    ```
+    Tests: ext_of cases ("A/b/01 - x.FLAC" → "flac", "noext" → None, "a.b/track" → None); FileOpener opens
+    `tests/fixtures/tone_24_96.flac` and TrackDecoder::new on it reports 96000 Hz.
+- [x] **4.4 `crates/engine/src/player.rs`** (+ `lib.rs`: `pub mod player;`) (after 4.1–4.3)
+    ```rust
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PlayerState { Idle, Loading, Buffering, Playing, Paused }
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum PlayerEvent {
+        StateChanged(PlayerState),
+        TrackLoaded { track_id: String, info: StreamInfo },
+        Position { track_id: String, position: Duration, duration: Option<Duration> },
+        TrackEnded { track_id: String },
+        Error { track_id: Option<String>, message: String },
+    }
+    #[derive(Debug, Clone)]
+    pub struct PlayerConfig {
+        pub prefill: Duration,            // 1 s: buffered audio required before (re)starting output
+        pub position_interval: Duration,  // 250 ms
+        pub tick: Duration,               // 20 ms controller poll
+        pub output_kind: SampleKind,      // F32 (I32 for bit-perfect later)
+    }
+    impl Default for PlayerConfig;
+    pub struct Player { tx: Sender<Msg>, thread: Option<JoinHandle<()>> }
+    impl Player {
+        /// Spawns the controller thread "sonorus-player". Events go to the returned receiver
+        /// (send errors are ignored if it is dropped).
+        pub fn new(sink: Box<dyn OutputSink>, opener: Arc<dyn TrackOpener>, config: PlayerConfig) -> (Player, Receiver<PlayerEvent>);
+        pub fn load(&self, track: TrackRef, autoplay: bool);
+        pub fn play(&self);  pub fn pause(&self);  pub fn stop(&self);
+        pub fn seek(&self, to: Duration);
+        pub fn set_volume(&self, volume: f32);
+    }
+    impl Drop for Player { /* send Shutdown, join the controller thread */ }
+    ```
+    Private plumbing (one channel into the controller so it can block on a single receiver):
+    ```rust
+    enum Msg { Cmd(Command), Dec(DecoderMsg) }
+    enum Command { Load { track: TrackRef, autoplay: bool }, Play, Pause, Stop, Seek(Duration), SetVolume(f32), Shutdown }
+    enum DecoderMsg {                     // every variant carries the session generation; stale ones are ignored
+        Opened { generation: u64, info: StreamInfo },
+        Seeked { generation: u64, position_frames: u64 },
+        Finished { generation: u64 },
+        Failed { generation: u64, message: String },
+    }
+    enum DecoderCmd {                     // controller → decode thread (std mpsc, one channel per session)
+        Start { producer: Producer<i32>, stats: Arc<RingStats> },
+        Seek { to: Duration, producer: Producer<i32>, stats: Arc<RingStats> },
+        Stop,
+    }
+    struct Session { generation, track: TrackRef, info: Option<StreamInfo>, cmd: Sender<DecoderCmd>,
+        stats: Option<Arc<RingStats>>, base_frames: u64, sink_playing: bool, last_underruns: u64,
+        pending_seek: Option<Duration>, last_position_emit: Instant }
+    ```
+    Controller loop: `match rx.recv_timeout(config.tick)` → handle Msg (Disconnected → shut down), then `tick()`.
+    `set_state(s)` emits StateChanged only when the state actually changes. Never joins a decode thread (it may
+    be blocked in network I/O); it sends `DecoderCmd::Stop` and drops the session — the thread exits on Stop or
+    on channel disconnect, and its later messages are ignored by generation.
+    - `stop_session()`: sink.stop(); send Stop (ignore error); session = None.
+    - Load{track, autoplay}: stop_session(); generation += 1; spawn decode thread "sonorus-decode"; want_play =
+      autoplay; session = new; set_state(Loading).
+    - Dec Opened (current gen): store info; emit TrackLoaded. If pending_seek → run the seek flow below with it;
+      else create ring (`new_ring(rate, channels)`) + `Arc<RingStats>` (set_volume(current volume)); `sink.start(
+      OutputFormat { sample_rate, channels, sample: config.output_kind }, consumer, stats.clone())` — Err → emit
+      Error, stop_session, set_state(Idle); send `Start { producer, stats }`; base_frames = 0; set_state(if
+      want_play { Buffering } else { Paused }).
+    - Play: want_play = true; if state == Paused → set_state(Buffering). (Loading: just records want_play.)
+    - Pause: want_play = false; if sink_playing → sink.pause(), sink_playing = false; if state is Buffering or
+      Playing → set_state(Paused).
+    - Stop: stop_session(); set_state(Idle).
+    - Seek(to): no session → ignore. info None (still loading) → pending_seek = Some(to). Else: clamp to
+      info.duration; sink.stop(); new ring + stats; sink.start(..) (Err → as above); send `Seek { to, producer,
+      stats }`; base_frames = round(to_secs * rate); sink_playing = false; last_underruns = 0; set_state(if want_play
+      { Buffering } else { Paused }); emit Position immediately.
+    - Dec Seeked (current gen): base_frames = position_frames.
+    - Dec Finished: nothing (stats.decoder_done is already set by the decode thread).
+    - Dec Failed (current gen): emit Error { Some(track.id), message }; stop_session(); set_state(Idle).
+    - SetVolume(v): volume = v; if stats → stats.set_volume(v).
+    - Shutdown: stop_session(); exit loop.
+    `tick()` (only when the session has stats):
+    - frames_buffered = stats.buffered_samples() / channels; prefill_frames = prefill_secs * rate; done = decoder_done.
+    - Buffering && want_play && (frames_buffered >= prefill_frames || done) → sink.play() (Err → Error + stop +
+      Idle), sink_playing = true, set_state(Playing).
+    - Playing: u = stats.underruns; if u > last_underruns { last_underruns = u; if !done { sink.pause();
+      sink_playing = false; set_state(Buffering) } }. If done && stats.buffered_samples() == 0 → emit final
+      Position, emit TrackEnded { id }, stop_session(), set_state(Idle).
+    - Position: if state ∈ {Playing, Buffering, Paused} and last_position_emit elapsed ≥ position_interval →
+      position = (base_frames + samples_played / channels) / rate; emit Position { id, position, duration }.
+    Decode thread `fn decode_main(generation, track, opener, msg_tx: Sender<Msg>, cmd_rx: Receiver<DecoderCmd>)`:
+    1. `opener.open(&track)` then `TrackDecoder::new(source, ext_hint)` — Err → send Failed, return.
+       send Opened { info }.
+    2. Wait (blocking recv) for the first Start or Seek (Seek: run `decoder.seek(to)` and send Seeked) — Stop or
+       disconnect → return.
+    3. Loop with `block: Vec<i32>` (reused) and `offset`. Commands are handled by one helper
+       `fn on_cmd(cmd, &mut decoder, &mut producer, &mut stats, &mut block, &mut offset, &mut eof) -> bool /*keep going*/`:
+       Stop → false; Seek → swap producer/stats, block.clear(), offset = 0, eof = false, decoder.seek(to) (Err →
+       send Failed, false), send Seeked { position_frames: decoder.position_frames() }; Start → ignore.
+       Each iteration: `try_recv` → Ok(cmd) → on_cmd; Disconnected → return.
+       If eof → block on `recv()` (Disconnected → return) and on_cmd; continue.
+       If offset >= block.len(): `decoder.next_block::<i32>(&mut block)` → Some → offset = 0; None →
+       stats.decoder_done.store(true, Release), send Finished, eof = true, continue; Err(e) → send Failed, return.
+       `let w = push_frames(&mut producer, block.get(offset..).unwrap_or(&[]), channels, &stats); offset += w;`
+       if w == 0 (ring full) → `recv_timeout(5 ms)`: Ok(cmd) → on_cmd; Timeout → continue; Disconnected → return.
+    Known limitation (document in a comment): a seek arriving while next_block is blocked on network waits until
+    that read returns (≤ the source's read timeout).
+    Tests (FileOpener over tests/fixtures + NullSink::with_speed(4.0), PlayerConfig { prefill: 50 ms, tick: 5 ms,
+    position_interval: 20 ms, .. }); collect events with recv_timeout and a 3 s overall deadline:
+    1. load("tone_24_96.flac", autoplay) → Loading, TrackLoaded (96000 Hz), Buffering, Playing, TrackEnded, Idle in
+       that relative order; last Position before TrackEnded is within 30 ms of 300 ms.
+    2. load(autoplay=false) → Paused; no TrackEnded within 300 ms; play() → TrackEnded.
+    3. load paused, seek(200 ms) → a Position ≥ 199 ms arrives; play() → TrackEnded; no Position after seek < 199 ms.
+    4. load("missing.flac") → Error and state Idle.
+    5. stall: a test-only opener wrapping the flac bytes in a reader that sleeps 400 ms once after 24 KiB →
+       events contain Playing, later Buffering, later Playing again, then TrackEnded.
+    6. Drop the Player mid-playback → returns promptly (< 500 ms), no panic.
+- [x] **4.5** Opus review + commit.
 
 ## Phase 5 — Gapless + queue
 - [ ] 5.1 `engine::queue::Queue` (items, index, shuffle order w/ seed, repeat Off/All/One; pure, unit-tested).

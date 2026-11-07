@@ -2,6 +2,10 @@
 
 pub mod decoder;
 pub mod error;
+pub mod opener;
+pub mod output;
+pub mod player;
+pub mod render;
 pub mod source;
 
 pub use error::{EngineError, Result};
