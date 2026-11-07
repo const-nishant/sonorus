@@ -11,6 +11,7 @@ import dev.constnishant.sonorus.core.SonorusCore
 import dev.constnishant.sonorus.core.SyncSummary
 import dev.constnishant.sonorus.data.audio.UsbAudioRouter
 import dev.constnishant.sonorus.data.audio.UsbDac
+import dev.constnishant.sonorus.playback.AudioFocusGuard
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -52,6 +53,12 @@ class SonorusRepository(private val app: Context) {
         bitPerfectEnabled = { output.bitPerfect() },
         onDacDetached = { command { it.pause() } },
     )
+
+    /**
+     * Holds audio focus while the core plays, for every source of play (the app's screens and the
+     * media session alike), and pauses on focus loss or when the output becomes noisy.
+     */
+    private val audioFocus = AudioFocusGuard(app, events.playback) { block -> command(block) }
 
     /** The connected USB DAC, or null when none is connected. */
     val dac: StateFlow<UsbDac?> get() = router.dac

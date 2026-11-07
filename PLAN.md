@@ -1133,8 +1133,21 @@ pauses playback (pulled forward from 12.2 so audio never jumps to the speaker).
   branch itself (needs a phone whose HAL declares a bit-perfect output, e.g. Pixel 8+ on Android 14+).
 
 ## Phase 12 — Background playback
-- [ ] 12.1 `PlaybackService : MediaSessionService` (foregroundServiceType mediaPlayback), Media3 `SimpleBasePlayer`
+- [x] 12.1 `PlaybackService : MediaSessionService` (foregroundServiceType mediaPlayback), Media3 `SimpleBasePlayer`
   bridging to core. 12.2 audio focus, becoming-noisy + USB detach → pause. 12.3 lock-screen/Bluetooth controls.
+  Opus decided: Media3 1.11.1. `SonorusPlayer` mirrors `CoreEvents.playback` (queue → playlist, uid = entry id;
+  stop = pause, the queue is kept; SEEK_TO_MEDIA_ITEM → `jumpTo`). Position ticks that stay on the extrapolated line
+  (< 1 s drift) are not republished, so the queue is not rebuilt 4×/s. Cover bytes for the current track are loaded
+  on IO (downscaled above 300 KB) into an 8-entry LRU. `AudioFocusGuard` lives in the repository and watches core
+  state, so play from the app's own screens takes focus too: LOSS → pause + abandon, LOSS_TRANSIENT → pause and
+  resume on gain, CAN_DUCK → system ducking, user pause keeps focus 30 s. MainActivity binds the service through a
+  MediaController while started. The service is exported (standard for media apps: Assistant, Wear, Auto); limiting
+  controllers in `onConnect` is a possible hardening later.
+  Device test (vivo V2338): playback continues in the background; foreground service with the media notification
+  (title, artist, cover); media keys play/pause/next/previous (restart after 3 s, previous at 0, next at the end of
+  the queue pauses); YouTube taking focus pauses Sonorus and releases focus; a transient system sound ducks and
+  gives focus back. Not tested: wired-headphone becoming-noisy (no wired headset; USB detach covered in 11.4),
+  Bluetooth AVRCP, a phone call. Next-track start takes ~3 s for a 96 k file from the bucket (no prefetch yet).
 
 ## Phase 13 — Upload
 - [ ] 13.1 SAF picker → copy-free read via fd; lofty tags in Rust; BLAKE3 hash dedupe.
