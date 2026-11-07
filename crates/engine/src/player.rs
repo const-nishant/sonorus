@@ -1,34 +1,47 @@
-//! Playback controller: the state machine that drives the output sink and one decode thread
-//! per loaded track.
+//! Playback controller: the state machine that drives the output sink, the play queue and one
+//! decode thread per session.
 //!
 //! Threads: the caller talks to the controller thread `sonorus-player` through [`Player`];
-//! each load spawns a `sonorus-decode` thread that opens and decodes the track and pushes
-//! left-justified `i32` samples into a per-session ring. Every load and every seek creates a
+//! each session spawns a `sonorus-decode` thread that opens and decodes the track and pushes
+//! left-justified `i32` samples into a per-session ring. Every session and every seek creates a
 //! new ring and a new [`RingStats`], so nothing ever flushes a ring the output is reading.
+//!
+//! Gapless: while a track plays, the next queued track is opened on a `sonorus-preload`
+//! thread. When it has the same sample rate and channel count as the output, it is handed to
+//! the decode thread, which switches to it at end of stream and reports a boundary. The
+//! controller crosses the boundary when the output reaches it. A queue change after the
+//! hand-off makes the boundary stale; playback then restarts on the queue's current entry.
 //!
 //! Known limitation: a seek that arrives while the decode thread is blocked inside
 //! `next_block` (for example waiting on a network read) takes effect only after that read
 //! returns, which is bounded by the source's read timeout.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rtrb::Producer;
 
 use crate::decoder::{StreamInfo, TrackDecoder};
 use crate::opener::{OpenedSource, TrackOpener, TrackRef};
 use crate::output::{OutputFormat, OutputSink, SampleKind};
+use crate::queue::{EntryId, Queue, QueueEntry, RepeatMode};
 use crate::render::{self, RingStats};
+use crate::source::BufferHandle;
 
 /// Name of the controller thread.
 const PLAYER_THREAD: &str = "sonorus-player";
 /// Name of the per-session decode thread.
 const DECODE_THREAD: &str = "sonorus-decode";
+/// Name of the thread that opens the next track ahead of time.
+const PRELOAD_THREAD: &str = "sonorus-preload";
 /// How long the decode thread waits for a command while its ring is full.
 const RING_FULL_WAIT: Duration = Duration::from_millis(5);
+/// `previous` restarts the current track when it is further in than this.
+const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 
 /// Playback state as seen by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +73,18 @@ pub enum PlayerEvent {
         track_id: Option<String>,
         message: String,
     },
+    /// The current queue entry changed (a track started, or the output moved to the next one).
+    TrackChanged {
+        entry_id: EntryId,
+        track_id: String,
+    },
+    /// Snapshot of the queue, in play order, after any change to it or to the current entry.
+    QueueChanged {
+        entries: Vec<QueueEntry>,
+        current: Option<EntryId>,
+        shuffle: bool,
+        repeat: RepeatMode,
+    },
 }
 
 /// Tuning knobs for the controller.
@@ -73,6 +98,10 @@ pub struct PlayerConfig {
     pub tick: Duration,
     /// Sample kind requested from the output sink.
     pub output_kind: SampleKind,
+    /// How long before the end of the current track the next queued track is opened.
+    pub preload_lead: Duration,
+    /// Seed for shuffle order. 0 seeds from the system clock.
+    pub shuffle_seed: u64,
 }
 
 impl Default for PlayerConfig {
@@ -82,6 +111,8 @@ impl Default for PlayerConfig {
             position_interval: Duration::from_millis(250),
             tick: Duration::from_millis(20),
             output_kind: SampleKind::F32,
+            preload_lead: Duration::from_secs(15),
+            shuffle_seed: 0,
         }
     }
 }
@@ -102,6 +133,7 @@ impl Player {
     ) -> (Player, Receiver<PlayerEvent>) {
         let (tx, rx) = mpsc::channel::<Msg>();
         let (events_tx, events_rx) = mpsc::channel::<PlayerEvent>();
+        let queue = Queue::new(resolve_seed(config.shuffle_seed));
         let controller = Controller {
             sink,
             opener,
@@ -114,6 +146,9 @@ impl Player {
             want_play: false,
             volume: 1.0,
             generation: 0,
+            queue,
+            preload: None,
+            preload_failed: None,
         };
         let thread = match thread::Builder::new()
             .name(PLAYER_THREAD.to_owned())
@@ -133,9 +168,66 @@ impl Player {
         (Player { tx, thread }, events_rx)
     }
 
-    /// Loads `track`, replacing any current track. Starts playing once buffered when `autoplay`.
+    /// Loads `track` as the whole queue. Same as `set_queue(vec![track], 0, autoplay)`.
     pub fn load(&self, track: TrackRef, autoplay: bool) {
-        self.send(Command::Load { track, autoplay });
+        self.set_queue(vec![track], 0, autoplay);
+    }
+
+    /// Replaces the queue with `tracks` and starts the entry at index `start` (clamped to the
+    /// last index). Starts playing once buffered when `autoplay`.
+    pub fn set_queue(&self, tracks: Vec<TrackRef>, start: usize, autoplay: bool) {
+        self.send(Command::SetQueue {
+            tracks,
+            start,
+            autoplay,
+        });
+    }
+
+    /// Adds `tracks` to the end of the queue.
+    pub fn append(&self, tracks: Vec<TrackRef>) {
+        self.send(Command::Append(tracks));
+    }
+
+    /// Inserts `tracks` right after the current entry.
+    pub fn play_next(&self, tracks: Vec<TrackRef>) {
+        self.send(Command::PlayNext(tracks));
+    }
+
+    /// Skips to the next queue entry (wraps with repeat All).
+    pub fn next(&self) {
+        self.send(Command::Next);
+    }
+
+    /// Restarts the current track when it is more than 3 s in, otherwise goes to the previous
+    /// queue entry.
+    pub fn previous(&self) {
+        self.send(Command::Previous);
+    }
+
+    /// Starts the queue entry `id`. Unknown ids are ignored.
+    pub fn jump_to(&self, id: EntryId) {
+        self.send(Command::JumpTo(id));
+    }
+
+    /// Removes the entry `id` from the queue. Removing the current entry starts the one that
+    /// takes its place, or goes idle.
+    pub fn remove(&self, id: EntryId) {
+        self.send(Command::Remove(id));
+    }
+
+    /// Moves the entry `id` to position `to` in the queue.
+    pub fn move_entry(&self, id: EntryId, to: usize) {
+        self.send(Command::MoveEntry { id, to });
+    }
+
+    /// Turns shuffle on or off. The current entry keeps playing.
+    pub fn set_shuffle(&self, on: bool) {
+        self.send(Command::SetShuffle(on));
+    }
+
+    /// Sets the repeat mode.
+    pub fn set_repeat(&self, mode: RepeatMode) {
+        self.send(Command::SetRepeat(mode));
     }
 
     /// Requests playback (buffers first if needed).
@@ -186,7 +278,23 @@ enum Msg {
 }
 
 enum Command {
-    Load { track: TrackRef, autoplay: bool },
+    SetQueue {
+        tracks: Vec<TrackRef>,
+        start: usize,
+        autoplay: bool,
+    },
+    Append(Vec<TrackRef>),
+    PlayNext(Vec<TrackRef>),
+    Next,
+    Previous,
+    JumpTo(EntryId),
+    Remove(EntryId),
+    MoveEntry {
+        id: EntryId,
+        to: usize,
+    },
+    SetShuffle(bool),
+    SetRepeat(RepeatMode),
     Play,
     Pause,
     Stop,
@@ -214,6 +322,26 @@ enum DecoderMsg {
         generation: u64,
         message: String,
     },
+    /// The decode thread switched to a queued track at the end of the previous one.
+    Advanced {
+        generation: u64,
+        entry_id: EntryId,
+        info: StreamInfo,
+        /// `samples_pushed` of the ring at the switch: the first sample of the new track is at
+        /// this index.
+        boundary_samples: u64,
+    },
+    /// A seek was refused because the decode thread had already switched to the next track.
+    SeekRejected {
+        generation: u64,
+        seq: u64,
+    },
+    /// Result of a `preload_main` run.
+    Preloaded {
+        generation: u64,
+        entry_id: EntryId,
+        result: Result<Box<TrackDecoder>, String>,
+    },
 }
 
 /// Controller to decode-thread commands.
@@ -225,21 +353,76 @@ enum DecoderCmd {
     Seek {
         to: Duration,
         seq: u64,
+        /// Number of `Advanced` reports the controller has received for this session. If the
+        /// decode thread has switched more often, the seek targets a track it no longer decodes
+        /// and is rejected.
+        track_seq: u64,
         producer: Producer<i32>,
         stats: Arc<RingStats>,
     },
+    /// Queues a gapless continuation, replacing any queued one.
+    Next {
+        entry_id: EntryId,
+        decoder: Box<TrackDecoder>,
+    },
+    /// Drops the queued continuation if it has not been switched to yet.
+    CancelNext,
     Stop,
+}
+
+/// What `decode_main` starts from: open the track, or use a decoder that is already probed.
+enum DecoderSource {
+    Open(TrackRef),
+    Ready(Box<TrackDecoder>),
+}
+
+// The decoder is moved into the decode thread (`Next`, `Preloaded`), so it must be `Send`.
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<TrackDecoder>();
+};
+
+/// The next queue entry, opened ahead of time.
+struct Preload {
+    entry_id: EntryId,
+    track: TrackRef,
+    state: PreloadState,
+    /// Stream description once the preload has finished opening.
+    info: Option<StreamInfo>,
+}
+
+enum PreloadState {
+    /// `preload_main` is still running.
+    Opening,
+    /// Opened and probed, waiting for a session that it can hand off to.
+    Ready(Box<TrackDecoder>),
+    /// Sent to the decode thread as its queued continuation.
+    HandedOff,
+}
+
+/// A track the decode thread has switched to whose samples start at `at_samples` in the ring.
+struct Boundary {
+    entry_id: EntryId,
+    track: TrackRef,
+    info: StreamInfo,
+    at_samples: u64,
 }
 
 /// The currently loaded track and its decode thread.
 struct Session {
     generation: u64,
+    /// Queue entry whose track is being output (the boundary's entry once crossed).
+    entry_id: EntryId,
     track: TrackRef,
     info: Option<StreamInfo>,
     cmd: Sender<DecoderCmd>,
     stats: Option<Arc<RingStats>>,
     /// Frames of the track before the current ring's first sample (seek target).
     base_frames: u64,
+    /// Ring sample index at which the current track starts.
+    offset_samples: u64,
+    /// Tracks the decode thread has switched to, in order, not yet reached by the output.
+    boundaries: VecDeque<Boundary>,
     /// Whether the output sink is currently consuming.
     sink_playing: bool,
     /// Underrun count already handled in the current ring.
@@ -248,7 +431,23 @@ struct Session {
     pending_seek: Option<Duration>,
     /// Incremented per seek so a late `Seeked` from an earlier seek cannot move `base_frames`.
     seek_seq: u64,
+    /// Target of the latest seek, replayed as a cold restart if the seek is rejected.
+    seek_target: Option<Duration>,
+    /// `Advanced` reports received for this session (compared against the decode thread's count).
+    advances: u64,
     last_position_emit: Instant,
+}
+
+impl Session {
+    /// Frames of the current track that the output has played.
+    fn position_frames(&self, channels: u16) -> u64 {
+        let played = self
+            .stats
+            .as_ref()
+            .map_or(0, |s| s.samples_played.load(Ordering::Acquire));
+        let frames = played.saturating_sub(self.offset_samples) / u64::from(channels.max(1));
+        self.base_frames.saturating_add(frames)
+    }
 }
 
 struct Controller {
@@ -264,6 +463,10 @@ struct Controller {
     want_play: bool,
     volume: f32,
     generation: u64,
+    queue: Queue,
+    preload: Option<Preload>,
+    /// Entry whose preload failed; not retried (the cold open at the track's end reports it).
+    preload_failed: Option<EntryId>,
 }
 
 impl Controller {
@@ -300,7 +503,35 @@ impl Controller {
 
     fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Load { track, autoplay } => self.on_load(track, autoplay),
+            Command::SetQueue {
+                tracks,
+                start,
+                autoplay,
+            } => self.on_set_queue(tracks, start, autoplay),
+            Command::Append(tracks) => {
+                self.queue.append(tracks);
+                self.queue_edited();
+            }
+            Command::PlayNext(tracks) => {
+                self.queue.play_next(tracks);
+                self.queue_edited();
+            }
+            Command::Next => self.on_next(),
+            Command::Previous => self.on_previous(),
+            Command::JumpTo(id) => self.on_jump_to(id),
+            Command::Remove(id) => self.on_remove(id),
+            Command::MoveEntry { id, to } => {
+                self.queue.move_entry(id, to);
+                self.queue_edited();
+            }
+            Command::SetShuffle(on) => {
+                self.queue.set_shuffle(on);
+                self.queue_edited();
+            }
+            Command::SetRepeat(mode) => {
+                self.queue.set_repeat(mode);
+                self.queue_edited();
+            }
             Command::Play => self.on_play(),
             Command::Pause => self.on_pause(),
             Command::Stop => self.on_stop(),
@@ -327,47 +558,77 @@ impl Controller {
                 generation,
                 message,
             } => self.on_failed(generation, message),
+            DecoderMsg::Advanced {
+                generation,
+                entry_id,
+                info,
+                boundary_samples,
+            } => self.on_advanced(generation, entry_id, info, boundary_samples),
+            DecoderMsg::Preloaded {
+                generation,
+                entry_id,
+                result,
+            } => self.on_preloaded(generation, entry_id, result),
+            DecoderMsg::SeekRejected { generation, seq } => self.on_seek_rejected(generation, seq),
         }
     }
 
-    fn on_load(&mut self, track: TrackRef, autoplay: bool) {
-        self.stop_session();
-        self.generation += 1;
-        let generation = self.generation;
+    fn on_set_queue(&mut self, tracks: Vec<TrackRef>, start: usize, autoplay: bool) {
+        self.queue.set_tracks(tracks, start);
+        match self.queue.current().cloned() {
+            Some(entry) => self.start_entry(entry, autoplay, None),
+            None => self.go_idle(),
+        }
+        self.emit_queue();
+        self.sync_preload();
+    }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
-        let spawned = thread::Builder::new()
-            .name(DECODE_THREAD.to_owned())
-            .spawn({
-                let opener = Arc::clone(&self.opener);
-                let msg_tx = self.self_tx.clone();
-                let thread_track = track.clone();
-                move || decode_main(generation, thread_track, opener, msg_tx, cmd_rx)
-            });
-        if let Err(e) = spawned {
-            self.emit(PlayerEvent::Error {
-                track_id: Some(track.id),
-                message: format!("failed to start decode thread: {e}"),
-            });
-            self.set_state(PlayerState::Idle);
+    fn on_next(&mut self) {
+        if let Some(entry) = self.queue.skip_next().cloned() {
+            self.switch_to(entry);
+        }
+    }
+
+    fn on_previous(&mut self) {
+        if self.position().is_some_and(|p| p > RESTART_THRESHOLD) {
+            self.on_seek(Duration::ZERO);
             return;
         }
+        if let Some(entry) = self.queue.skip_previous().cloned() {
+            self.switch_to(entry);
+        }
+    }
 
-        self.want_play = autoplay;
-        self.session = Some(Session {
-            generation,
-            track,
-            info: None,
-            cmd: cmd_tx,
-            stats: None,
-            base_frames: 0,
-            sink_playing: false,
-            last_underruns: 0,
-            pending_seek: None,
-            seek_seq: 0,
-            last_position_emit: Instant::now(),
-        });
-        self.set_state(PlayerState::Loading);
+    fn on_jump_to(&mut self, id: EntryId) {
+        if let Some(entry) = self.queue.jump_to(id).cloned() {
+            self.switch_to(entry);
+        }
+    }
+
+    fn on_remove(&mut self, id: EntryId) {
+        let was_current = self.queue.current_id() == Some(id);
+        if self.queue.remove(id) && was_current {
+            match self.queue.current().cloned() {
+                Some(entry) => {
+                    let autoplay = self.autoplay_intent();
+                    self.start_entry(entry, autoplay, None);
+                }
+                None => self.go_idle(),
+            }
+        }
+        self.queue_edited();
+    }
+
+    /// Starts `entry` after a transport command, playing when the output was or is playing.
+    fn switch_to(&mut self, entry: QueueEntry) {
+        let autoplay = self.autoplay_intent();
+        self.start_entry(entry, autoplay, None);
+        self.emit_queue();
+    }
+
+    /// Whether a track started by a transport command should play right away.
+    fn autoplay_intent(&self) -> bool {
+        self.want_play || matches!(self.state, PlayerState::Playing | PlayerState::Buffering)
     }
 
     fn on_play(&mut self) {
@@ -401,8 +662,7 @@ impl Controller {
     }
 
     fn on_stop(&mut self) {
-        self.stop_session();
-        self.set_state(PlayerState::Idle);
+        self.go_idle();
     }
 
     fn on_seek(&mut self, to: Duration) {
@@ -411,6 +671,16 @@ impl Controller {
         };
         if session.info.is_none() {
             session.pending_seek = Some(to);
+            return;
+        }
+        // Boundaries queued: the decode thread is known to be on a later track, so seeking in
+        // place would aim at the wrong one. Restart the current entry at `to` instead. A switch
+        // still in flight is caught by `track_seq` and answered with `SeekRejected`.
+        if !session.boundaries.is_empty() {
+            let entry_id = session.entry_id;
+            if let Some(entry) = self.queue.get(entry_id).cloned() {
+                self.start_entry(entry, self.want_play, Some(to));
+            }
             return;
         }
         self.seek_to(to);
@@ -425,6 +695,12 @@ impl Controller {
 
     fn current_mut(&mut self, generation: u64) -> Option<&mut Session> {
         self.session.as_mut().filter(|s| s.generation == generation)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
     }
 
     fn on_opened(&mut self, generation: u64, info: StreamInfo) {
@@ -449,11 +725,113 @@ impl Controller {
         }
     }
 
+    /// The decode thread had already moved to the next track when the seek arrived: replay the
+    /// seek as a cold restart of the entry being output.
+    fn on_seek_rejected(&mut self, generation: u64, seq: u64) {
+        let Some(session) = self.current_mut(generation) else {
+            return;
+        };
+        if session.seek_seq != seq {
+            return;
+        }
+        let target = session.seek_target;
+        let entry_id = session.entry_id;
+        if let Some(entry) = self.queue.get(entry_id).cloned() {
+            self.start_entry(entry, self.want_play, target);
+        }
+    }
+
     fn on_failed(&mut self, generation: u64, message: String) {
         if self.current_mut(generation).is_none() {
             return;
         }
         self.fail(message);
+    }
+
+    /// The decode thread moved on to `entry_id`'s track at the end of the current one.
+    fn on_advanced(
+        &mut self,
+        generation: u64,
+        entry_id: EntryId,
+        info: StreamInfo,
+        boundary_samples: u64,
+    ) {
+        if !self.is_current(generation) {
+            return;
+        }
+        let track = match self.preload.take_if(|p| p.entry_id == entry_id) {
+            Some(preload) => preload.track,
+            None => match self.queue.get(entry_id) {
+                Some(entry) => entry.track.clone(),
+                None => {
+                    // Removed from the queue after the hand-off. Its boundary can only be
+                    // stale, so the track itself is never shown.
+                    log::warn!("hand-off to entry {entry_id}, which is no longer queued");
+                    TrackRef {
+                        id: String::new(),
+                        key: String::new(),
+                        size: 0,
+                    }
+                }
+            },
+        };
+        if let Some(session) = self.session.as_mut() {
+            session.advances = session.advances.wrapping_add(1);
+            session.boundaries.push_back(Boundary {
+                entry_id,
+                track,
+                info,
+                at_samples: boundary_samples,
+            });
+        }
+    }
+
+    /// The preload thread finished opening `entry_id`.
+    fn on_preloaded(
+        &mut self,
+        generation: u64,
+        entry_id: EntryId,
+        result: Result<Box<TrackDecoder>, String>,
+    ) {
+        if !self.is_current(generation) {
+            return;
+        }
+        // Results for an entry that is no longer being preloaded are dropped with the decoder.
+        let wanted = self
+            .preload
+            .as_ref()
+            .is_some_and(|p| p.entry_id == entry_id && matches!(p.state, PreloadState::Opening));
+        if !wanted {
+            return;
+        }
+        let decoder = match result {
+            Ok(decoder) => decoder,
+            Err(message) => {
+                log::warn!("preload of entry {entry_id} failed: {message}");
+                self.preload = None;
+                self.preload_failed = Some(entry_id);
+                return;
+            }
+        };
+        let info = decoder.info().clone();
+        let (Some(session), Some(preload)) = (self.session.as_ref(), self.preload.as_mut()) else {
+            return;
+        };
+        preload.info = Some(info);
+        // The hand-off keeps the ring's format, so only a matching stream can continue it.
+        let fits = match (session.info.as_ref(), preload.info.as_ref()) {
+            (Some(current), Some(next)) => {
+                current.sample_rate == next.sample_rate && current.channels == next.channels
+            }
+            _ => false,
+        };
+        if fits {
+            // A failed send means the decode thread already exited; nothing will switch.
+            let _ = session.cmd.send(DecoderCmd::Next { entry_id, decoder });
+            preload.state = PreloadState::HandedOff;
+        } else {
+            preload.state = PreloadState::Ready(decoder);
+        }
     }
 
     /// Starts the output on a fresh ring and hands the producer to the decode thread.
@@ -499,15 +877,19 @@ impl Controller {
         };
         session.pending_seek = None;
         session.seek_seq = session.seek_seq.wrapping_add(1);
+        session.seek_target = Some(to);
         let seq = session.seek_seq;
+        let track_seq = session.advances;
         session.stats = Some(Arc::clone(&stats));
         session.base_frames = duration_to_frames(to, info.sample_rate);
+        session.offset_samples = 0;
         session.sink_playing = false;
         session.last_underruns = 0;
         // A failed send means the decode thread already exited; nothing more will arrive.
         let _ = session.cmd.send(DecoderCmd::Seek {
             to,
             seq,
+            track_seq,
             producer,
             stats,
         });
@@ -539,6 +921,69 @@ impl Controller {
         }
     }
 
+    /// Starts `entry` as the current track. A Ready preload of the same entry is used as is;
+    /// anything else is opened. Stops the previous session first.
+    fn start_entry(&mut self, entry: QueueEntry, autoplay: bool, seek: Option<Duration>) {
+        // Taken before stop_session, which would drop it.
+        let preload = self.preload.take();
+        self.stop_session();
+
+        let QueueEntry {
+            id: entry_id,
+            track,
+        } = entry;
+        let track_id = track.id.clone();
+        let source = match preload {
+            Some(Preload {
+                entry_id: preloaded,
+                state: PreloadState::Ready(decoder),
+                ..
+            }) if preloaded == entry_id => DecoderSource::Ready(decoder),
+            _ => DecoderSource::Open(track.clone()),
+        };
+
+        self.generation += 1;
+        let generation = self.generation;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
+        let spawned = thread::Builder::new()
+            .name(DECODE_THREAD.to_owned())
+            .spawn({
+                let opener = Arc::clone(&self.opener);
+                let msg_tx = self.self_tx.clone();
+                move || decode_main(generation, source, opener, msg_tx, cmd_rx)
+            });
+        if let Err(e) = spawned {
+            self.emit(PlayerEvent::Error {
+                track_id: Some(track_id),
+                message: format!("failed to start decode thread: {e}"),
+            });
+            self.set_state(PlayerState::Idle);
+            return;
+        }
+
+        self.want_play = autoplay;
+        self.session = Some(Session {
+            generation,
+            entry_id,
+            track,
+            info: None,
+            cmd: cmd_tx,
+            stats: None,
+            base_frames: 0,
+            offset_samples: 0,
+            boundaries: VecDeque::new(),
+            sink_playing: false,
+            last_underruns: 0,
+            pending_seek: seek,
+            seek_seq: 0,
+            seek_target: None,
+            advances: 0,
+            last_position_emit: Instant::now(),
+        });
+        self.set_state(PlayerState::Loading);
+        self.emit(PlayerEvent::TrackChanged { entry_id, track_id });
+    }
+
     /// Reports `message` for the current track, drops the session and goes idle.
     fn fail(&mut self, message: String) {
         let track_id = self.session.as_ref().map(|s| s.track.id.clone());
@@ -547,9 +992,17 @@ impl Controller {
         self.set_state(PlayerState::Idle);
     }
 
-    /// Stops the sink and tells the decode thread to exit. Never joins the decode thread.
+    /// Stops the session and goes idle.
+    fn go_idle(&mut self) {
+        self.stop_session();
+        self.set_state(PlayerState::Idle);
+    }
+
+    /// Stops the sink, drops any preload and tells the decode thread to exit. Never joins the
+    /// decode thread.
     fn stop_session(&mut self) {
         self.sink.stop();
+        self.preload = None;
         if let Some(session) = self.session.take() {
             // The decode thread may already be gone; that is fine.
             let _ = session.cmd.send(DecoderCmd::Stop);
@@ -574,6 +1027,166 @@ impl Controller {
         let _ = self.events.send(event);
     }
 
+    /// Emits a `QueueChanged` snapshot of the queue.
+    fn emit_queue(&self) {
+        let entries = self.queue.entries_in_order().into_iter().cloned().collect();
+        self.emit(PlayerEvent::QueueChanged {
+            entries,
+            current: self.queue.current_id(),
+            shuffle: self.queue.shuffle(),
+            repeat: self.queue.repeat(),
+        });
+    }
+
+    /// After a queue edit: snapshot the queue and re-check the preload against it.
+    fn queue_edited(&mut self) {
+        self.emit_queue();
+        self.sync_preload();
+    }
+
+    /// Drops the preload when auto-advance no longer wants it, cancelling a queued hand-off.
+    fn sync_preload(&mut self) {
+        let want = self.queue.peek_auto_next().map(|e| e.id);
+        let Some(preload) = self.preload.as_ref() else {
+            return;
+        };
+        if Some(preload.entry_id) == want {
+            return;
+        }
+        if matches!(preload.state, PreloadState::HandedOff)
+            && let Some(session) = self.session.as_ref()
+        {
+            let _ = session.cmd.send(DecoderCmd::CancelNext);
+        }
+        self.preload = None;
+    }
+
+    /// Opens the entry auto-advance will play, once the current track is near its end.
+    fn maybe_start_preload(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        // While boundaries are queued the decode thread is already past the output: the next
+        // hand-off target is only known once they are crossed.
+        if self.preload.is_some() || !session.boundaries.is_empty() {
+            return;
+        }
+        let (Some(info), Some(stats)) = (session.info.as_ref(), session.stats.as_ref()) else {
+            return;
+        };
+        let Some(want) = self.queue.peek_auto_next() else {
+            return;
+        };
+        if self.preload_failed == Some(want.id) {
+            return;
+        }
+        let due = match info.duration {
+            Some(duration) => {
+                let position =
+                    frames_to_duration(session.position_frames(info.channels), info.sample_rate);
+                duration.saturating_sub(position) < self.config.preload_lead
+            }
+            None => stats.decoder_done.load(Ordering::Acquire),
+        };
+        if !due {
+            return;
+        }
+        let entry_id = want.id;
+        let track = want.track.clone();
+        let generation = session.generation;
+        let spawned = thread::Builder::new()
+            .name(PRELOAD_THREAD.to_owned())
+            .spawn({
+                let opener = Arc::clone(&self.opener);
+                let msg_tx = self.self_tx.clone();
+                let thread_track = track.clone();
+                move || preload_main(generation, entry_id, thread_track, opener, msg_tx)
+            });
+        match spawned {
+            Ok(_) => {
+                self.preload = Some(Preload {
+                    entry_id,
+                    track,
+                    state: PreloadState::Opening,
+                    info: None,
+                });
+            }
+            Err(e) => {
+                log::warn!("failed to start preload thread: {e}");
+                self.preload_failed = Some(entry_id);
+            }
+        }
+    }
+
+    /// Crosses every boundary the output has reached (several can fall in one tick for short
+    /// tracks). Returns true when a stale boundary restarted playback, which ends the tick.
+    fn cross_boundaries(&mut self) -> bool {
+        loop {
+            let Some(session) = self.session.as_mut() else {
+                return false;
+            };
+            let played = session
+                .stats
+                .as_ref()
+                .map_or(0, |s| s.samples_played.load(Ordering::Acquire));
+            if !session
+                .boundaries
+                .front()
+                .is_some_and(|b| played >= b.at_samples)
+            {
+                return false;
+            }
+            let Some(boundary) = session.boundaries.pop_front() else {
+                return false;
+            };
+            let ended_id = session.track.id.clone();
+            self.emit(PlayerEvent::TrackEnded { track_id: ended_id });
+
+            if self.queue.peek_auto_next().map(|e| e.id) != Some(boundary.entry_id) {
+                // The queue changed after the hand-off: play what it now says instead.
+                match self.queue.advance_auto().cloned() {
+                    Some(entry) => {
+                        self.start_entry(entry, self.want_play, None);
+                        self.emit_queue();
+                    }
+                    None => self.go_idle(),
+                }
+                return true;
+            }
+
+            self.queue.advance_auto();
+            let entry_id = boundary.entry_id;
+            let at_samples = boundary.at_samples;
+            let track_id = boundary.track.id.clone();
+            let info = boundary.info;
+            if let Some(session) = self.session.as_mut() {
+                session.track = boundary.track;
+                session.entry_id = entry_id;
+                session.info = Some(info.clone());
+                session.base_frames = 0;
+                session.offset_samples = at_samples;
+            }
+            self.emit(PlayerEvent::TrackChanged {
+                entry_id,
+                track_id: track_id.clone(),
+            });
+            self.emit(PlayerEvent::TrackLoaded { track_id, info });
+            self.emit_queue();
+            self.emit_position();
+            self.sync_preload();
+        }
+    }
+
+    /// Frames → the output position of the current track, if there is a session with a stream.
+    fn position(&self) -> Option<Duration> {
+        let session = self.session.as_ref()?;
+        let info = session.info.as_ref()?;
+        Some(frames_to_duration(
+            session.position_frames(info.channels),
+            info.sample_rate,
+        ))
+    }
+
     fn position_due(&self) -> bool {
         self.session
             .as_ref()
@@ -586,17 +1199,13 @@ impl Controller {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        let (Some(stats), Some(info)) = (session.stats.as_ref(), session.info.as_ref()) else {
+        let Some(info) = session.info.as_ref() else {
             return;
         };
-        if info.sample_rate == 0 || info.channels == 0 {
+        if session.stats.is_none() || info.sample_rate == 0 || info.channels == 0 {
             return;
         }
-        let played_frames = stats.samples_played.load(Ordering::Acquire) / u64::from(info.channels);
-        let position = frames_to_duration(
-            session.base_frames.saturating_add(played_frames),
-            info.sample_rate,
-        );
+        let position = frames_to_duration(session.position_frames(info.channels), info.sample_rate);
         let event = PlayerEvent::Position {
             track_id: session.track.id.clone(),
             position,
@@ -606,19 +1215,29 @@ impl Controller {
         self.emit(event);
     }
 
-    /// Final position, `TrackEnded`, then tear down and go idle.
-    fn finish_track(&mut self) {
+    /// The output has played out the last track: final position, `TrackEnded`, then the next
+    /// queue entry (cold or preloaded) or idle.
+    fn drain_end(&mut self) {
         self.emit_position();
         if let Some(track_id) = self.session.as_ref().map(|s| s.track.id.clone()) {
             self.emit(PlayerEvent::TrackEnded { track_id });
         }
-        self.stop_session();
-        self.set_state(PlayerState::Idle);
+        match self.queue.advance_auto().cloned() {
+            Some(entry) => {
+                self.start_entry(entry, true, None);
+                self.emit_queue();
+            }
+            None => self.go_idle(),
+        }
     }
 
-    /// Periodic state machine step: prefill → play, underrun → rebuffer, end detection,
-    /// position reporting. Does nothing without a session that has stats.
+    /// Periodic state machine step: boundary crossing, prefill → play, underrun → rebuffer,
+    /// end detection, preload start, position reporting. Does nothing without a session that
+    /// has stats.
     fn tick(&mut self) {
+        if self.cross_boundaries() {
+            return;
+        }
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -666,10 +1285,12 @@ impl Controller {
                 self.set_state(PlayerState::Buffering);
             }
             if done && stats.buffered_samples() == 0 {
-                self.finish_track();
+                self.drain_end();
                 return;
             }
         }
+
+        self.maybe_start_preload();
 
         if matches!(
             self.state,
@@ -679,6 +1300,16 @@ impl Controller {
             self.emit_position();
         }
     }
+}
+
+/// Shuffle seed: `configured` when non-zero, otherwise nanoseconds since the Unix epoch.
+fn resolve_seed(configured: u64) -> u64 {
+    if configured != 0 {
+        return configured;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| u64::try_from(d.as_nanos()).unwrap_or(1))
 }
 
 /// Frames → duration at `rate` Hz. Returns zero for a zero rate.
@@ -699,6 +1330,8 @@ struct DecodeLoop {
     generation: u64,
     msg_tx: Sender<Msg>,
     decoder: TrackDecoder,
+    /// Queued gapless continuation, switched to at EOF (or at once if EOF was already reached).
+    next: Option<(EntryId, Box<TrackDecoder>)>,
     channels: usize,
     producer: Producer<i32>,
     stats: Arc<RingStats>,
@@ -707,6 +1340,8 @@ struct DecodeLoop {
     offset: usize,
     /// End of stream reached; only commands are processed from here on.
     eof: bool,
+    /// Number of gapless switches performed (see `DecoderCmd::Seek::track_seq`).
+    track_seq: u64,
 }
 
 impl DecodeLoop {
@@ -738,16 +1373,20 @@ impl DecodeLoop {
             if self.offset >= self.block.len() {
                 match self.decoder.next_block::<i32>(&mut self.block) {
                     Ok(Some(_)) => self.offset = 0,
-                    Ok(None) => {
-                        self.stats.decoder_done.store(true, Ordering::Release);
-                        report(
-                            &self.msg_tx,
-                            DecoderMsg::Finished {
-                                generation: self.generation,
-                            },
-                        );
-                        self.eof = true;
-                    }
+                    // Only reached once the previous block is fully pushed (`offset == len`).
+                    Ok(None) => match self.next.take() {
+                        Some((entry_id, decoder)) => self.switch(entry_id, decoder),
+                        None => {
+                            self.stats.decoder_done.store(true, Ordering::Release);
+                            report(
+                                &self.msg_tx,
+                                DecoderMsg::Finished {
+                                    generation: self.generation,
+                                },
+                            );
+                            self.eof = true;
+                        }
+                    },
                     Err(e) => {
                         report(
                             &self.msg_tx,
@@ -779,18 +1418,67 @@ impl DecodeLoop {
         }
     }
 
+    /// Gapless switch to `decoder`. Callers guarantee the previous decoder's last block is fully
+    /// pushed, so nothing sits between its last sample and the first sample of `decoder`.
+    fn switch(&mut self, entry_id: EntryId, decoder: Box<TrackDecoder>) {
+        // Read before any sample of the new decoder is pushed.
+        let boundary_samples = self.stats.samples_pushed.load(Ordering::Acquire);
+        self.track_seq = self.track_seq.wrapping_add(1);
+        self.decoder = *decoder;
+        self.block.clear();
+        self.offset = 0;
+        report(
+            &self.msg_tx,
+            DecoderMsg::Advanced {
+                generation: self.generation,
+                entry_id,
+                info: self.decoder.info().clone(),
+                boundary_samples,
+            },
+        );
+    }
+
     /// Applies one command. Returns false when the thread must exit.
     fn on_cmd(&mut self, cmd: DecoderCmd) -> bool {
         match cmd {
             DecoderCmd::Stop => false,
             // The first Start is consumed before the loop; any later one is stale.
             DecoderCmd::Start { .. } => true,
+            DecoderCmd::Next { entry_id, decoder } => {
+                if self.eof {
+                    // EOF was already reported and every sample is pushed: hand off now and
+                    // resume decoding. The EOF `decoder_done` is withdrawn for the new track.
+                    self.stats.decoder_done.store(false, Ordering::Release);
+                    self.eof = false;
+                    self.switch(entry_id, decoder);
+                } else {
+                    self.next = Some((entry_id, decoder));
+                }
+                true
+            }
+            DecoderCmd::CancelNext => {
+                self.next = None;
+                true
+            }
             DecoderCmd::Seek {
                 to,
                 seq,
+                track_seq,
                 producer,
                 stats,
             } => {
+                if track_seq != self.track_seq {
+                    // The seek was meant for a track this thread has already finished. The
+                    // controller cold-restarts that track and stops this thread.
+                    report(
+                        &self.msg_tx,
+                        DecoderMsg::SeekRejected {
+                            generation: self.generation,
+                            seq,
+                        },
+                    );
+                    return true;
+                }
                 self.producer = producer;
                 self.stats = stats;
                 self.block.clear();
@@ -802,81 +1490,110 @@ impl DecodeLoop {
     }
 }
 
-/// Body of the `sonorus-decode` thread for one session.
-fn decode_main(
-    generation: u64,
-    track: TrackRef,
-    opener: Arc<dyn TrackOpener>,
-    msg_tx: Sender<Msg>,
-    cmd_rx: Receiver<DecoderCmd>,
-) {
-    let opened = match opener.open(&track) {
-        Ok(opened) => opened,
-        Err(e) => {
-            report(
-                &msg_tx,
-                DecoderMsg::Failed {
-                    generation,
-                    message: e.to_string(),
-                },
-            );
-            return;
-        }
-    };
+/// Opens `track` through `opener` and probes it. The buffer handle is only a view of the
+/// source's read-ahead state; the decoder owns the source itself.
+fn open_track(
+    track: &TrackRef,
+    opener: &dyn TrackOpener,
+) -> crate::error::Result<(TrackDecoder, Option<BufferHandle>)> {
     let OpenedSource {
         source,
         ext_hint,
         buffer,
-    } = opened;
-    // Keeps the source's buffer handle alive for as long as this session decodes.
-    let _buffer = buffer;
+    } = opener.open(track)?;
+    let decoder = TrackDecoder::new(source, ext_hint.as_deref())?;
+    Ok((decoder, buffer))
+}
 
-    let mut decoder = match TrackDecoder::new(source, ext_hint.as_deref()) {
-        Ok(decoder) => decoder,
-        Err(e) => {
-            report(
-                &msg_tx,
-                DecoderMsg::Failed {
-                    generation,
-                    message: e.to_string(),
-                },
-            );
-            return;
-        }
+/// Body of the `sonorus-decode` thread for one session.
+fn decode_main(
+    generation: u64,
+    source: DecoderSource,
+    opener: Arc<dyn TrackOpener>,
+    msg_tx: Sender<Msg>,
+    cmd_rx: Receiver<DecoderCmd>,
+) {
+    let (mut decoder, _buffer) = match source {
+        DecoderSource::Open(track) => match open_track(&track, opener.as_ref()) {
+            Ok(opened) => opened,
+            Err(e) => {
+                report(
+                    &msg_tx,
+                    DecoderMsg::Failed {
+                        generation,
+                        message: e.to_string(),
+                    },
+                );
+                return;
+            }
+        },
+        DecoderSource::Ready(decoder) => (*decoder, None),
     };
     let info = decoder.info().clone();
     let channels = usize::from(info.channels);
     report(&msg_tx, DecoderMsg::Opened { generation, info });
 
-    // Wait for the first ring: either a plain start or a seek before playback.
-    let (producer, stats) = match cmd_rx.recv() {
-        Ok(DecoderCmd::Start { producer, stats }) => (producer, stats),
-        Ok(DecoderCmd::Seek {
-            to,
-            seq,
-            producer,
-            stats,
-        }) => {
-            if !seek_decoder(&mut decoder, to, seq, generation, &msg_tx) {
-                return;
+    // Wait for the first ring: either a plain start or a seek before playback. A continuation
+    // queued before the ring exists is kept for the decode loop.
+    let mut next = None;
+    let (producer, stats) = loop {
+        match cmd_rx.recv() {
+            Ok(DecoderCmd::Start { producer, stats }) => break (producer, stats),
+            // No switch can happen before the loop starts, so `track_seq` is always 0 here.
+            Ok(DecoderCmd::Seek {
+                to,
+                seq,
+                producer,
+                stats,
+                ..
+            }) => {
+                if !seek_decoder(&mut decoder, to, seq, generation, &msg_tx) {
+                    return;
+                }
+                break (producer, stats);
             }
-            (producer, stats)
+            Ok(DecoderCmd::Next { entry_id, decoder }) => next = Some((entry_id, decoder)),
+            Ok(DecoderCmd::CancelNext) => next = None,
+            Ok(DecoderCmd::Stop) | Err(_) => return,
         }
-        Ok(DecoderCmd::Stop) | Err(_) => return,
     };
 
     let mut decode = DecodeLoop {
         generation,
         msg_tx,
         decoder,
+        next,
         channels,
         producer,
         stats,
         block: Vec::new(),
         offset: 0,
         eof: false,
+        track_seq: 0,
     };
     decode.run(&cmd_rx);
+}
+
+/// Body of a preload thread (`sonorus-preload`): opens and probes `track` without touching any
+/// ring, then reports the decoder or the error as `Preloaded`.
+fn preload_main(
+    generation: u64,
+    entry_id: EntryId,
+    track: TrackRef,
+    opener: Arc<dyn TrackOpener>,
+    msg_tx: Sender<Msg>,
+) {
+    let result = open_track(&track, opener.as_ref())
+        .map(|(decoder, _buffer)| Box::new(decoder))
+        .map_err(|e| e.to_string());
+    report(
+        &msg_tx,
+        DecoderMsg::Preloaded {
+            generation,
+            entry_id,
+            result,
+        },
+    );
 }
 
 /// Seeks the decoder and reports `Seeked` (or `Failed`). Returns false on failure.
@@ -924,6 +1641,8 @@ mod tests {
     use crate::opener::FileOpener;
     use crate::output::NullSink;
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use symphonia::core::io::MediaSource;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -937,6 +1656,7 @@ mod tests {
             prefill: Duration::from_millis(50),
             tick: Duration::from_millis(5),
             position_interval: Duration::from_millis(20),
+            preload_lead: Duration::from_secs(10),
             ..PlayerConfig::default()
         }
     }
@@ -1034,6 +1754,46 @@ mod tests {
             PlayerEvent::Position { position, .. } => Some(*position),
             _ => None,
         }
+    }
+
+    /// Entry ids of every `TrackChanged`, in order.
+    fn changed_ids(events: &[PlayerEvent]) -> Vec<EntryId> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::TrackChanged { entry_id, .. } => Some(*entry_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(entry ids in play order, current, shuffle, repeat)` of every `QueueChanged`.
+    type QueueSnapshot = (Vec<EntryId>, Option<EntryId>, bool, RepeatMode);
+
+    fn queue_snapshots(events: &[PlayerEvent]) -> Vec<QueueSnapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::QueueChanged {
+                    entries,
+                    current,
+                    shuffle,
+                    repeat,
+                } => Some((
+                    entries.iter().map(|x| x.id).collect(),
+                    *current,
+                    *shuffle,
+                    *repeat,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits for the next `TrackChanged` and returns its entry id.
+    fn next_track_changed(rx: &Receiver<PlayerEvent>) -> Option<EntryId> {
+        let events = collect_until(rx, |e| !changed_ids(e).is_empty());
+        changed_ids(&events).last().copied()
     }
 
     #[test]
@@ -1259,5 +2019,476 @@ mod tests {
         drop(player);
         let took = started.elapsed();
         assert!(took < Duration::from_millis(500), "drop took {took:?}");
+    }
+
+    /// Fully decodes a fixture through `TrackDecoder` (the reference output).
+    fn decode_fixture(name: &str, ext: &str) -> Vec<i32> {
+        let file = std::fs::File::open(format!("{FIXTURES}/{name}")).expect("fixture");
+        let mut dec = TrackDecoder::new(Box::new(file), Some(ext)).expect("probe fixture");
+        let mut all = Vec::new();
+        let mut block = Vec::<i32>::new();
+        while dec.next_block(&mut block).expect("decode").is_some() {
+            all.extend_from_slice(&block);
+        }
+        all
+    }
+
+    /// Names of the decode-thread messages, for readable assertions.
+    fn msg_names(msgs: &[DecoderMsg]) -> Vec<&'static str> {
+        msgs.iter()
+            .map(|m| match m {
+                DecoderMsg::Opened { .. } => "Opened",
+                DecoderMsg::Seeked { .. } => "Seeked",
+                DecoderMsg::Finished { .. } => "Finished",
+                DecoderMsg::Failed { .. } => "Failed",
+                DecoderMsg::Advanced { .. } => "Advanced",
+                DecoderMsg::Preloaded { .. } => "Preloaded",
+                DecoderMsg::SeekRejected { .. } => "SeekRejected",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_track_switches_gaplessly_at_eof() {
+        const FLAC_SAMPLES: u64 = 28_800 * 2;
+        let flac = decode_fixture("tone_24_96.flac", "flac");
+        let wav = decode_fixture("tone_24_96.wav", "wav");
+        assert_eq!(flac.len() as u64, FLAC_SAMPLES);
+        let mut expected = flac;
+        expected.extend_from_slice(&wav);
+
+        let next_file = std::fs::File::open(format!("{FIXTURES}/tone_24_96.wav")).expect("wav");
+        let preloaded = TrackDecoder::new(Box::new(next_file), Some("wav")).expect("preload");
+
+        // A small ring keeps the decode thread blocked on the consumer, so `Next` is always
+        // queued well before the first track reaches EOF.
+        let (producer, mut consumer) = rtrb::RingBuffer::<i32>::new(4096);
+        let stats = Arc::new(RingStats::new());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        let handle = thread::spawn({
+            let opener = fixture_opener();
+            move || {
+                decode_main(
+                    1,
+                    DecoderSource::Open(track("tone_24_96.flac")),
+                    opener,
+                    msg_tx,
+                    cmd_rx,
+                )
+            }
+        });
+        cmd_tx
+            .send(DecoderCmd::Start {
+                producer,
+                stats: Arc::clone(&stats),
+            })
+            .expect("send start");
+        cmd_tx
+            .send(DecoderCmd::Next {
+                entry_id: 2,
+                decoder: Box::new(preloaded),
+            })
+            .expect("send next");
+
+        // Drain on this thread until the decode thread reports its end (or fails).
+        let deadline = Instant::now() + DEADLINE;
+        let mut samples: Vec<i32> = Vec::new();
+        let mut msgs: Vec<DecoderMsg> = Vec::new();
+        loop {
+            while let Ok(s) = consumer.pop() {
+                samples.push(s);
+            }
+            while let Ok(Msg::Dec(m)) = msg_rx.try_recv() {
+                msgs.push(m);
+            }
+            if msgs
+                .iter()
+                .any(|m| matches!(m, DecoderMsg::Finished { .. } | DecoderMsg::Failed { .. }))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "decode did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Finished is sent after the last push, so everything is in the ring by now.
+        while let Ok(s) = consumer.pop() {
+            samples.push(s);
+        }
+        cmd_tx.send(DecoderCmd::Stop).expect("send stop");
+        handle.join().expect("decode thread");
+
+        assert_eq!(
+            msg_names(&msgs),
+            vec!["Opened", "Advanced", "Finished"],
+            "unexpected decode messages"
+        );
+        let advanced: Vec<(EntryId, u64)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                DecoderMsg::Advanced {
+                    entry_id,
+                    boundary_samples,
+                    ..
+                } => Some((*entry_id, *boundary_samples)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(advanced, vec![(2, FLAC_SAMPLES)]);
+        assert!(
+            samples == expected,
+            "decoded {} samples, expected {}",
+            samples.len(),
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn seek_for_a_track_already_switched_away_from_is_rejected() {
+        let next_file = std::fs::File::open(format!("{FIXTURES}/tone_24_96.wav")).expect("wav");
+        let preloaded = TrackDecoder::new(Box::new(next_file), Some("wav")).expect("preload");
+        let (producer, mut consumer) = rtrb::RingBuffer::<i32>::new(1 << 17);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        let handle = thread::spawn({
+            let opener = fixture_opener();
+            move || {
+                let source = DecoderSource::Open(track("tone_24_96.flac"));
+                decode_main(1, source, opener, msg_tx, cmd_rx)
+            }
+        });
+        let stats = Arc::new(RingStats::new());
+        cmd_tx
+            .send(DecoderCmd::Next {
+                entry_id: 2,
+                decoder: Box::new(preloaded),
+            })
+            .expect("send next");
+        cmd_tx
+            .send(DecoderCmd::Start { producer, stats })
+            .expect("send start");
+
+        let wait_for =
+            |name: &str, msgs: &mut Vec<DecoderMsg>, consumer: &mut rtrb::Consumer<i32>| {
+                let deadline = Instant::now() + DEADLINE;
+                while !msg_names(msgs).contains(&name) {
+                    while consumer.pop().is_ok() {}
+                    while let Ok(Msg::Dec(m)) = msg_rx.try_recv() {
+                        msgs.push(m);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "no {name}: {:?}",
+                        msg_names(msgs)
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            };
+        let mut msgs = Vec::new();
+        wait_for("Finished", &mut msgs, &mut consumer);
+
+        // The controller has not seen the switch yet (track_seq 0): the seek must be refused.
+        let (stale_producer, _stale_consumer) = rtrb::RingBuffer::<i32>::new(4096);
+        cmd_tx
+            .send(DecoderCmd::Seek {
+                to: Duration::from_millis(100),
+                seq: 7,
+                track_seq: 0,
+                producer: stale_producer,
+                stats: Arc::new(RingStats::new()),
+            })
+            .expect("send seek");
+        wait_for("SeekRejected", &mut msgs, &mut consumer);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, DecoderMsg::SeekRejected { seq: 7, .. })),
+            "{:?}",
+            msg_names(&msgs)
+        );
+
+        // With the switch acknowledged (track_seq 1) the same seek is applied to the new track.
+        let (fresh_producer, mut fresh_consumer) = rtrb::RingBuffer::<i32>::new(4096);
+        cmd_tx
+            .send(DecoderCmd::Seek {
+                to: Duration::from_millis(100),
+                seq: 8,
+                track_seq: 1,
+                producer: fresh_producer,
+                stats: Arc::new(RingStats::new()),
+            })
+            .expect("send seek");
+        wait_for("Seeked", &mut msgs, &mut fresh_consumer);
+        cmd_tx.send(DecoderCmd::Stop).expect("send stop");
+        handle.join().expect("decode thread");
+    }
+
+    /// Output that captures every sample it consumes instead of discarding them. It consumes
+    /// only while playing, and never zero-fills.
+    struct CaptureSink {
+        captured: Arc<Mutex<Vec<i32>>>,
+        quit: Arc<AtomicBool>,
+        playing: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl CaptureSink {
+        fn new(captured: Arc<Mutex<Vec<i32>>>) -> Self {
+            Self {
+                captured,
+                quit: Arc::new(AtomicBool::new(false)),
+                playing: Arc::new(AtomicBool::new(false)),
+                thread: None,
+            }
+        }
+
+        fn halt(&mut self) {
+            self.quit.store(true, Ordering::Release);
+            self.playing.store(false, Ordering::Release);
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for CaptureSink {
+        fn drop(&mut self) {
+            self.halt();
+        }
+    }
+
+    impl OutputSink for CaptureSink {
+        fn start(
+            &mut self,
+            _format: OutputFormat,
+            mut consumer: rtrb::Consumer<i32>,
+            stats: Arc<RingStats>,
+        ) -> Result<()> {
+            self.halt();
+            self.quit = Arc::new(AtomicBool::new(false));
+            self.playing = Arc::new(AtomicBool::new(false));
+            let quit = Arc::clone(&self.quit);
+            let playing = Arc::clone(&self.playing);
+            let captured = Arc::clone(&self.captured);
+            let handle = thread::Builder::new()
+                .name("sonorus-capture".to_owned())
+                .spawn(move || {
+                    while !quit.load(Ordering::Acquire) {
+                        let slots = consumer.slots();
+                        if playing.load(Ordering::Acquire)
+                            && slots > 0
+                            && let Ok(chunk) = consumer.read_chunk(slots)
+                        {
+                            let (a, b) = chunk.as_slices();
+                            let n = a.len() + b.len();
+                            if let Ok(mut out) = captured.lock() {
+                                out.extend_from_slice(a);
+                                out.extend_from_slice(b);
+                            }
+                            chunk.commit_all();
+                            stats.samples_played.fetch_add(n as u64, Ordering::Release);
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+                .expect("spawn capture thread");
+            self.thread = Some(handle);
+            Ok(())
+        }
+
+        fn play(&mut self) -> Result<()> {
+            self.playing.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn pause(&mut self) -> Result<()> {
+            self.playing.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.halt();
+        }
+
+        fn latency(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn name(&self) -> &str {
+            "capture"
+        }
+    }
+
+    #[test]
+    fn flac_to_wav_is_gapless_and_bit_exact() {
+        let mut expected = decode_fixture("tone_24_96.flac", "flac");
+        expected.extend(decode_fixture("tone_24_96.wav", "wav"));
+
+        let captured = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let config = PlayerConfig {
+            output_kind: SampleKind::I32,
+            ..test_config()
+        };
+        let sink = Box::new(CaptureSink::new(Arc::clone(&captured)));
+        let (player, rx) = Player::new(sink, fixture_opener(), config);
+        player.set_queue(
+            vec![track("tone_24_96.flac"), track("tone_24_96.wav")],
+            0,
+            true,
+        );
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1, 2], "{events:#?}");
+
+        // The controller stops the sink before going idle, so nothing is appended after this.
+        let got = captured.lock().expect("capture lock").clone();
+        assert!(
+            got == expected,
+            "captured {} samples, expected {}; first difference at {:?}",
+            got.len(),
+            expected.len(),
+            got.iter().zip(&expected).position(|(a, b)| a != b)
+        );
+
+        let first_end = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+            .expect("first TrackEnded");
+        let before = &events[..first_end];
+        let buffering = before
+            .iter()
+            .filter(|e| is_state(e, PlayerState::Buffering))
+            .count();
+        let playing = before
+            .iter()
+            .filter(|e| is_state(e, PlayerState::Playing))
+            .count();
+        assert_eq!((buffering, playing), (1, 1), "{events:#?}");
+
+        let second_change = events
+            .iter()
+            .enumerate()
+            .skip(first_end)
+            .find(|(_, e)| matches!(e, PlayerEvent::TrackChanged { .. }))
+            .map(|(i, _)| i)
+            .expect("second TrackChanged");
+        let gap = &events[first_end..second_change];
+        assert!(
+            !gap.iter()
+                .any(|e| is_state(e, PlayerState::Buffering) || is_state(e, PlayerState::Loading)),
+            "state change between tracks: {gap:#?}"
+        );
+    }
+
+    #[test]
+    fn format_change_cold_starts_at_new_rate() {
+        let (player, rx) = player_with(fixture_opener(), 4.0);
+        player.set_queue(
+            vec![track("tone_24_96.flac"), track("tone_16_44.flac")],
+            0,
+            true,
+        );
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+
+        let ended = events
+            .iter()
+            .filter(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+            .count();
+        assert_eq!(ended, 2, "{events:#?}");
+        let rates: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::TrackLoaded { info, .. } => Some(info.sample_rate),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rates, vec![96_000, 44_100], "{events:#?}");
+    }
+
+    #[test]
+    fn repeat_one_replays_the_same_entry() {
+        let (player, rx) = player_with(fixture_opener(), 4.0);
+        player.set_queue(vec![track("tone_24_96.flac")], 0, true);
+        player.set_repeat(RepeatMode::One);
+        let events = collect_until(&rx, |e| changed_ids(e).len() >= 2);
+        player.stop();
+
+        let ids = changed_ids(&events);
+        assert!(ids.len() >= 2, "fewer than two starts: {events:#?}");
+        assert!(ids.iter().all(|&id| id == 1), "{ids:?}");
+    }
+
+    #[test]
+    fn transport_and_queue_views_follow_the_queue() {
+        let (player, rx) = player_with(fixture_opener(), 4.0);
+        player.set_queue(
+            vec![
+                track("tone_24_96.flac"),
+                track("tone_16_44.flac"),
+                track("tone_24_96.wav"),
+            ],
+            0,
+            false,
+        );
+        let _ = collect_until(&rx, |e| has_state(e, PlayerState::Paused));
+
+        player.next();
+        assert_eq!(next_track_changed(&rx), Some(2));
+        player.previous();
+        assert_eq!(next_track_changed(&rx), Some(1));
+        player.jump_to(3);
+        assert_eq!(next_track_changed(&rx), Some(3));
+
+        player.set_shuffle(true);
+        let events = collect_until(&rx, |e| queue_snapshots(e).last().is_some_and(|s| s.2));
+        let (ids, current, shuffle, repeat) = queue_snapshots(&events)
+            .last()
+            .cloned()
+            .expect("shuffle snapshot");
+        assert!(shuffle, "{events:#?}");
+        assert_eq!(current, Some(3));
+        assert_eq!(
+            ids.first(),
+            Some(&3),
+            "current entry leads the shuffled order"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 2, 3]);
+        assert_eq!(repeat, RepeatMode::Off);
+
+        player.set_repeat(RepeatMode::All);
+        let events = collect_until(&rx, |e| {
+            queue_snapshots(e)
+                .last()
+                .is_some_and(|s| s.3 == RepeatMode::All)
+        });
+        let (_, current, shuffle, repeat) = queue_snapshots(&events)
+            .last()
+            .cloned()
+            .expect("repeat snapshot");
+        assert_eq!((current, shuffle, repeat), (Some(3), true, RepeatMode::All));
+        player.stop();
+    }
+
+    #[test]
+    fn removed_upcoming_entry_is_never_played() {
+        let (player, rx) = player_with(fixture_opener(), 4.0);
+        player.set_queue(
+            vec![
+                track("tone_24_96.flac"),
+                track("tone_24_96.wav"),
+                track("tone_24_96.flac"),
+            ],
+            0,
+            true,
+        );
+        // Remove the upcoming wav (entry 2) once the first track plays. Its hand-off has
+        // normally happened by then; either way it must never become the current entry.
+        let mut events = collect_until(&rx, |e| has_state(e, PlayerState::Playing));
+        player.remove(2);
+        events.extend(collect_until(&rx, ends_idle));
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1, 3], "{events:#?}");
     }
 }

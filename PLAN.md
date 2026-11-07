@@ -613,9 +613,159 @@ rtrb 0.4.1: `RingBuffer::<T>::new(cap) -> (Producer<T>, Consumer<T>)`; `slots()`
 - [x] **4.5** Opus review + commit.
 
 ## Phase 5 — Gapless + queue
-- [ ] 5.1 `engine::queue::Queue` (items, index, shuffle order w/ seed, repeat Off/All/One; pure, unit-tested).
-- [ ] 5.2 prefetch: open next track's RangeSource+decoder when current has < 15 s left.
-- [ ] 5.3 seamless handoff in decode thread when formats match; else drain + reconfigure output.
+
+- [x] **5.1 `crates/engine/src/queue.rs`** (+ `lib.rs`: `pub mod queue;`) — pure logic, no threads/IO.
+    ```rust
+    pub type EntryId = u64;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct QueueEntry { pub id: EntryId, pub track: TrackRef }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum RepeatMode { #[default] Off, All, One }
+    pub struct Queue {
+        entries: Vec<QueueEntry>,   // "original" order (what shuffle-off restores)
+        order: Vec<EntryId>,        // play order; == entries' ids when shuffle is off
+        pos: Option<usize>,         // index into `order` of the current entry
+        shuffle: bool, repeat: RepeatMode, next_id: EntryId, rng: fastrand::Rng,
+    }
+    impl Queue {
+        pub fn new(seed: u64) -> Self;                       // rng = fastrand::Rng::with_seed(seed); ids start at 1
+        /// Replace everything. Empty → pos None, returns None. `start` clamped to len-1. Shuffle on →
+        /// order = [start entry] + the others shuffled, pos = 0. Shuffle off → order = entries, pos = start.
+        pub fn set_tracks(&mut self, tracks: Vec<TrackRef>, start: usize) -> Option<&QueueEntry>;
+        pub fn current(&self) -> Option<&QueueEntry>;
+        pub fn current_id(&self) -> Option<EntryId>;
+        pub fn current_index(&self) -> Option<usize>;        // == pos
+        pub fn entries_in_order(&self) -> Vec<&QueueEntry>;  // play order
+        pub fn upcoming(&self) -> Vec<&QueueEntry>;          // play order after pos, no wrap
+        pub fn get(&self, id: EntryId) -> Option<&QueueEntry>;
+        pub fn len(&self) -> usize;  pub fn is_empty(&self) -> bool;
+        /// What plays when the current track finishes by itself. One → current. Off → order[pos+1] or None.
+        /// All → order[(pos+1) % len] (a single entry repeats itself). pos None → None.
+        pub fn peek_auto_next(&self) -> Option<&QueueEntry>;
+        pub fn advance_auto(&mut self) -> Option<&QueueEntry>; // moves pos to peek_auto_next; None → pos unchanged
+        /// User "next": order[pos+1]; at the end, All → wrap to order[0], Off/One → None (pos unchanged).
+        /// (Repeat One only affects auto-advance, never an explicit skip.)
+        pub fn skip_next(&mut self) -> Option<&QueueEntry>;
+        /// User "previous": pos-1. At pos 0: All → wrap to last; otherwise stay and return current.
+        pub fn skip_previous(&mut self) -> Option<&QueueEntry>;
+        pub fn jump_to(&mut self, id: EntryId) -> Option<&QueueEntry>; // unknown id → None, pos unchanged
+        /// Add to the end of `order` and `entries`. Returns new ids. Does not change pos (None stays None).
+        pub fn append(&mut self, tracks: Vec<TrackRef>) -> Vec<EntryId>;
+        /// Insert right after pos in `order` (pos None → same as append). Shuffle off → also insert after
+        /// the current entry in `entries`; shuffle on → push to the end of `entries`. Returns new ids.
+        pub fn play_next(&mut self, tracks: Vec<TrackRef>) -> Vec<EntryId>;
+        /// Remove from both vecs. If it was current: the entry now at the same order index becomes current;
+        /// if it was last, the new last; if empty, None. Entries before pos removed → pos -= 1. false if unknown.
+        pub fn remove(&mut self, id: EntryId) -> bool;
+        /// Move within `order` to `to` (clamped to len-1); pos follows the current entry. Shuffle off → apply the
+        /// same move to `entries` so they stay identical. false if unknown id.
+        pub fn move_entry(&mut self, id: EntryId, to: usize) -> bool;
+        pub fn clear(&mut self);
+        /// On: order = [current] + others shuffled (pos = 0); with no current, shuffle all, pos None.
+        /// Off: order = entries' ids, pos = index of current. No-op if unchanged.
+        pub fn set_shuffle(&mut self, on: bool);
+        pub fn shuffle(&self) -> bool;
+        pub fn set_repeat(&mut self, mode: RepeatMode);  pub fn repeat(&self) -> RepeatMode;
+    }
+    ```
+    Invariants (assert in tests after every operation via a test helper): `order` is a permutation of the
+    entries' ids; shuffle off ⇒ order == entries' ids; pos is None iff (empty or never set) else < len.
+    No panics on any input (empty queue, unknown ids, huge indices). Tests: each method incl. edge cases above;
+    shuffle with the same seed is deterministic; set_shuffle(true) keeps current at pos 0 and set_shuffle(false)
+    restores original order with the same current; Repeat All wraps both directions; One repeats on auto but
+    not on skip_next; remove current at end / middle / only entry; move_entry of current keeps it current.
+
+- [x] **5.2 `crates/engine/src/player.rs`: decode-side gapless plumbing** (after 5.1)
+    New private items:
+    ```rust
+    enum DecoderSource { Open(TrackRef), Ready(Box<TrackDecoder>) }   // decode_main entry: open, or use a preloaded decoder
+    // DecoderCmd gains:
+    Next { entry_id: EntryId, decoder: Box<TrackDecoder> },          // queue for gapless continuation (replaces any queued one)
+    CancelNext,                                                      // drop the queued next, if not yet switched
+    // DecoderMsg gains:
+    Advanced { generation: u64, entry_id: EntryId, info: StreamInfo, boundary_samples: u64 },
+    Preloaded { generation: u64, entry_id: EntryId, result: Result<Box<TrackDecoder>, String> },
+    ```
+    - `decode_main(generation, source: DecoderSource, opener, msg_tx, cmd_rx)`: Open → as today; Ready → skip
+      opening, send Opened with `decoder.info()` immediately.
+    - `DecodeLoop` gets `next: Option<(EntryId, Box<TrackDecoder>)>`. on_cmd: Next → `self.next = Some(..)`;
+      CancelNext → `self.next = None`. Seek keeps `next` untouched.
+    - At EOF (`next_block` → Ok(None)): if `self.next.take()` is Some((id, dec)): `boundary =
+      stats.samples_pushed.load(Acquire)`; `self.decoder = *dec`; `self.channels` unchanged (controller only hands
+      off same-channel-count, same-rate decoders); send `Advanced { generation, entry_id: id, info:
+      self.decoder.info().clone(), boundary_samples: boundary }`; block.clear(); offset = 0; continue decoding
+      (eof stays false, decoder_done NOT set). Else: today's behaviour (decoder_done, Finished, eof = true).
+      Also when `eof` is true and a `Next` arrives (handed off late): switch immediately the same way, first
+      `stats.decoder_done.store(false, Release)` (it was set at EOF), set eof = false, and resume. If the controller
+      already drained and cold-started the track, this thread has been sent Stop and its messages are stale.
+    - `fn preload_main(generation, entry_id, track, opener, msg_tx)`: thread "sonorus-preload": open + TrackDecoder::new
+      → send `Preloaded { result: Ok(Box::new(decoder)) }` or `Err(e.to_string())`. Never touches any ring.
+    - `TrackDecoder` must be `Send` (it holds Box<dyn FormatReader>/Box<dyn AudioDecoder>, both Send in Symphonia
+      0.6); add a compile-time assertion `const _: fn() = || { fn is_send<T: Send>() {} is_send::<TrackDecoder>(); };`.
+    Controller changes are task 5.3; in 5.2 only wire the new variants so it compiles: on Advanced/Preloaded the
+    controller just logs (log::debug) and drops them, and all existing call sites use `DecoderSource::Open`.
+    All existing player tests must still pass unchanged.
+- [x] **5.3 `crates/engine/src/player.rs`: queue + gapless controller** (after 5.2)
+    Public API (Player methods send Commands; `load(track, autoplay)` becomes `set_queue(vec![track], 0, autoplay)`):
+    ```rust
+    pub fn set_queue(&self, tracks: Vec<TrackRef>, start: usize, autoplay: bool);
+    pub fn append(&self, tracks: Vec<TrackRef>);      pub fn play_next(&self, tracks: Vec<TrackRef>);
+    pub fn next(&self);  pub fn previous(&self);      pub fn jump_to(&self, id: EntryId);
+    pub fn remove(&self, id: EntryId);                pub fn move_entry(&self, id: EntryId, to: usize);
+    pub fn set_shuffle(&self, on: bool);              pub fn set_repeat(&self, mode: RepeatMode);
+    // PlayerConfig gains: pub preload_lead: Duration (15 s), pub shuffle_seed: u64 (0 → seed from SystemTime nanos)
+    // PlayerEvent gains:
+    TrackChanged { entry_id: EntryId, track_id: String },
+    QueueChanged { entries: Vec<QueueEntry>, current: Option<EntryId>, shuffle: bool, repeat: RepeatMode },
+    ```
+    Controller state: `queue: Queue`; `preload: Option<Preload>` with
+    `enum PreloadState { Opening, Ready(Box<TrackDecoder>), HandedOff }`, `struct Preload { entry_id, track, state, info: Option<StreamInfo> }`;
+    Session gains `entry_id: EntryId`, `offset_samples: u64` (ring sample index where the current track starts;
+    position = base_frames + (samples_played - offset_samples) / channels), and
+    `boundaries: VecDeque<Boundary { entry_id, track: TrackRef, info: StreamInfo, at_samples: u64 }>`.
+    Helpers:
+    - `start_entry(entry: QueueEntry, autoplay, seek: Option<Duration>)`: stop_session(); if preload is Ready for
+      this entry id → take its decoder and spawn decode_main with `DecoderSource::Ready`, else `Open(track)`;
+      preload = None; session with entry_id, pending_seek = seek; set_state(Loading); emit TrackChanged.
+    - `emit_queue()`: QueueChanged snapshot (entries_in_order cloned).
+    - `sync_preload()`: after any queue mutation or track change: let want = queue.peek_auto_next() id. If preload
+      exists with a different entry id → if HandedOff send CancelNext; preload = None.
+    - `maybe_start_preload()` in tick: if preload None, session opened, want is Some, and (remaining <
+      preload_lead, where remaining = duration - position, or duration unknown and decoder_done) → spawn
+      preload_main, preload = Opening.
+    - Preloaded msg (current generation, entry id == preload's): Err → log::warn, preload = None (fall back to cold
+      open later). Ok(dec) → info = dec.info(); if session info has the same sample_rate AND channels → send
+      `Next { entry_id, decoder }`, state HandedOff; else state Ready(dec).
+    - Advanced msg (current gen): push Boundary { entry_id, track from preload (or queue.get(entry_id)), info,
+      at_samples: boundary_samples } onto session.boundaries; preload = None (it has been consumed).
+    tick additions (before the existing done/drain check):
+    - Boundary crossing: while front boundary b has `samples_played >= b.at_samples`: pop it; emit TrackEnded(old
+      track id); if `queue.peek_auto_next().map(|e| e.id) == Some(b.entry_id)` → queue.advance_auto(); session.track =
+      b.track; session.entry_id; session.info = b.info; base_frames = 0; offset_samples = b.at_samples; emit
+      TrackChanged, TrackLoaded(info), QueueChanged, Position; sync_preload(). Else (queue changed after handoff:
+      stale) → advance_auto() and start_entry(that entry or Idle if None, want_play, None); return.
+    - Drain end (done && buffered == 0), replacing finish_track: emit final Position + TrackEnded; then
+      `queue.advance_auto()` → Some(e) → start_entry(e, true, None) (uses a Ready preload if present = no network
+      wait), emit QueueChanged; None → stop_session, set_state(Idle).
+    Commands: SetQueue → queue.set_tracks; current Some → start_entry(current, autoplay); else stop + Idle;
+    emit_queue. Next → skip_next → Some → start_entry(e, want_play || state was Playing/Buffering) else nothing.
+    Previous → if current position > 3 s → seek(0) else skip_previous → start_entry. JumpTo → start_entry.
+    Append/PlayNext/Move/SetShuffle/SetRepeat → mutate, emit_queue, sync_preload. Remove(id) → if it was current:
+    start_entry(new current) or stop+Idle; emit_queue; sync_preload.
+    Seek with non-empty `boundaries` (the decode thread has already moved on to the next track) → start_entry(
+    current entry, want_play, Some(to)) instead of seeking in place. Otherwise unchanged; on seek set offset_samples = 0.
+    Tests (FileOpener + test config with preload_lead 10 s so preloading starts immediately):
+    1. gapless bit-exactness: a test-only `CaptureSink` (OutputSink; its thread drains ALL available samples with
+       read_chunk(slots) every 1 ms while playing, appends them to Arc<Mutex<Vec<i32>>>, adds samples_played, never
+       zero-fills; output_kind I32). Queue [tone_24_96.flac, tone_24_96.wav] → captured == full decode of the
+       flac (i32) followed by full decode of the wav, exactly; events: exactly one Buffering→Playing before the
+       first TrackEnded, and no StateChanged(Buffering)/Loading between first TrackEnded and second TrackChanged.
+    2. format change: [tone_24_96.flac, tone_16_44.flac] → both TrackEnded, second TrackLoaded reports 44100 Hz.
+    3. repeat One on a single track → at least 2 TrackChanged with the same entry id within 3 s; then stop().
+    4. next()/previous()/jump_to change TrackChanged ids as the queue dictates; QueueChanged reflects shuffle/repeat.
+    5. remove the upcoming entry after handoff (preload HandedOff) → the removed track never gets TrackChanged.
+    6. all Phase 4 tests still pass (load() now goes through set_queue).
+- [x] **5.4** Opus review + commit.
 
 ## Phase 6 — `sonorus-library`
 - [ ] 6.1 schema + migrations (rusqlite bundled): tracks, albums, artists, covers, scan_state.
