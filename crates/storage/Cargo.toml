@@ -1,0 +1,17 @@
+[package]
+name = "sonorus-storage"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+aws-sdk-s3 = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+fastrand = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }
+tokio = { workspace = true }

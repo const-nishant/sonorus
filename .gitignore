@@ -1,0 +1,13 @@
+/target/
+target/
+.env
+.env.*
+local.properties
+*.so
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+*.keystore
+*.jks
+.DS_Store
