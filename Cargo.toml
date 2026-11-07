@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/storage", "crates/engine", "crates/library"]
+members = [
+    "crates/storage",
+    "crates/engine",
+    "crates/library",
+    "crates/core",
+    "crates/uniffi-bindgen",
+]
 
 [workspace.package]
 edition = "2024"
@@ -24,3 +30,11 @@ lofty = "0.25"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uniffi = "0.32"
+sonorus-engine = { path = "crates/engine" }
+sonorus-library = { path = "crates/library" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

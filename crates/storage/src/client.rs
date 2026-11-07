@@ -96,7 +96,8 @@ impl Storage {
             None,
             "sonorus-env",
         );
-        let s3_config = aws_sdk_s3::Config::builder()
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+        let mut s3_builder = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
             .endpoint_url(endpoint)
@@ -109,8 +110,14 @@ impl Storage {
                     .connect_timeout(Duration::from_secs(10))
                     .read_timeout(Duration::from_secs(30))
                     .build(),
-            )
-            .build();
+            );
+        #[cfg(target_os = "android")]
+        {
+            if let Some(http_client) = crate::tls::android_http_client() {
+                s3_builder = s3_builder.http_client(http_client);
+            }
+        }
+        let s3_config = s3_builder.build();
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(s3_config),
             bucket: config.bucket.clone(),

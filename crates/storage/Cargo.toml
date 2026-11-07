@@ -11,7 +11,13 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 fastrand = { workspace = true }
 log = { workspace = true }
+# Already in the tree via aws-sdk-s3; used to pre-validate Android CA certificates.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-pki-types = "1"
 
 [dev-dependencies]
 dotenvy = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+aws-smithy-http-client = { version = "1.5.2", features = ["rustls-aws-lc"] }

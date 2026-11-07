@@ -1014,10 +1014,32 @@ history/sync. Tracks are resolved from keys through `TRACK_SELECT` (query.rs; ma
   "strictly newer", otherwise two devices with equal timestamps never converge (test
   `equal_timestamps_converge_across_devices`). sync validates BOTH remote docs before applying anything.
 
-## Phase 8 — `sonorus-core` (UniFFI, cdylib `libsonorus_core.so`)
-- [ ] 8.1 UniFFI proc-macro setup, `SonorusCore` object, records/enums mirroring engine/library types.
-- [ ] 8.2 async event stream (callback interface `EventListener` or async `next_event()`).
-- [ ] 8.3 `init_android_context(context)` + `android_logger` init (JNA/`JNI_OnLoad` gotcha).
+## Phase 8 — `sonorus-core` (UniFFI 0.32, cdylib `libsonorus_core.so`)
+
+Opus did: crate `crates/core` (lib name `sonorus_core`, crate-type cdylib + lib; deps uniffi 0.32, storage, engine,
+library, tokio, thiserror, log; android_logger 0.15 on Android), `crates/uniffi-bindgen` (bin, uniffi `cli`),
+`crates/core/uniffi.toml` (Kotlin package `dev.constnishant.sonorus.core`), `scripts/gen-kotlin.sh`, lib.rs
+(`setup_scaffolding!`, `init_logging()`, `core_version()`). Verified: proc-macro records/objects/errors and
+`#[uniffi::export(foreign)]` traits (`Arc<dyn Trait>`) generate Kotlin in library mode; the full library stack
+(aws-lc-sys, bundled SQLite) cross-compiles for `aarch64-linux-android` with NDK r28 (clang 34 linker).
+Findings: (1) **no ndk-context/JNI needed** — AAudio, logcat and TLS below need no JavaVM, so the JNA/`JNI_OnLoad`
+gotcha does not apply. (2) **Android TLS blocker**: rustls-native-certs finds no roots on Android (only a Termux path),
+so every HTTPS call would fail → 8.3. API rule: all exported methods are blocking (call from `Dispatchers.IO`); ids are
+library i64 ids (engine `TrackRef.id` = id as string); times are ms (u64). Credentials come from Kotlin
+(Keystore-backed settings in Phase 15), never logged (`S3Settings` Debug redacts).
+
+- [x] **8.1 `error.rs` + `types.rs`** — `CoreError` (uniffi::Error) + conversions; all records/enums + converters.
+- [x] **8.2 `core.rs` + `events.rs`** — `SonorusCore` object, `EventListener` foreign trait, event pump with
+  play-time accounting (record_play when listened ≥ min(30 s, duration/2); position deltas > 2 s ignored as seeks).
+- [x] **8.3 storage: Android trust store** — on `target_os = "android"` build the SDK HTTP client
+  (aws-smithy-http-client, rustls + aws-lc) with `TrustStore::empty()` + the PEM blocks of every file in
+  `/apex/com.android.conscrypt/cacerts` (Android 14+) or else `/system/etc/security/cacerts`.
+- [x] **8.4** Opus review: host tests (local-dir backend: scan fixtures, query, play with NullSink, events,
+  history), Kotlin generation, `aarch64-linux-android` build of sonorus-core; commit. Review fixes: Android CA certs
+  are pre-validated with rustls (`tls::is_valid_root`) because the SDK `.expect()`s on bad PEMs at connector build;
+  PlayTracker starts a new entry at position 0 (time before the first Position report counted). Release profile:
+  thin LTO, 1 CGU, stripped → arm64 `libsonorus_core.so` 15 MB (needs only liblog/libdl/libm/libc).
+  NOTE: until Phase 10 the core plays into `NullSink` (silent, real-time paced).
 
 ## Phase 9 — Android project
 - [ ] 9.1 Gradle (Kotlin DSL, version catalog), app id `dev.constnishant.sonorus`, minSdk 34, cargo-ndk task

@@ -3,6 +3,7 @@
 mod client;
 mod config;
 mod error;
+mod tls;
 mod upload;
 
 pub use client::{

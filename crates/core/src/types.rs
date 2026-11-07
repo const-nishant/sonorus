@@ -1,0 +1,1159 @@
+//! Records and enums exported to Kotlin, plus the conversions from the library, engine and
+//! storage types. Exported types never use `usize`, sets, paths or `Duration`: times are
+//! milliseconds (`u64`), paths are `String`s, and ids are the library's `i64` ids.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::time::Duration;
+
+use sonorus_engine::decoder::StreamInfo;
+use sonorus_engine::player::{PlayerEvent, PlayerState};
+use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
+use sonorus_library::{
+    Album, AlbumSort as LibraryAlbumSort, Artist, Library, LibraryStats, Playlist, PlaylistEntry,
+    ScanProgress, ScanReport, SearchResults, SyncReport, Track,
+};
+use sonorus_storage::{StorageConfig, normalize_prefix, region_from_endpoint};
+
+use crate::error::CoreResult;
+
+/// Bucket connection settings, as entered by the user and stored in the Android Keystore.
+///
+/// `Debug` is implemented manually: the secret is printed as `"<redacted>"` and the access key
+/// id is cut to its first four characters, so the value can be logged safely.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct S3Settings {
+    /// Endpoint URL, `https://...` or `http://...`.
+    pub endpoint: String,
+    /// Signing region. Empty means "derive from the endpoint, else `auto`".
+    pub region: String,
+    /// Bucket name.
+    pub bucket: String,
+    /// Access key id.
+    pub access_key_id: String,
+    /// Secret access key. Never logged or shown.
+    pub secret_access_key: String,
+    /// Use path-style addressing (`endpoint/bucket/key`).
+    pub path_style: bool,
+    /// Key prefix the music lives under. Empty means the whole bucket.
+    pub prefix: String,
+}
+
+impl S3Settings {
+    /// Builds the storage client configuration. Strings are trimmed, the prefix is normalized
+    /// (`"/music/"` becomes `"music/"`), and an empty region is derived from the endpoint or
+    /// falls back to `auto`.
+    pub fn to_storage_config(&self) -> StorageConfig {
+        let endpoint = self.endpoint.trim().to_string();
+        let region = self.region.trim();
+        let region = if region.is_empty() {
+            region_from_endpoint(&endpoint).unwrap_or_else(|| "auto".to_string())
+        } else {
+            region.to_string()
+        };
+        StorageConfig {
+            endpoint,
+            region,
+            bucket: self.bucket.trim().to_string(),
+            access_key_id: self.access_key_id.trim().to_string(),
+            secret_access_key: self.secret_access_key.trim().to_string(),
+            path_style: self.path_style,
+            prefix: normalize_prefix(&self.prefix),
+        }
+    }
+}
+
+impl fmt::Debug for S3Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key_hint = if self.access_key_id.chars().count() >= 8 {
+            let head: String = self.access_key_id.chars().take(4).collect();
+            format!("{head}…")
+        } else {
+            "…".to_string()
+        };
+        f.debug_struct("S3Settings")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &key_hint)
+            .field("secret_access_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+/// Everything the core needs at construction time.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CoreConfig {
+    /// Directory for the catalogue database, cover files and local state. Must exist and be
+    /// writable.
+    pub data_dir: String,
+    /// Bucket settings. `None` means no bucket backend.
+    pub s3: Option<S3Settings>,
+    /// Development and testing backend: scan a local folder and play files from it. When set,
+    /// it takes precedence over `s3`.
+    pub local_music_dir: Option<String>,
+}
+
+/// Playback state as shown in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PlaybackState {
+    /// Nothing loaded.
+    Idle,
+    /// Opening the current track.
+    Loading,
+    /// Waiting for audio data.
+    Buffering,
+    /// Audio is playing.
+    Playing,
+    /// Paused with a track loaded.
+    Paused,
+}
+
+/// Repeat behaviour at the end of the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RepeatMode {
+    /// Stop at the end of the queue.
+    Off,
+    /// Start over when the queue ends.
+    All,
+    /// Repeat the current track.
+    One,
+}
+
+/// Sort order for album listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AlbumSort {
+    /// By album artist, then title.
+    Artist,
+    /// By album title.
+    Title,
+    /// By release year.
+    Year,
+    /// Most recently added first.
+    RecentlyAdded,
+}
+
+/// A catalogued track with its album and artist resolved, as shown in the UI.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TrackInfo {
+    /// Library track id.
+    pub id: i64,
+    /// Object key in the bucket (or relative path for the local backend).
+    pub key: String,
+    /// Track title.
+    pub title: String,
+    /// Track artist.
+    pub artist: String,
+    /// Album artist.
+    pub album_artist: String,
+    /// Album title.
+    pub album: String,
+    /// Library album id.
+    pub album_id: i64,
+    /// Library artist id.
+    pub artist_id: i64,
+    /// Track number on its disc.
+    pub track_no: Option<u32>,
+    /// Disc number.
+    pub disc_no: Option<u32>,
+    /// Release year.
+    pub year: Option<i32>,
+    /// Genre tag.
+    pub genre: Option<String>,
+    /// Duration in milliseconds, when known.
+    pub duration_ms: Option<u64>,
+    /// Sample rate in Hz, when known.
+    pub sample_rate: Option<u32>,
+    /// Bits per sample, when known.
+    pub bits_per_sample: Option<u8>,
+    /// Channel count, when known.
+    pub channels: Option<u8>,
+    /// Codec name, when known.
+    pub codec: Option<String>,
+    /// File size in bytes.
+    pub size: u64,
+    /// Absolute path of the cover image file, when there is one.
+    pub cover_path: Option<String>,
+    /// Whether the track has embedded lyrics.
+    pub has_lyrics: bool,
+    /// Whether the track is in the favorites.
+    pub is_favorite: bool,
+}
+
+/// An album as shown in listings.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AlbumInfo {
+    /// Library album id.
+    pub id: i64,
+    /// Album title.
+    pub title: String,
+    /// Album artist name.
+    pub artist: String,
+    /// Library artist id.
+    pub artist_id: i64,
+    /// Release year.
+    pub year: Option<i32>,
+    /// Number of catalogued tracks.
+    pub track_count: u32,
+    /// Sum of track durations in milliseconds.
+    pub duration_ms: u64,
+    /// Absolute path of the cover image file, when there is one.
+    pub cover_path: Option<String>,
+    /// When the album was first catalogued (Unix seconds).
+    pub added_at: i64,
+}
+
+/// An artist as shown in listings.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ArtistInfo {
+    /// Library artist id.
+    pub id: i64,
+    /// Artist name.
+    pub name: String,
+    /// Number of albums.
+    pub album_count: u32,
+    /// Number of tracks.
+    pub track_count: u32,
+}
+
+/// A user playlist.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PlaylistInfo {
+    /// Library playlist id.
+    pub id: i64,
+    /// Playlist name.
+    pub name: String,
+    /// Number of entries, including ones whose track is not catalogued.
+    pub track_count: u32,
+    /// Sum of durations of the catalogued entries, in milliseconds.
+    pub duration_ms: u64,
+    /// Absolute path of the cover of the first catalogued entry, when there is one.
+    pub cover_path: Option<String>,
+    /// Creation time (Unix milliseconds).
+    pub created_at: i64,
+    /// Last change time (Unix milliseconds).
+    pub updated_at: i64,
+}
+
+/// One slot of a playlist.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PlaylistEntryInfo {
+    /// Zero-based position in the playlist.
+    pub position: u32,
+    /// Object key of the track in this slot.
+    pub track_key: String,
+    /// The track, or `None` when the key is not (or no longer) catalogued.
+    pub track: Option<TrackInfo>,
+}
+
+/// Search results grouped by kind.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SearchResult {
+    /// Matching tracks.
+    pub tracks: Vec<TrackInfo>,
+    /// Matching albums.
+    pub albums: Vec<AlbumInfo>,
+    /// Matching artists.
+    pub artists: Vec<ArtistInfo>,
+}
+
+/// Library totals for the about or settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct LibraryStatsInfo {
+    /// Number of catalogued tracks.
+    pub tracks: u64,
+    /// Number of albums.
+    pub albums: u64,
+    /// Number of artists.
+    pub artists: u64,
+    /// Sum of track sizes in bytes.
+    pub total_bytes: u64,
+    /// Sum of track durations in milliseconds.
+    pub total_duration_ms: u64,
+}
+
+/// Description of the decoded stream of the track being played.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StreamInfoRecord {
+    /// Codec name, such as `FLAC` or `PCM`.
+    pub codec: String,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Channel count.
+    pub channels: u16,
+    /// Bits per sample, when the container states it.
+    pub bits_per_sample: Option<u32>,
+    /// Duration in milliseconds, when known.
+    pub duration_ms: Option<u64>,
+    /// Human-readable summary, such as `FLAC 24/96`.
+    pub label: String,
+}
+
+/// One entry of the play queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct QueueItem {
+    /// Queue entry id. Unique within the queue, so the same track can appear twice.
+    pub entry_id: u64,
+    /// Library track id.
+    pub track_id: i64,
+}
+
+/// Counters of a bucket or folder scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ScanProgressInfo {
+    /// Tracks to add or update in this scan.
+    pub total: u32,
+    /// Tracks finished so far.
+    pub done: u32,
+    /// Tracks newly catalogued.
+    pub added: u32,
+    /// Existing tracks re-read because they changed.
+    pub updated: u32,
+    /// Catalogue tracks whose object disappeared.
+    pub removed: u32,
+    /// Tracks that could not be read or stored.
+    pub failed: u32,
+}
+
+/// One object that could not be catalogued.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ScanFailureInfo {
+    /// Object key of the failed track.
+    pub key: String,
+    /// Why it failed.
+    pub error: String,
+}
+
+/// Outcome of a completed scan.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ScanSummary {
+    /// Final counters.
+    pub progress: ScanProgressInfo,
+    /// Per-object failures, in completion order.
+    pub failures: Vec<ScanFailureInfo>,
+    /// Albums removed by the final prune.
+    pub pruned_albums: u64,
+    /// Artists removed by the final prune.
+    pub pruned_artists: u64,
+    /// Cover files removed by the final prune.
+    pub pruned_covers: u64,
+}
+
+/// Outcome of a user-data sync (playlists and favorites).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SyncSummary {
+    /// Local playlists created or overwritten from the remote document.
+    pub playlists_applied: u32,
+    /// Local favorites created or overwritten from the remote document.
+    pub favorites_applied: u32,
+    /// Whether the playlists document was written to the bucket.
+    pub playlists_pushed: bool,
+    /// Whether the favorites document was written to the bucket.
+    pub favorites_pushed: bool,
+}
+
+/// Events pushed to the foreign `EventListener` by the core's event pump.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreEvent {
+    /// The playback state changed.
+    StateChanged {
+        /// The new state.
+        state: PlaybackState,
+    },
+    /// The current queue entry changed. `track` is `None` if the track is not catalogued.
+    TrackChanged {
+        /// Queue entry that is now current.
+        entry_id: u64,
+        /// The track, when it resolves in the catalogue.
+        track: Option<TrackInfo>,
+    },
+    /// A track's stream was opened and is ready to play.
+    TrackLoaded {
+        /// Library track id.
+        track_id: i64,
+        /// Format of the stream.
+        stream: StreamInfoRecord,
+    },
+    /// Playback position update, emitted a few times per second.
+    Position {
+        /// Library track id.
+        track_id: i64,
+        /// Position in milliseconds.
+        position_ms: u64,
+        /// Track duration in milliseconds, when known.
+        duration_ms: Option<u64>,
+    },
+    /// The track played to its end.
+    TrackEnded {
+        /// Library track id.
+        track_id: i64,
+    },
+    /// The queue changed, or the current entry changed.
+    QueueChanged {
+        /// Queue in play order.
+        items: Vec<QueueItem>,
+        /// Current entry id, if any.
+        current: Option<u64>,
+        /// Shuffle on or off.
+        shuffle: bool,
+        /// Repeat mode.
+        repeat: RepeatMode,
+    },
+    /// A transient failure stopped playback; the core is retrying.
+    Recovering {
+        /// Library track id.
+        track_id: i64,
+        /// Retry attempt number, starting at 1.
+        attempt: u32,
+        /// Position the retry resumes at, in milliseconds.
+        position_ms: u64,
+        /// Delay before the retry, in milliseconds.
+        retry_in_ms: u64,
+    },
+    /// Playback failed.
+    PlaybackError {
+        /// Library track id, when the failure is tied to a track.
+        track_id: Option<i64>,
+        /// What went wrong.
+        message: String,
+    },
+    /// Progress of a running scan.
+    ScanProgress {
+        /// Current counters.
+        progress: ScanProgressInfo,
+    },
+    /// A scan completed.
+    ScanFinished {
+        /// Final summary.
+        summary: ScanSummary,
+    },
+    /// A scan failed before completing.
+    ScanFailed {
+        /// What went wrong.
+        message: String,
+    },
+}
+
+impl From<PlayerState> for PlaybackState {
+    fn from(s: PlayerState) -> Self {
+        match s {
+            PlayerState::Idle => PlaybackState::Idle,
+            PlayerState::Loading => PlaybackState::Loading,
+            PlayerState::Buffering => PlaybackState::Buffering,
+            PlayerState::Playing => PlaybackState::Playing,
+            PlayerState::Paused => PlaybackState::Paused,
+        }
+    }
+}
+
+impl From<EngineRepeatMode> for RepeatMode {
+    fn from(m: EngineRepeatMode) -> Self {
+        match m {
+            EngineRepeatMode::Off => RepeatMode::Off,
+            EngineRepeatMode::All => RepeatMode::All,
+            EngineRepeatMode::One => RepeatMode::One,
+        }
+    }
+}
+
+impl From<RepeatMode> for EngineRepeatMode {
+    fn from(m: RepeatMode) -> Self {
+        match m {
+            RepeatMode::Off => EngineRepeatMode::Off,
+            RepeatMode::All => EngineRepeatMode::All,
+            RepeatMode::One => EngineRepeatMode::One,
+        }
+    }
+}
+
+impl From<AlbumSort> for LibraryAlbumSort {
+    fn from(s: AlbumSort) -> Self {
+        match s {
+            AlbumSort::Artist => LibraryAlbumSort::Artist,
+            AlbumSort::Title => LibraryAlbumSort::Title,
+            AlbumSort::Year => LibraryAlbumSort::Year,
+            AlbumSort::RecentlyAdded => LibraryAlbumSort::RecentlyAdded,
+        }
+    }
+}
+
+impl From<&StreamInfo> for StreamInfoRecord {
+    fn from(info: &StreamInfo) -> Self {
+        StreamInfoRecord {
+            codec: info.codec.clone(),
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            bits_per_sample: info.bits_per_sample,
+            duration_ms: info.duration.map(duration_ms),
+            label: info.label(),
+        }
+    }
+}
+
+impl From<ScanProgress> for ScanProgressInfo {
+    fn from(p: ScanProgress) -> Self {
+        ScanProgressInfo {
+            total: p.total,
+            done: p.done,
+            added: p.added,
+            updated: p.updated,
+            removed: p.removed,
+            failed: p.failed,
+        }
+    }
+}
+
+impl From<ScanReport> for ScanSummary {
+    fn from(r: ScanReport) -> Self {
+        ScanSummary {
+            progress: r.progress.into(),
+            failures: r
+                .failures
+                .into_iter()
+                .map(|f| ScanFailureInfo {
+                    key: f.key,
+                    error: f.error,
+                })
+                .collect(),
+            pruned_albums: r.prune.albums,
+            pruned_artists: r.prune.artists,
+            pruned_covers: r.prune.covers,
+        }
+    }
+}
+
+impl From<SyncReport> for SyncSummary {
+    fn from(r: SyncReport) -> Self {
+        SyncSummary {
+            playlists_applied: r.playlists_applied,
+            favorites_applied: r.favorites_applied,
+            playlists_pushed: r.playlists_pushed,
+            favorites_pushed: r.favorites_pushed,
+        }
+    }
+}
+
+impl From<LibraryStats> for LibraryStatsInfo {
+    fn from(s: LibraryStats) -> Self {
+        LibraryStatsInfo {
+            tracks: s.tracks,
+            albums: s.albums,
+            artists: s.artists,
+            total_bytes: s.total_bytes,
+            total_duration_ms: s.total_duration_ms,
+        }
+    }
+}
+
+impl From<Artist> for ArtistInfo {
+    fn from(a: Artist) -> Self {
+        ArtistInfo {
+            id: a.id,
+            name: a.name,
+            album_count: a.album_count,
+            track_count: a.track_count,
+        }
+    }
+}
+
+/// Saturating conversion of a duration to whole milliseconds.
+pub(crate) fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Parses a library track id from the engine's string form (`TrackRef.id`).
+pub(crate) fn parse_track_id(s: &str) -> Option<i64> {
+    s.parse::<i64>().ok()
+}
+
+/// Turns library rows into UI records. Covers are resolved to file paths and favorites are
+/// looked up once, when the converter is created; cover lookups are cached per converter.
+pub(crate) struct Converter<'a> {
+    lib: &'a Library,
+    favorites: HashSet<String>,
+    covers: RefCell<HashMap<i64, Option<String>>>,
+}
+
+impl<'a> Converter<'a> {
+    /// Creates a converter over `lib`, loading the current favorite keys.
+    pub(crate) fn new(lib: &'a Library) -> CoreResult<Self> {
+        Ok(Self {
+            lib,
+            favorites: lib.favorite_keys()?,
+            covers: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Absolute path of the cover with this id, or `None` for no cover. A lookup error is
+    /// logged and treated as no cover.
+    pub(crate) fn cover(&self, cover_id: Option<i64>) -> Option<String> {
+        let id = cover_id?;
+        if let Some(hit) = self.covers.borrow().get(&id) {
+            return hit.clone();
+        }
+        let path = match self.lib.cover_path(id) {
+            Ok(path) => path.map(|p| p.to_string_lossy().into_owned()),
+            Err(e) => {
+                log::warn!("cover {id} lookup failed: {e}");
+                None
+            }
+        };
+        self.covers.borrow_mut().insert(id, path.clone());
+        path
+    }
+
+    /// Converts one track.
+    pub(crate) fn track(&self, t: Track) -> TrackInfo {
+        TrackInfo {
+            is_favorite: self.favorites.contains(&t.key),
+            cover_path: self.cover(t.cover_id),
+            id: t.id,
+            key: t.key,
+            title: t.title,
+            artist: t.artist,
+            album_artist: t.album_artist,
+            album: t.album,
+            album_id: t.album_id,
+            artist_id: t.artist_id,
+            track_no: t.track_no,
+            disc_no: t.disc_no,
+            year: t.year,
+            genre: t.genre,
+            duration_ms: t.duration_ms,
+            sample_rate: t.sample_rate,
+            bits_per_sample: t.bits_per_sample,
+            channels: t.channels,
+            codec: t.codec,
+            size: t.size,
+            has_lyrics: t.has_lyrics,
+        }
+    }
+
+    /// Converts a list of tracks, keeping order.
+    pub(crate) fn tracks(&self, tracks: Vec<Track>) -> Vec<TrackInfo> {
+        tracks.into_iter().map(|t| self.track(t)).collect()
+    }
+
+    /// Converts one album.
+    pub(crate) fn album(&self, a: Album) -> AlbumInfo {
+        AlbumInfo {
+            cover_path: self.cover(a.cover_id),
+            id: a.id,
+            title: a.title,
+            artist: a.artist,
+            artist_id: a.artist_id,
+            year: a.year,
+            track_count: a.track_count,
+            duration_ms: a.duration_ms,
+            added_at: a.added_at,
+        }
+    }
+
+    /// Converts a list of albums, keeping order.
+    pub(crate) fn albums(&self, albums: Vec<Album>) -> Vec<AlbumInfo> {
+        albums.into_iter().map(|a| self.album(a)).collect()
+    }
+
+    /// Converts one playlist.
+    pub(crate) fn playlist(&self, p: Playlist) -> PlaylistInfo {
+        PlaylistInfo {
+            cover_path: self.cover(p.cover_id),
+            id: p.id,
+            name: p.name,
+            track_count: p.track_count,
+            duration_ms: p.duration_ms,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+        }
+    }
+
+    /// Converts one playlist slot.
+    pub(crate) fn entry(&self, e: PlaylistEntry) -> PlaylistEntryInfo {
+        PlaylistEntryInfo {
+            position: e.position,
+            track_key: e.track_key,
+            track: e.track.map(|t| self.track(t)),
+        }
+    }
+
+    /// Converts search results.
+    pub(crate) fn search(&self, r: SearchResults) -> SearchResult {
+        SearchResult {
+            tracks: self.tracks(r.tracks),
+            albums: self.albums(r.albums),
+            artists: r.artists.into_iter().map(ArtistInfo::from).collect(),
+        }
+    }
+}
+
+/// Resolves a track id to its UI record. `None` when the id is unknown.
+fn resolve_track(lib: &Library, conv: Option<&Converter<'_>>, id: i64) -> Option<TrackInfo> {
+    let track = lib.track(id).ok()?;
+    match conv {
+        Some(c) => Some(c.track(track)),
+        None => Converter::new(lib).ok().map(|c| c.track(track)),
+    }
+}
+
+/// Maps one engine event to the core event sent to the UI. Returns `None` for events that
+/// cannot be represented (an unparsable track id in an event that needs one).
+///
+/// `conv` is reused for track lookups when given; otherwise a temporary converter is built.
+pub(crate) fn player_event(
+    event: PlayerEvent,
+    conv: Option<&Converter<'_>>,
+    lib: &Library,
+) -> Option<CoreEvent> {
+    Some(match event {
+        PlayerEvent::StateChanged(state) => CoreEvent::StateChanged {
+            state: state.into(),
+        },
+        PlayerEvent::TrackLoaded { track_id, info } => CoreEvent::TrackLoaded {
+            track_id: parse_track_id(&track_id)?,
+            stream: StreamInfoRecord::from(&info),
+        },
+        PlayerEvent::Position {
+            track_id,
+            position,
+            duration,
+        } => CoreEvent::Position {
+            track_id: parse_track_id(&track_id)?,
+            position_ms: duration_ms(position),
+            duration_ms: duration.map(duration_ms),
+        },
+        PlayerEvent::TrackEnded { track_id } => CoreEvent::TrackEnded {
+            track_id: parse_track_id(&track_id)?,
+        },
+        PlayerEvent::Error { track_id, message } => CoreEvent::PlaybackError {
+            track_id: track_id.as_deref().and_then(parse_track_id),
+            message,
+        },
+        PlayerEvent::Recovering {
+            track_id,
+            attempt,
+            position,
+            retry_in,
+        } => CoreEvent::Recovering {
+            track_id: parse_track_id(&track_id)?,
+            attempt,
+            position_ms: duration_ms(position),
+            retry_in_ms: duration_ms(retry_in),
+        },
+        PlayerEvent::TrackChanged { entry_id, track_id } => CoreEvent::TrackChanged {
+            entry_id,
+            track: resolve_track(lib, conv, parse_track_id(&track_id)?),
+        },
+        PlayerEvent::QueueChanged {
+            entries,
+            current,
+            shuffle,
+            repeat,
+        } => CoreEvent::QueueChanged {
+            items: entries
+                .iter()
+                .filter_map(|e| {
+                    parse_track_id(&e.track.id).map(|track_id| QueueItem {
+                        entry_id: e.id,
+                        track_id,
+                    })
+                })
+                .collect(),
+            current,
+            shuffle,
+            repeat: repeat.into(),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sonorus_engine::opener::TrackRef;
+    use sonorus_engine::queue::QueueEntry;
+    use sonorus_library::{ObjectStamp, TrackMeta};
+
+    use super::*;
+
+    const SECRET: &str = "wJalrXUtnFEMI-SECRET-VALUE-9z";
+    const KEY_ID: &str = "AKIAEXAMPLEKEYID1234";
+
+    /// Removes a temporary directory when dropped, even if the test panics.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir()
+                .join(format!("sonorus-core-{tag}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn settings(endpoint: &str, region: &str, prefix: &str) -> S3Settings {
+        S3Settings {
+            endpoint: endpoint.to_string(),
+            region: region.to_string(),
+            bucket: " music ".to_string(),
+            access_key_id: KEY_ID.to_string(),
+            secret_access_key: SECRET.to_string(),
+            path_style: true,
+            prefix: prefix.to_string(),
+        }
+    }
+
+    #[test]
+    fn s3_debug_redacts_secret_and_truncates_key_id() {
+        let text = format!("{:?}", settings("https://s3.example.com", "auto", ""));
+        assert!(!text.contains(SECRET), "secret leaked: {text}");
+        assert!(!text.contains("EXAMPLEKEYID"), "key id leaked: {text}");
+        assert!(text.contains("AKIA…"), "missing key hint: {text}");
+        assert!(
+            text.contains("<redacted>"),
+            "missing redaction marker: {text}"
+        );
+
+        let mut short = settings("https://s3.example.com", "auto", "");
+        short.access_key_id = "AKIA".to_string();
+        let text = format!("{short:?}");
+        assert!(text.contains("access_key_id: \"…\""), "{text}");
+        assert!(!text.contains("AKIA"), "{text}");
+    }
+
+    #[test]
+    fn core_config_debug_does_not_leak_secret() {
+        let config = CoreConfig {
+            data_dir: "/data".to_string(),
+            s3: Some(settings("https://s3.example.com", "auto", "")),
+            local_music_dir: None,
+        };
+        assert!(!format!("{config:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn to_storage_config_trims_and_normalizes_prefix() {
+        let mut s = settings("  https://s3.us-west-004.backblazeb2.com/ ", "", "/music/");
+        s.access_key_id = " AKIAEXAMPLEKEYID1234 ".to_string();
+        s.secret_access_key = " SECRET ".to_string();
+        let cfg = s.to_storage_config();
+        assert_eq!(cfg.endpoint, "https://s3.us-west-004.backblazeb2.com/");
+        assert_eq!(cfg.region, "us-west-004");
+        assert_eq!(cfg.bucket, "music");
+        assert_eq!(cfg.access_key_id, "AKIAEXAMPLEKEYID1234");
+        assert_eq!(cfg.secret_access_key, "SECRET");
+        assert_eq!(cfg.prefix, "music/");
+        assert!(cfg.path_style);
+    }
+
+    #[test]
+    fn to_storage_config_region_fallback_and_explicit() {
+        let cfg = settings("https://example.r2.cloudflarestorage.com", "", "").to_storage_config();
+        assert_eq!(cfg.region, "auto");
+        assert_eq!(cfg.prefix, "");
+
+        let cfg = settings("https://s3.example.com", " eu-1 ", "").to_storage_config();
+        assert_eq!(cfg.region, "eu-1");
+    }
+
+    #[test]
+    fn repeat_mode_round_trips() {
+        for mode in [RepeatMode::Off, RepeatMode::All, RepeatMode::One] {
+            let engine: EngineRepeatMode = mode.into();
+            assert_eq!(RepeatMode::from(engine), mode);
+        }
+        assert_eq!(
+            EngineRepeatMode::from(RepeatMode::All),
+            EngineRepeatMode::All
+        );
+    }
+
+    #[test]
+    fn playback_state_and_album_sort_map() {
+        assert_eq!(
+            PlaybackState::from(PlayerState::Paused),
+            PlaybackState::Paused
+        );
+        assert_eq!(
+            LibraryAlbumSort::from(AlbumSort::RecentlyAdded),
+            LibraryAlbumSort::RecentlyAdded
+        );
+    }
+
+    #[test]
+    fn stream_info_record_from_engine() {
+        let info = StreamInfo {
+            codec: "FLAC".to_string(),
+            sample_rate: 96_000,
+            channels: 2,
+            bits_per_sample: Some(24),
+            duration: Some(Duration::from_millis(2_500)),
+            total_frames: None,
+        };
+        let rec = StreamInfoRecord::from(&info);
+        assert_eq!(rec.duration_ms, Some(2_500));
+        assert_eq!(rec.label, "FLAC 24/96");
+        assert_eq!(rec.channels, 2);
+    }
+
+    #[test]
+    fn duration_ms_saturates() {
+        assert_eq!(duration_ms(Duration::from_millis(1_234)), 1_234);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn parse_track_id_rejects_non_numbers() {
+        assert_eq!(parse_track_id("42"), Some(42));
+        assert_eq!(parse_track_id("abc"), None);
+        assert_eq!(parse_track_id(""), None);
+    }
+
+    #[test]
+    fn scan_report_converts() {
+        let report = ScanReport {
+            progress: ScanProgress {
+                total: 3,
+                done: 3,
+                added: 2,
+                updated: 0,
+                removed: 1,
+                failed: 1,
+            },
+            failures: vec![sonorus_library::ScanFailure {
+                key: "a.flac".to_string(),
+                error: "bad tags".to_string(),
+            }],
+            prune: sonorus_library::PruneStats {
+                albums: 1,
+                artists: 2,
+                covers: 3,
+            },
+        };
+        let summary = ScanSummary::from(report);
+        assert_eq!(summary.progress.failed, 1);
+        assert_eq!(summary.failures[0].error, "bad tags");
+        assert_eq!(
+            (
+                summary.pruned_albums,
+                summary.pruned_artists,
+                summary.pruned_covers
+            ),
+            (1, 2, 3)
+        );
+    }
+
+    /// An in-memory library with two tracks; the first is a favorite and has a cover.
+    struct Fixture {
+        _dir: TempDir,
+        lib: Library,
+        fav_id: i64,
+        plain_id: i64,
+    }
+
+    fn fixture(tag: &str) -> Fixture {
+        let dir = TempDir::new(tag);
+        let lib = Library::open_in_memory(&dir.path().join("covers")).expect("open library");
+        let cover_id = lib
+            .store_cover(b"\xff\xd8\xff fake jpeg", "image/jpeg")
+            .expect("store cover");
+        let meta = TrackMeta {
+            title: Some("Song".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some("Album".to_string()),
+            album_artist: Some("Artist".to_string()),
+            duration_ms: Some(180_000),
+            ..TrackMeta::default()
+        };
+        let stamp = |key: &str| ObjectStamp {
+            key: key.to_string(),
+            size: 100,
+            etag: None,
+            last_modified: None,
+        };
+        let fav_id = lib
+            .upsert_track(&stamp("Artist/Album/01 - Song.flac"), &meta, Some(cover_id))
+            .expect("upsert fav");
+        let plain_id = lib
+            .upsert_track(&stamp("Artist/Album/02 - Other.flac"), &meta, None)
+            .expect("upsert plain");
+        lib.set_favorite("Artist/Album/01 - Song.flac", true)
+            .expect("set favorite");
+        Fixture {
+            _dir: dir,
+            lib,
+            fav_id,
+            plain_id,
+        }
+    }
+
+    #[test]
+    fn converter_sets_favorite_and_cover() {
+        let f = fixture("conv");
+        let conv = Converter::new(&f.lib).expect("converter");
+
+        let fav = conv.track(f.lib.track(f.fav_id).expect("track"));
+        assert!(fav.is_favorite);
+        let cover = fav.cover_path.expect("cover path");
+        assert!(cover.ends_with(".jpg"), "{cover}");
+        assert!(Path::new(&cover).is_file());
+
+        let plain = conv.track(f.lib.track(f.plain_id).expect("track"));
+        assert!(!plain.is_favorite);
+        assert_eq!(plain.cover_path, None);
+    }
+
+    #[test]
+    fn converter_album_cover_resolves() {
+        let f = fixture("album");
+        let conv = Converter::new(&f.lib).expect("converter");
+        let track = f.lib.track(f.fav_id).expect("track");
+        let album = f.lib.album(track.album_id).expect("album");
+        let info = conv.album(album);
+        assert!(info.cover_path.is_some());
+        assert_eq!(info.track_count, 2);
+    }
+
+    #[test]
+    fn player_event_maps_positions_and_drops_bad_ids() {
+        let f = fixture("events");
+        let pos = player_event(
+            PlayerEvent::Position {
+                track_id: f.fav_id.to_string(),
+                position: Duration::from_millis(1_500),
+                duration: Some(Duration::from_secs(3)),
+            },
+            None,
+            &f.lib,
+        );
+        assert_eq!(
+            pos,
+            Some(CoreEvent::Position {
+                track_id: f.fav_id,
+                position_ms: 1_500,
+                duration_ms: Some(3_000),
+            })
+        );
+
+        let bad = player_event(
+            PlayerEvent::Position {
+                track_id: "not-a-number".to_string(),
+                position: Duration::ZERO,
+                duration: None,
+            },
+            None,
+            &f.lib,
+        );
+        assert_eq!(bad, None);
+
+        let ended = player_event(
+            PlayerEvent::TrackEnded {
+                track_id: "x".to_string(),
+            },
+            None,
+            &f.lib,
+        );
+        assert_eq!(ended, None);
+
+        let err = player_event(
+            PlayerEvent::Error {
+                track_id: Some("x".to_string()),
+                message: "boom".to_string(),
+            },
+            None,
+            &f.lib,
+        );
+        assert_eq!(
+            err,
+            Some(CoreEvent::PlaybackError {
+                track_id: None,
+                message: "boom".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn player_event_track_changed_resolves_track() {
+        let f = fixture("changed");
+        let conv = Converter::new(&f.lib).expect("converter");
+        let ev = |id: &str| PlayerEvent::TrackChanged {
+            entry_id: 7,
+            track_id: id.to_string(),
+        };
+
+        match player_event(ev(&f.fav_id.to_string()), Some(&conv), &f.lib) {
+            Some(CoreEvent::TrackChanged {
+                entry_id: 7,
+                track: Some(t),
+            }) => {
+                assert!(t.is_favorite);
+                assert_eq!(t.id, f.fav_id);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match player_event(ev(&f.plain_id.to_string()), None, &f.lib) {
+            Some(CoreEvent::TrackChanged { track: Some(t), .. }) => assert!(!t.is_favorite),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match player_event(ev("999999"), None, &f.lib) {
+            Some(CoreEvent::TrackChanged { track: None, .. }) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(player_event(ev("zz"), Some(&conv), &f.lib), None);
+    }
+
+    #[test]
+    fn player_event_queue_skips_unparsable_ids() {
+        let f = fixture("queue");
+        let entry = |id: u64, track_id: &str| QueueEntry {
+            id,
+            track: TrackRef {
+                id: track_id.to_string(),
+                key: String::new(),
+                size: 0,
+            },
+        };
+        let ev = PlayerEvent::QueueChanged {
+            entries: vec![entry(1, "3"), entry(2, "x"), entry(4, "5")],
+            current: Some(4),
+            shuffle: true,
+            repeat: EngineRepeatMode::All,
+        };
+        assert_eq!(
+            player_event(ev, None, &f.lib),
+            Some(CoreEvent::QueueChanged {
+                items: vec![
+                    QueueItem {
+                        entry_id: 1,
+                        track_id: 3
+                    },
+                    QueueItem {
+                        entry_id: 4,
+                        track_id: 5
+                    },
+                ],
+                current: Some(4),
+                shuffle: true,
+                repeat: RepeatMode::All,
+            })
+        );
+    }
+}
