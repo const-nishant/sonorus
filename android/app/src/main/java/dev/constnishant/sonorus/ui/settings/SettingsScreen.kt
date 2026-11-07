@@ -25,6 +25,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,9 +46,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.constnishant.sonorus.core.OutputInfo
+import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.ScanProgressInfo
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.repository
+import dev.constnishant.sonorus.ui.components.formatKhz
 
 /**
  * Settings: bucket connection, library scan and stats, playlist and favorite sync, and about
@@ -80,6 +86,7 @@ fun SettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             viewModel = viewModel,
         )
         LibrarySection(state = state, scan = scan, onScan = viewModel::startScan)
+        OutputSection(state = state, viewModel = viewModel)
         SyncSection(state = state, onSync = viewModel::syncUserData)
         AboutSection(version = state.version)
     }
@@ -272,6 +279,75 @@ private fun LibrarySection(state: SettingsUiState, scan: ScanUi, onScan: () -> U
 }
 
 @Composable
+private fun OutputSection(state: SettingsUiState, viewModel: SettingsViewModel) {
+    SectionTitle("Output")
+    val formats = listOf(
+        OutputSampleFormat.FLOAT to "Float",
+        OutputSampleFormat.INT32 to "32-bit",
+        OutputSampleFormat.INT24_PACKED to "24-bit",
+    )
+    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+        formats.forEachIndexed { index, (format, label) ->
+            SegmentedButton(
+                selected = state.output.sampleFormat == format,
+                onClick = { viewModel.setSampleFormat(format) },
+                shape = SegmentedButtonDefaults.itemShape(index = index, count = formats.size),
+            ) {
+                Text(label)
+            }
+        }
+    }
+    Text(
+        text = "Float follows the volume setting. 32-bit and 24-bit send the samples unchanged " +
+            "(bit-perfect) at full volume.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(text = "Exclusive mode", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "Asks Android for a direct, low-latency stream. The device may still share it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = state.output.exclusive,
+            onCheckedChange = viewModel::setExclusive,
+        )
+    }
+    Text(
+        text = "Changing these stops playback.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        text = state.outputInfo?.let(::outputLine) ?: "No active output stream",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** One line describing an open output stream, for the Output section. */
+private fun outputLine(info: OutputInfo): String {
+    val format = when (info.sampleFormat) {
+        OutputSampleFormat.FLOAT -> "Float"
+        OutputSampleFormat.INT32 -> "32-bit"
+        OutputSampleFormat.INT24_PACKED -> "24-bit"
+    }
+    val mode = if (info.exclusive) "Exclusive" else "Shared"
+    val lowLatency = if (info.lowLatency) ", low latency" else ""
+    return "${backendLabel(info.backend)} · ${formatKhz(info.sampleRate)} kHz · ${info.channels} ch · " +
+        "$format · $mode$lowLatency · device ${info.deviceId} · burst ${info.framesPerBurst} · " +
+        "buffer ${info.bufferFrames} · xruns ${info.xruns}"
+}
+
+@Composable
 private fun SyncSection(state: SettingsUiState, onSync: () -> Unit) {
     SectionTitle("Sync")
     Button(onClick = onSync, enabled = !state.syncing) {
@@ -295,7 +371,7 @@ private fun AboutSection(version: String) {
     SectionTitle("About")
     Text(text = "Sonorus $version", style = MaterialTheme.typography.bodyMedium)
     Text(
-        text = "Audio output: silent test output until Phase 10",
+        text = "Audio output: AAudio",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -315,4 +391,10 @@ private fun progressLine(p: ScanProgressInfo): String {
     ).filter { (count, _) -> count > 0u }.joinToString(", ") { (count, label) -> "$count $label" }
     val files = "${p.done} of ${p.total} files"
     return if (changes.isEmpty()) "$files · no changes" else "$files · $changes"
+}
+
+/** Display name for the core's output backend id ("aaudio" → "AAudio"). */
+private fun backendLabel(backend: String): String = when (backend) {
+    "aaudio" -> "AAudio"
+    else -> backend
 }

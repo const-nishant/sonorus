@@ -1,5 +1,6 @@
 //! Sonorus playback engine: streaming source, decoding, ring buffer, output, queue.
 
+pub mod aaudio;
 pub mod decoder;
 pub mod error;
 pub mod opener;

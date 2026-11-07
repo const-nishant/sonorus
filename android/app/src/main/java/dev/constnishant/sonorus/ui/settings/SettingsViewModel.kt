@@ -5,16 +5,21 @@ import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.BuildConfig
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.LibraryStatsInfo
+import dev.constnishant.sonorus.core.OutputInfo
+import dev.constnishant.sonorus.core.OutputSampleFormat
+import dev.constnishant.sonorus.core.OutputSettings
 import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.coreVersion
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -56,6 +61,10 @@ data class SettingsUiState(
     /** Result of the last sync, shown inline. */
     val syncMessage: String? = null,
     val syncFailed: Boolean = false,
+    /** Saved output settings: sample format and exclusive mode. */
+    val output: OutputSettings = OutputSettings(sampleFormat = OutputSampleFormat.FLOAT, exclusive = false),
+    /** The output stream the core has open, or null when nothing is open. Refreshed every second. */
+    val outputInfo: OutputInfo? = null,
     val version: String = "",
 )
 
@@ -118,6 +127,21 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                         ),
                     )
                 }
+            }
+        }
+        viewModelScope.launch {
+            val output = withContext(Dispatchers.IO) { repository.output.load() }
+            _state.update { it.copy(output = output) }
+        }
+        viewModelScope.launch {
+            while (isActive) {
+                val info = try {
+                    repository.outputInfo()
+                } catch (e: CoreException) {
+                    null
+                }
+                _state.update { it.copy(outputInfo = info) }
+                delay(1_000)
             }
         }
         viewModelScope.launch {
@@ -228,6 +252,33 @@ class SettingsViewModel(private val repository: SonorusRepository) : ViewModel()
                     bucketMessage = "Disconnected. The change takes effect after restart.",
                     bucketFailed = false,
                 )
+            }
+        }
+    }
+
+    /** Selects the sample format and applies it. Playback stops if the value changed. */
+    fun setSampleFormat(format: OutputSampleFormat) {
+        applyOutput(_state.value.output.copy(sampleFormat = format))
+    }
+
+    /** Turns exclusive mode on or off and applies it. Playback stops if the value changed. */
+    fun setExclusive(exclusive: Boolean) {
+        applyOutput(_state.value.output.copy(exclusive = exclusive))
+    }
+
+    /**
+     * Shows [settings] at once, then applies them in the core. If the core rejects them, the saved
+     * settings are shown again and the reason is shown as a message.
+     */
+    private fun applyOutput(settings: OutputSettings) {
+        _state.update { it.copy(output = settings) }
+        viewModelScope.launch {
+            try {
+                repository.setOutputSettings(settings)
+            } catch (e: CoreException) {
+                val saved = withContext(Dispatchers.IO) { repository.output.load() }
+                _state.update { it.copy(output = saved) }
+                repository.events.emitError(e.userMessage("Could not change the output settings."))
             }
         }
     }

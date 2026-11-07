@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+use sonorus_engine::aaudio::{AAudioConfig, Performance, Sharing, StreamInfo as AAudioStreamInfo};
 use sonorus_engine::decoder::StreamInfo;
+use sonorus_engine::output::SampleKind;
 use sonorus_engine::player::{PlayerEvent, PlayerState};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_library::{
@@ -435,6 +437,106 @@ pub enum CoreEvent {
         /// What went wrong.
         message: String,
     },
+}
+
+/// Sample format the output stream is opened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum OutputSampleFormat {
+    /// 32-bit float, volume applied.
+    #[default]
+    Float,
+    /// Left-justified 32-bit integers, bit-perfect.
+    Int32,
+    /// 24-bit packed integers, bit-perfect (for 24-bit DACs).
+    Int24Packed,
+}
+
+/// User output settings. They apply to the next player, see `SonorusCore::set_output_settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Record)]
+pub struct OutputSettings {
+    /// Sample format the output is opened with.
+    pub sample_format: OutputSampleFormat,
+    /// Request exclusive device access (lowest latency, may fall back to shared).
+    pub exclusive: bool,
+}
+
+/// The output stream as the device actually opened it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OutputInfo {
+    /// Output backend name, `"aaudio"`.
+    pub backend: String,
+    /// Negotiated sample rate in Hz.
+    pub sample_rate: u32,
+    /// Negotiated channel count.
+    pub channels: u32,
+    /// Negotiated sample format.
+    pub sample_format: OutputSampleFormat,
+    /// Whether the stream actually runs in exclusive sharing mode.
+    pub exclusive: bool,
+    /// Whether the stream actually runs in low-latency performance mode.
+    pub low_latency: bool,
+    /// Device the stream is attached to.
+    pub device_id: i32,
+    /// Frames per hardware burst.
+    pub frames_per_burst: u32,
+    /// Buffer size in frames.
+    pub buffer_frames: u32,
+    /// Underruns (xruns) reported by the stream so far.
+    pub xruns: i32,
+}
+
+impl OutputSettings {
+    /// The AAudio configuration for these settings. Performance is `PowerSaving`; the engine
+    /// forces low latency for exclusive streams. The device is the default one.
+    pub fn aaudio_config(&self) -> AAudioConfig {
+        AAudioConfig {
+            sharing: if self.exclusive {
+                Sharing::Exclusive
+            } else {
+                Sharing::Shared
+            },
+            performance: Performance::PowerSaving,
+            device_id: None,
+        }
+    }
+}
+
+impl From<OutputSampleFormat> for SampleKind {
+    fn from(f: OutputSampleFormat) -> Self {
+        match f {
+            OutputSampleFormat::Float => SampleKind::F32,
+            OutputSampleFormat::Int32 => SampleKind::I32,
+            OutputSampleFormat::Int24Packed => SampleKind::I24Packed,
+        }
+    }
+}
+
+impl From<SampleKind> for OutputSampleFormat {
+    fn from(k: SampleKind) -> Self {
+        match k {
+            SampleKind::F32 => OutputSampleFormat::Float,
+            SampleKind::I32 => OutputSampleFormat::Int32,
+            SampleKind::I24Packed => OutputSampleFormat::Int24Packed,
+        }
+    }
+}
+
+/// The exported view of a negotiated AAudio stream. `xruns` comes from the stream, not from
+/// `info`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn output_info_from(info: AAudioStreamInfo, xruns: i32) -> OutputInfo {
+    OutputInfo {
+        backend: "aaudio".to_owned(),
+        sample_rate: info.sample_rate,
+        channels: u32::from(info.channels),
+        sample_format: info.sample.into(),
+        exclusive: info.sharing == Sharing::Exclusive,
+        low_latency: info.performance == Performance::LowLatency,
+        device_id: info.device_id,
+        frames_per_burst: info.frames_per_burst,
+        buffer_frames: info.buffer_frames,
+        xruns,
+    }
 }
 
 impl From<PlayerState> for PlaybackState {
@@ -896,6 +998,96 @@ mod tests {
             LibraryAlbumSort::from(AlbumSort::RecentlyAdded),
             LibraryAlbumSort::RecentlyAdded
         );
+    }
+
+    #[test]
+    fn output_sample_format_round_trips() {
+        for (format, kind) in [
+            (OutputSampleFormat::Float, SampleKind::F32),
+            (OutputSampleFormat::Int32, SampleKind::I32),
+            (OutputSampleFormat::Int24Packed, SampleKind::I24Packed),
+        ] {
+            assert_eq!(SampleKind::from(format), kind);
+            assert_eq!(OutputSampleFormat::from(kind), format);
+        }
+        assert_eq!(OutputSampleFormat::default(), OutputSampleFormat::Float);
+    }
+
+    #[test]
+    fn output_settings_default_is_shared_float() {
+        let d = OutputSettings::default();
+        assert_eq!(d.sample_format, OutputSampleFormat::Float);
+        assert!(!d.exclusive);
+    }
+
+    #[test]
+    fn output_settings_aaudio_config_maps_sharing() {
+        let shared = OutputSettings {
+            sample_format: OutputSampleFormat::Int32,
+            exclusive: false,
+        }
+        .aaudio_config();
+        assert_eq!(shared, AAudioConfig::default());
+        assert_eq!(shared.sharing, Sharing::Shared);
+        assert_eq!(shared.performance, Performance::PowerSaving);
+        assert_eq!(shared.device_id, None);
+
+        let exclusive = OutputSettings {
+            sample_format: OutputSampleFormat::Float,
+            exclusive: true,
+        }
+        .aaudio_config();
+        assert_eq!(exclusive.sharing, Sharing::Exclusive);
+        assert_eq!(exclusive.performance, Performance::PowerSaving);
+        assert_eq!(exclusive.device_id, None);
+    }
+
+    #[test]
+    fn output_info_from_maps_every_field() {
+        let info = AAudioStreamInfo {
+            sample_rate: 96_000,
+            channels: 2,
+            sample: SampleKind::I24Packed,
+            sharing: Sharing::Exclusive,
+            performance: Performance::LowLatency,
+            device_id: 7,
+            frames_per_burst: 192,
+            buffer_frames: 768,
+        };
+        assert_eq!(
+            output_info_from(info, 3),
+            OutputInfo {
+                backend: "aaudio".to_owned(),
+                sample_rate: 96_000,
+                channels: 2,
+                sample_format: OutputSampleFormat::Int24Packed,
+                exclusive: true,
+                low_latency: true,
+                device_id: 7,
+                frames_per_burst: 192,
+                buffer_frames: 768,
+                xruns: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn output_info_from_reports_shared_and_power_saving() {
+        let info = AAudioStreamInfo {
+            sample_rate: 48_000,
+            channels: 2,
+            sample: SampleKind::F32,
+            sharing: Sharing::Shared,
+            performance: Performance::PowerSaving,
+            device_id: 0,
+            frames_per_burst: 240,
+            buffer_frames: 960,
+        };
+        let out = output_info_from(info, 0);
+        assert!(!out.exclusive);
+        assert!(!out.low_latency);
+        assert_eq!(out.sample_format, OutputSampleFormat::Float);
+        assert_eq!(out.xruns, 0);
     }
 
     #[test]

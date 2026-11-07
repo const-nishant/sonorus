@@ -142,6 +142,14 @@ class CoreEvents : EventListener {
         _scan.update { it.copy(running = false, error = message) }
     }
 
+    /**
+     * Resets playback state to its initial value. Used when the core drops its player without
+     * sending an event, for example when the output settings change.
+     */
+    internal fun resetPlayback() {
+        _playback.value = PlaybackUi()
+    }
+
     /** Publishes an error message to [errors]. */
     internal fun emitError(message: String) {
         _errors.tryEmit(message)

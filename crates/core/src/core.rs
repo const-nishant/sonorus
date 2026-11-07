@@ -17,8 +17,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "android")]
+use sonorus_engine::aaudio::{AAudioHandle, AAudioSink};
 use sonorus_engine::opener::{FileOpener, StorageOpener, TrackOpener, TrackRef};
-use sonorus_engine::output::{NullSink, OutputSink};
+#[cfg(not(target_os = "android"))]
+use sonorus_engine::output::NullSink;
+use sonorus_engine::output::OutputSink;
 use sonorus_engine::player::{Player, PlayerConfig};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_engine::source::SourceConfig;
@@ -31,10 +35,12 @@ use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventListener, ListenerSlot, spawn_pump};
+#[cfg(target_os = "android")]
+use crate::types::output_info_from;
 use crate::types::{
     AlbumInfo, AlbumSort, ArtistInfo, Converter, CoreConfig, CoreEvent, LibraryStatsInfo,
-    PlaylistEntryInfo, PlaylistInfo, RepeatMode, S3Settings, ScanProgressInfo, ScanSummary,
-    SearchResult, SyncSummary, TrackInfo,
+    OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, RepeatMode, S3Settings,
+    ScanProgressInfo, ScanSummary, SearchResult, SyncSummary, TrackInfo,
 };
 
 /// Concurrent tag reads during a scan.
@@ -68,6 +74,9 @@ struct PlayerSlot {
     player: Player,
     /// Joins the event thread when the slot is dropped; never read directly.
     _pump: PumpHandle,
+    /// Reads the AAudio stream state for `output_info`. Dropped after `player` and `_pump`.
+    #[cfg(target_os = "android")]
+    aaudio: AAudioHandle,
 }
 
 /// Joins the event thread when dropped. Declared after `player` in [`PlayerSlot`].
@@ -102,6 +111,8 @@ pub struct SonorusCore {
     player: Mutex<Option<PlayerSlot>>,
     listener: ListenerSlot,
     scanning: AtomicBool,
+    /// Output settings applied to the next player.
+    output: Mutex<OutputSettings>,
     /// Option only so that `Drop` can shut it down. Always `Some` while the core is alive.
     rt: Option<Runtime>,
 }
@@ -131,6 +142,7 @@ impl SonorusCore {
             player: Mutex::new(None),
             listener: ListenerSlot::default(),
             scanning: AtomicBool::new(false),
+            output: Mutex::new(OutputSettings::default()),
             rt: Some(rt),
         }))
     }
@@ -525,6 +537,32 @@ impl SonorusCore {
     pub fn set_volume(&self, volume: f32) {
         self.with_player(|p| p.set_volume(volume));
     }
+
+    /// Sets the output format and exclusive mode. Stops playback and clears the queue when the
+    /// settings change; the next play uses them.
+    pub fn set_output_settings(&self, settings: OutputSettings) {
+        let changed = {
+            let mut current = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+            let changed = *current != settings;
+            *current = settings;
+            changed
+        };
+        log::info!("output settings: {settings:?}");
+        if changed {
+            self.stop_player();
+        }
+    }
+
+    /// The output settings the next player is built with.
+    pub fn output_settings(&self) -> OutputSettings {
+        *self.output.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The output stream as the device actually opened it. `None` when there is no player, no
+    /// open stream, or when not running on Android.
+    pub fn output_info(&self) -> Option<OutputInfo> {
+        self.aaudio_output_info()
+    }
 }
 
 impl SonorusCore {
@@ -548,6 +586,21 @@ impl SonorusCore {
     fn set_backend(&self, backend: Option<Backend>) {
         *self.backend.write().unwrap_or_else(PoisonError::into_inner) = backend;
         self.stop_player();
+    }
+
+    /// The AAudio stream state of the current player (Android only).
+    #[cfg(target_os = "android")]
+    fn aaudio_output_info(&self) -> Option<OutputInfo> {
+        let guard = self.lock_player();
+        let slot = guard.as_ref()?;
+        let info = slot.aaudio.stream_info()?;
+        Some(output_info_from(info, slot.aaudio.xruns().unwrap_or(0)))
+    }
+
+    /// Other platforms have no AAudio stream.
+    #[cfg(not(target_os = "android"))]
+    fn aaudio_output_info(&self) -> Option<OutputInfo> {
+        None
     }
 
     fn runtime(&self) -> CoreResult<&Runtime> {
@@ -598,7 +651,14 @@ impl SonorusCore {
             )),
             Backend::Local { root } => Arc::new(FileOpener::new(root)),
         };
-        let (player, events) = Player::new(make_sink(), opener, PlayerConfig::default());
+        let settings = self.output_settings();
+        let config = PlayerConfig {
+            output_kind: settings.sample_format.into(),
+            ..PlayerConfig::default()
+        };
+        #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+        let (sink, handle) = make_sink(settings)?;
+        let (player, events) = Player::new(sink, opener, config);
         let pump =
             spawn_pump(events, Arc::clone(&self.library), self.listener.clone()).map_err(|e| {
                 CoreError::Internal {
@@ -608,6 +668,8 @@ impl SonorusCore {
         Ok(PlayerSlot {
             player,
             _pump: PumpHandle(Some(pump)),
+            #[cfg(target_os = "android")]
+            aaudio: handle,
         })
     }
 
@@ -692,9 +754,28 @@ fn backend_from_config(config: &CoreConfig) -> CoreResult<Option<Backend>> {
     }
 }
 
-/// Output sink for the player. Phase 10 replaces this with the AAudio sink on Android.
-fn make_sink() -> Box<dyn OutputSink> {
-    Box::new(NullSink::new())
+/// The handle type that reads the output state: the AAudio handle on Android, nothing elsewhere.
+#[cfg(target_os = "android")]
+type SinkHandle = AAudioHandle;
+#[cfg(not(target_os = "android"))]
+type SinkHandle = ();
+
+/// Output sink for the player, opened with `settings`, and the handle that reads its state.
+/// Android opens the AAudio sink; other platforms use a `NullSink`.
+fn make_sink(settings: OutputSettings) -> CoreResult<(Box<dyn OutputSink>, SinkHandle)> {
+    #[cfg(target_os = "android")]
+    {
+        let sink = AAudioSink::new(settings.aaudio_config()).map_err(|e| CoreError::Internal {
+            detail: format!("audio output: {e}"),
+        })?;
+        let handle = sink.handle();
+        Ok((Box::new(sink), handle))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = settings;
+        Ok((Box::new(NullSink::new()), ()))
+    }
 }
 
 /// The queue entry for a library track.

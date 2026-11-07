@@ -175,6 +175,55 @@ pub fn render_i32(
     frames
 }
 
+/// Callback renderer for 24-bit packed outputs. `out` holds little-endian packed samples, 3 bytes
+/// each; `out.len() / 3` is the sample capacity. Same contract as [`render_i32`] otherwise:
+/// samples are bit-perfect (no volume), the top three bytes of each left-justified `i32` are
+/// written, and the rest of `out` (including partial sample bytes) is zero-filled.
+#[deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+pub fn render_i24_packed(
+    consumer: &mut rtrb::Consumer<i32>,
+    out: &mut [u8],
+    channels: usize,
+    stats: &RingStats,
+) -> usize {
+    if channels == 0 {
+        out.iter_mut().for_each(|x| *x = 0);
+        return 0;
+    }
+    let sample_capacity = out.len() / 3;
+    let frames_wanted = sample_capacity / channels;
+    let frames_avail = consumer.slots() / channels;
+    let n = frames_wanted.min(frames_avail);
+
+    let mut frames = 0;
+    if n > 0
+        && let Ok(chunk) = consumer.read_chunk(n.saturating_mul(channels))
+    {
+        let (a, b) = chunk.as_slices();
+        let (dst_samples, _) = out.as_chunks_mut::<3>();
+        for (dst, &s) in dst_samples.iter_mut().zip(a.iter().chain(b.iter())) {
+            let [_, b1, b2, b3] = s.to_le_bytes();
+            *dst = [b1, b2, b3];
+        }
+        chunk.commit_all();
+        frames = n;
+    }
+
+    let written = frames.saturating_mul(channels).saturating_mul(3);
+    if let Some(tail) = out.get_mut(written..) {
+        tail.iter_mut().for_each(|x| *x = 0);
+    }
+    if frames > 0 {
+        stats
+            .samples_played
+            .fetch_add((frames * channels) as u64, Ordering::Release);
+    }
+    if frames < frames_wanted && !stats.decoder_done.load(Ordering::Acquire) {
+        stats.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+    frames
+}
+
 /// Decode-thread helper: writes as much of `samples` as fits, returns samples written (may be 0).
 ///
 /// Writes only whole frames: `n = min(samples.len(), producer.slots())` rounded down to a
@@ -264,6 +313,67 @@ mod tests {
         let mut out = [0i32; 6];
         assert_eq!(render_i32(&mut c, &mut out, CH, &stats), 6);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn i24_packed_writes_top_three_bytes_little_endian() {
+        let stats = RingStats::new();
+        stats.set_volume(0.1); // must be ignored on the integer path
+        let (mut p, mut c) = ring(16);
+        let src = [0x1234_5600, i32::MIN, -256];
+        assert_eq!(push_frames(&mut p, &src, CH, &stats), 3);
+        let mut out = [0u8; 9];
+        assert_eq!(render_i24_packed(&mut c, &mut out, CH, &stats), 3);
+        assert_eq!(
+            out,
+            [
+                0x56, 0x34, 0x12, // 0x12345600
+                0x00, 0x00, 0x80, // i32::MIN
+                0xFF, 0xFF, 0xFF, // -256
+            ]
+        );
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.samples_played.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn i24_packed_short_counts_underrun_unless_done() {
+        let stats = RingStats::new();
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[0x0A0B_0C00], CH, &stats);
+        let mut out = [0x77u8; 6];
+        assert_eq!(render_i24_packed(&mut c, &mut out, CH, &stats), 1);
+        assert_eq!(out, [0x0C, 0x0B, 0x0A, 0, 0, 0]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
+
+        // Decoder finished: the same kind of shortfall is not an underrun.
+        stats.decoder_done.store(true, Ordering::Release);
+        let mut out2 = [0x77u8; 6];
+        assert_eq!(render_i24_packed(&mut c, &mut out2, CH, &stats), 0);
+        assert_eq!(out2, [0u8; 6]);
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn i24_packed_zero_fills_partial_trailing_bytes() {
+        let stats = RingStats::new();
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[0x0102_0300, 0x0405_0600], CH, &stats);
+        // 7 bytes = 2 whole samples plus 1 partial sample byte.
+        let mut out = [0xEEu8; 7];
+        assert_eq!(render_i24_packed(&mut c, &mut out, CH, &stats), 2);
+        assert_eq!(out, [0x03, 0x02, 0x01, 0x06, 0x05, 0x04, 0x00]);
+    }
+
+    #[test]
+    fn i24_packed_channels_zero_is_safe() {
+        let stats = RingStats::new();
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[1, 2], CH, &stats);
+        let mut out = [0xAAu8; 6];
+        assert_eq!(render_i24_packed(&mut c, &mut out, 0, &stats), 0);
+        assert_eq!(out, [0u8; 6]);
+        assert_eq!(stats.samples_played.load(Ordering::Relaxed), 0);
     }
 
     #[test]

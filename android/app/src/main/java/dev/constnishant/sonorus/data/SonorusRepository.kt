@@ -3,6 +3,8 @@ package dev.constnishant.sonorus.data
 import android.content.Context
 import dev.constnishant.sonorus.core.CoreConfig
 import dev.constnishant.sonorus.core.CoreException
+import dev.constnishant.sonorus.core.OutputInfo
+import dev.constnishant.sonorus.core.OutputSettings
 import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.SonorusCore
 import dev.constnishant.sonorus.core.SyncSummary
@@ -29,6 +31,9 @@ class SonorusRepository(private val app: Context) {
     /** Persisted bucket settings (credentials encrypted with the Keystore). */
     val settings = BucketSettingsStore(app)
 
+    /** Persisted output settings (sample format and exclusive mode). */
+    val output = OutputSettingsStore(app)
+
     /** UI state built from core events. */
     val events = CoreEvents()
 
@@ -52,6 +57,7 @@ class SonorusRepository(private val app: Context) {
             ),
         ).also {
             it.setListener(events)
+            it.setOutputSettings(output.load())
             _configured.value = it.isConfigured()
         }
     }
@@ -124,6 +130,22 @@ class SonorusRepository(private val app: Context) {
         notifyLibraryChanged()
         return summary
     }
+
+    /**
+     * Applies output settings in the core and persists them. Does nothing when they equal the saved
+     * settings. Changing them makes the core stop playback and clear the queue, so the playback
+     * state is reset here too. Throws a [CoreException] when the core rejects the change; nothing
+     * is saved in that case.
+     */
+    suspend fun setOutputSettings(settings: OutputSettings) {
+        if (settings == withContext(Dispatchers.IO) { output.load() }) return
+        call { it.setOutputSettings(settings) }
+        withContext(Dispatchers.IO) { output.save(settings) }
+        events.resetPlayback()
+    }
+
+    /** The output stream the core has open, or null when nothing is open. */
+    suspend fun outputInfo(): OutputInfo? = call { it.outputInfo() }
 
     /**
      * Tells observers that the catalogue changed. Call this after playlist or favorite edits.

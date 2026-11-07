@@ -1072,9 +1072,32 @@ NOTE: audio is silent until Phase 10 (NullSink).
   empty in release; the debug APK then holds the secret, so it is not for sharing); `data_extraction_rules.xml`
   excludes everything from backup/transfer; Home shelves snap back to the newest item; readable scan summary.
 
-## Phase 10 — AAudio output (ndk crate)
-- [ ] 10.1 `AAudioSink: OutputSink` float + I24_PACKED/I32 formats, device id selection, exclusive/shared.
-- [ ] 10.2 data callback: consume from rtrb only (no locks/alloc), underrun counter; error callback → reopen on device change.
+## Phase 10 — AAudio output (ndk-sys)
+
+Opus decided: raw `ndk-sys` 0.6 FFI with our own small wrapper instead of the `ndk` crate (its `AudioStream` Drop
+unwraps the close status, and its `AudioFormat` has no PCM_I32 / PCM_I24_PACKED). Module `sonorus_engine::aaudio`:
+`mod.rs` (host-testable config/info/negotiation helpers), `stream.rs` + `sink.rs` (`cfg(target_os = "android")`).
+The ring consumer lives in a boxed `CallbackState` passed as the data-callback user data and is reclaimed after
+`AAudioStream_close` (AAudio guarantees no callback after close), so the sink can reopen without losing it. Seeks
+reopen the stream (player calls stop + start); measure on device before optimizing.
+
+- [x] 10.1 `SampleKind::I24Packed` + `render_i24_packed`; `AAudioSink: OutputSink` (float / I32 / I24_PACKED,
+  usage MEDIA + content MUSIC, shared+power-saving by default, exclusive forces low-latency, optional device id,
+  negotiated format checked after open) and `AAudioHandle` (stream info, config, xruns).
+- [x] 10.2 data callback renders from rtrb only (no locks/alloc/logging); underruns via `RingStats`; error callback
+  only `try_send`s to the "sonorus-aaudio" supervisor thread, which closes and reopens (5 tries, 100 ms → 1.6 s
+  backoff) and resumes if it was playing; a failed reopen parks the state and `play()` retries.
+- [x] 10.3 core: AAudio sink on Android (NullSink elsewhere); `set_output_settings` / `output_settings` /
+  `output_info`; Kotlin Settings "Output" section (sample format, exclusive, live stream info), persisted.
+- [x] 10.4 Opus review + on-device test + commit. Review fix: a failed `AAudioStream_close` now leaks the callback
+  boxes instead of freeing them (a callback might still run). Device (vivo V2338, speaker, device 3): 24/96 FLAC
+  opens 96000 Hz F32 Shared/PowerSaving, burst 3844, buffer 7688 (mixer resamples to 48 kHz); position tracks wall
+  time; seek = close + reopen in ~16 ms, 0 xruns; pause/resume → AudioPlaybackConfiguration paused/started; track
+  change 96 k → 44.1 k reopens in ~28 ms; I32 and I24_PACKED open as requested; Exclusive is granted as Shared
+  (no MMAP for 44.1 k / I24 on this phone) — Phase 11 territory. Also: Settings shows "AAudio"; re-selecting a
+  bottom tab returns to its top screen and the tab stays highlighted on detail screens.
+  Open: AudioPlaybackConfiguration lists content type UNKNOWN although MUSIC is set (cosmetic); the reopen after a
+  route change (headphones/USB unplug) is not yet exercised on a device.
 
 ## Phase 11 — Bit-perfect
 - [ ] 11.1 Kotlin `UsbAudioRouter`: find USB DAC `AudioDeviceInfo`, `getSupportedMixerAttributes`,

@@ -11,7 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sonorus_core::types::{
-    AlbumInfo, AlbumSort, CoreConfig, CoreEvent, PlaybackState, S3Settings, TrackInfo,
+    AlbumInfo, AlbumSort, CoreConfig, CoreEvent, OutputSampleFormat, OutputSettings, PlaybackState,
+    S3Settings, TrackInfo,
 };
 use sonorus_core::{CoreError, EventListener, SonorusCore};
 
@@ -487,4 +488,62 @@ fn long_play_is_recorded_in_history() {
 
     core.clear_history().expect("clear history");
     assert!(core.recently_played(10).expect("history").is_empty());
+}
+
+#[test]
+fn output_settings_round_trip_and_default() {
+    let dir = TempDir::new("output-settings");
+    let (core, _rec) = open(&dir, None);
+    assert_eq!(
+        core.output_settings(),
+        OutputSettings {
+            sample_format: OutputSampleFormat::Float,
+            exclusive: false,
+        }
+    );
+
+    let settings = OutputSettings {
+        sample_format: OutputSampleFormat::Int24Packed,
+        exclusive: true,
+    };
+    core.set_output_settings(settings);
+    assert_eq!(core.output_settings(), settings);
+    // No AAudio stream exists off Android, and there is no player yet.
+    assert!(core.output_info().is_none());
+}
+
+#[test]
+fn playback_works_with_each_output_format() {
+    let dir = TempDir::new("output-formats");
+    let (core, _rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+
+    let album = album_by_title(&core, "Album One");
+    let first = core
+        .album_tracks(album.id)
+        .expect("album tracks")
+        .first()
+        .expect("first track")
+        .id;
+
+    for sample_format in [
+        OutputSampleFormat::Float,
+        OutputSampleFormat::Int32,
+        OutputSampleFormat::Int24Packed,
+    ] {
+        // A fresh recorder per format, so earlier positions cannot satisfy the wait.
+        let rec = Arc::new(Recorder::default());
+        core.set_listener(rec.clone());
+        core.set_output_settings(OutputSettings {
+            sample_format,
+            exclusive: false,
+        });
+
+        core.play_album(album.id, 0).expect("play album");
+        rec.wait_for(
+            |e| matches!(e, CoreEvent::Position { track_id, .. } if *track_id == first),
+            &format!("position with {sample_format:?}"),
+        );
+        core.stop();
+    }
 }

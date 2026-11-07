@@ -15,8 +15,12 @@ use crate::render::{self, RingStats};
 /// Sample representation expected by the output device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleKind {
+    /// Float, volume applied.
     F32,
+    /// Left-justified 32-bit integers, bit-perfect, no volume.
     I32,
+    /// 24-bit little-endian packed integers, 3 bytes per sample (bit-perfect path for 24-bit DACs).
+    I24Packed,
 }
 
 /// Format the output is opened with.
@@ -205,6 +209,12 @@ fn spawn_pacer(
                     render::render_i32(&mut consumer, &mut buf, channels, &stats);
                 });
             }
+            SampleKind::I24Packed => {
+                let mut buf = vec![0u8; samples * 3];
+                pace(&quit, &playing, period, || {
+                    render::render_i24_packed(&mut consumer, &mut buf, channels, &stats);
+                });
+            }
         })
 }
 
@@ -344,6 +354,18 @@ mod tests {
             (lo..=hi).contains(&got),
             "played {got} samples, expected {lo}..={hi}"
         );
+    }
+
+    #[test]
+    fn i24_packed_format_consumes() {
+        let (c, stats) = preloaded();
+        let mut sink = NullSink::new();
+        sink.start(fmt(SampleKind::I24Packed), c, Arc::clone(&stats))
+            .unwrap();
+        sink.play().unwrap();
+        thread::sleep(Duration::from_millis(60));
+        sink.stop();
+        assert!(played(&stats) > 0);
     }
 
     #[test]

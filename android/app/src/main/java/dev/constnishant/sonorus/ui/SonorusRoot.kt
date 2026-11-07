@@ -16,13 +16,15 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavBackStackEntry
-import androidx.navigation.NavDestination
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -52,16 +54,6 @@ private val TopLevelTabs = listOf(
 /** Navigation arguments for the detail routes: a single non-null library id. */
 private val IdArgs = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType })
 
-/** True when this destination is [route] or sits below it in the navigation graph. */
-private fun NavDestination.isUnder(route: String): Boolean {
-    var current: NavDestination? = this
-    while (current != null) {
-        if (current.route == route) return true
-        current = current.parent
-    }
-    return false
-}
-
 private fun NavBackStackEntry.idArg(): Long =
     checkNotNull(arguments?.getLong(Routes.ARG_ID)) { "missing ${Routes.ARG_ID}" }
 
@@ -78,6 +70,13 @@ fun SonorusRoot() {
     val destination = backStackEntry?.destination
     val showChrome = destination?.route != Routes.NOW_PLAYING && destination?.route != Routes.SETTINGS
     val snackbarHostState = remember { SnackbarHostState() }
+    // The tab the user is in. Detail screens are not nested under a tab in the graph, so the tab
+    // is remembered from the last top-level destination instead of derived from the current one.
+    var currentTab by rememberSaveable { mutableStateOf(Routes.HOME) }
+    LaunchedEffect(destination?.route) {
+        val route = destination?.route
+        if (TopLevelTabs.any { it.route == route } && route != null) currentTab = route
+    }
 
     LaunchedEffect(repository) {
         repository.events.errors.collect { snackbarHostState.showSnackbar(it) }
@@ -102,12 +101,17 @@ fun SonorusRoot() {
                     NavigationBar {
                         TopLevelTabs.forEach { tab ->
                             NavigationBarItem(
-                                selected = destination?.isUnder(tab.route) == true,
+                                selected = currentTab == tab.route,
                                 onClick = {
-                                    navController.navigate(tab.route) {
-                                        popUpTo(Routes.HOME) { saveState = true }
-                                        launchSingleTop = true
-                                        restoreState = true
+                                    if (currentTab == tab.route) {
+                                        // Re-selecting the current tab returns to its top screen.
+                                        navController.popBackStack(tab.route, inclusive = false)
+                                    } else {
+                                        navController.navigate(tab.route) {
+                                            popUpTo(Routes.HOME) { saveState = true }
+                                            launchSingleTop = true
+                                            restoreState = true
+                                        }
                                     }
                                 },
                                 icon = { Icon(tab.icon, contentDescription = null) },
