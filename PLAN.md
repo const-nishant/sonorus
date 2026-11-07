@@ -268,14 +268,124 @@ alac, all-meta], rtrb, tokio, bytes, fastrand, log, thiserror). Symphonia 0.6 tr
     timeout 200 ms → read Err TimedOut and is_buffering() true.
 
 ## Phase 3 — `engine::decoder::TrackDecoder`
-- [ ] 3.1 `TrackDecoder::new(source: Box<dyn MediaSource>, ext_hint: Option<&str>) -> Result<Self>`; probe with hint,
-  `FormatOptions { enable_gapless: true, .. }`, default track, codec registry default.
-- [ ] 3.2 `next_block(&mut self, out: &mut Vec<f32>) -> Result<Option<usize /*frames*/>>` interleaved f32;
-  skip `DecodeError` packets (log, count); reset on `ResetRequired`. Also keep native-int path
-  (`next_block_i32`) for bit-perfect int output (Phase 10/11).
-- [ ] 3.3 `StreamInfo { codec, sample_rate, channels, bits_per_sample, duration: Option<Duration>, total_frames }`
-  + `label()` → "FLAC 24/96", "WAV 16/44.1", "ALAC 24/192".
-- [ ] 3.4 `seek(Duration) -> Result<Duration actual>` via `SeekMode::Accurate`, then `decoder.reset()`.
+
+Opus did: fixtures in `crates/engine/tests/fixtures/` (stereo, 0.3 s): `tone_24_96.{wav,flac,m4a(ALAC)}`
+(28 800 frames, 24-bit) and `tone_16_44.{wav,flac}` (13 230 frames, 16-bit). FLAC/ALAC are lossless encodes
+of the WAVs, so decoded samples must be identical.
+
+Symphonia 0.6.1 facts (verified in source):
+- Probe: `symphonia::default::get_probe().probe(&Hint, MediaSourceStream, FormatOptions, MetadataOptions)
+  -> Result<Box<dyn FormatReader>>`; `Hint::new().with_extension(ext)`; paths `symphonia::core::formats::
+  {FormatOptions, FormatReader, SeekMode, SeekTo, SeekedTo, TrackType, probe::Hint}`, `symphonia::core::io::
+  {MediaSource, MediaSourceStream}`, `symphonia::core::meta::MetadataOptions`, `symphonia::core::errors::Error`.
+- `format.default_track(TrackType::Audio) -> Option<&Track>`; `Track { id: u32, codec_params: Option<CodecParameters>,
+  time_base: Option<TimeBase>, num_frames: Option<u64>, duration: Option<units::Duration>, start_ts, delay, padding }`;
+  `codec_params.audio() -> Option<&AudioCodecParameters>` with `sample_rate: Option<u32>`,
+  `bits_per_sample: Option<u32>`, `channels: Option<Channels>` (`.count()`), `codec: AudioCodecId`.
+- Decoder: `symphonia::default::get_codecs().make_audio_decoder(&AudioCodecParameters, &AudioDecoderOptions)
+  -> Result<Box<dyn AudioDecoder>>`; `AudioDecoderOptions::default().gapless(true)` (gapless lives on the DECODER
+  in 0.6, not FormatOptions). `decoder.codec_info().short_name` ("flac", "alac", "pcm_s24le", ...), `reset()`.
+- `format.next_packet() -> Result<Option<Packet>>` (Ok(None) = end); `Packet { track_id, pts: Timestamp, dur, .. }`.
+- `decoder.decode(&packet) -> Result<GenericAudioBufferRef<'_>>`; `.frames()`, `.copy_to_vec_interleaved::<S>(&mut Vec<S>)`
+  where `S: symphonia::core::audio::conv::ConvertibleSample` (f32 and i32 both implement it; int→i32 is
+  left-justified, i.e. 24-bit sample s becomes s << 8 — lossless).
+- `Error::{IoError(io::Error), DecodeError(&str), SeekError(SeekErrorKind), Unsupported(&str), LimitError(&str), ResetRequired}`.
+- Seek: `format.seek(SeekMode::Accurate, SeekTo::Time { time: units::Time, track_id: Some(id) }) -> Result<SeekedTo
+  { track_id, required_ts: Timestamp, actual_ts: Timestamp }>`. `Time::try_new(secs: i64, nanos: u32) -> Option<Time>`,
+  `Timestamp::get() -> i64`, `TimeBase::calc_time(ts) -> Option<Time>`, `TimeBase::calc_timestamp(Time) -> Option<Timestamp>`,
+  `Time::as_secs_f64()`. **Accurate seek lands on the packet at/before required_ts; the caller must discard
+  decoded frames until required_ts.**
+
+- [x] **3.1 `crates/engine/src/error.rs`** (+ `lib.rs`: `pub mod error; pub use error::{EngineError, Result};`)
+    ```rust
+    #[derive(Debug, thiserror::Error)]
+    pub enum EngineError {
+        #[error("unsupported stream: {0}")] Unsupported(String),
+        #[error("no audio track")]          NoAudioTrack,
+        #[error("I/O error: {0}")]          Io(#[from] std::io::Error),
+        #[error("decode error: {0}")]       Decode(String),
+        #[error("seek error: {0}")]         Seek(String),
+        #[error(transparent)]               Storage(#[from] sonorus_storage::StorageError),
+    }
+    pub type Result<T> = std::result::Result<T, EngineError>;
+    ```
+- [x] **3.2 `crates/engine/src/decoder.rs`** (+ `lib.rs`: `pub mod decoder;`)
+    ```rust
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StreamInfo {
+        pub codec: String,                 // "FLAC" | "ALAC" | "WAV" | "AIFF" | "PCM" | uppercase short_name otherwise
+        pub sample_rate: u32,
+        pub channels: u16,
+        pub bits_per_sample: Option<u32>,
+        pub duration: Option<std::time::Duration>,
+        pub total_frames: Option<u64>,
+    }
+    impl StreamInfo {
+        /// "FLAC 24/96", "WAV 16/44.1", "ALAC 24/192", "FLAC 24/352.8"; bits None → "FLAC 96 kHz".
+        pub fn label(&self) -> String;
+    }
+    /// 44100 → "44.1", 96000 → "96", 88200 → "88.2", 352800 → "352.8", 11025 → "11.025" (trim trailing zeros).
+    pub fn format_khz(rate: u32) -> String;
+
+    pub struct TrackDecoder { /* format: Box<dyn FormatReader>, decoder: Box<dyn AudioDecoder>, track_id: u32,
+        codec_params: AudioCodecParameters (clone, for ResetRequired), time_base: Option<TimeBase>, info: StreamInfo,
+        position: u64 /*frames*/, discard_until: u64 /*frames*/, skipped_packets: u64 */ }
+
+    impl TrackDecoder {
+        /// MediaSourceStream::new(source, Default::default()); hint from ext_hint (lowercased);
+        /// FormatOptions/MetadataOptions default; default_track(Audio) else NoAudioTrack; codec_params.audio()
+        /// else Unsupported("no audio codec parameters"); sample_rate None → Unsupported; channels None →
+        /// Unsupported; decoder with gapless(true). Probe/decoder-creation errors → Unsupported(err.to_string()).
+        /// codec label: short_name "flac"→"FLAC", "alac"→"ALAC", starts_with "pcm" → ext_hint "wav"→"WAV",
+        /// "aif"|"aiff"→"AIFF", else "PCM"; other → short_name.to_uppercase().
+        /// duration: from total_frames / sample_rate if num_frames is Some, else time_base+duration, else None.
+        pub fn new(source: Box<dyn MediaSource>, ext_hint: Option<&str>) -> Result<Self>;
+        pub fn info(&self) -> &StreamInfo;
+        /// Next decoded block, interleaved, into `out` (cleared first). Ok(Some(frames)) with frames > 0,
+        /// Ok(None) at end of stream. Generic so the same path yields f32 (shared mixer) or i32 (bit-perfect int).
+        pub fn next_block<S: ConvertibleSample>(&mut self, out: &mut Vec<S>) -> Result<Option<usize>>;
+        /// Accurate seek; returns the position actually reached (== requested unless clamped).
+        /// `to` beyond duration (when known) → clamp to duration (next_block then returns None).
+        pub fn seek(&mut self, to: std::time::Duration) -> Result<std::time::Duration>;
+        /// Frames delivered so far (after seek: the seek target), i.e. playback position in frames.
+        pub fn position_frames(&self) -> u64;
+        pub fn skipped_packets(&self) -> u64;
+    }
+    ```
+    `next_block` loop:
+    - `format.next_packet()`: Ok(None) → Ok(None). Err(ResetRequired) → recreate decoder from stored codec_params,
+      continue. Err(IoError(e)) with kind UnexpectedEof → Ok(None). Err(IoError(e)) otherwise → Err(Io(e)) (this is
+      how a RangeSource timeout surfaces — must not be swallowed). Other Err → Decode(err.to_string()).
+    - packet.track_id != track_id → continue.
+    - `decoder.decode(&packet)`: Err(DecodeError(m)) or Err(IoError(_)) → log::warn, skipped_packets += 1,
+      consecutive_bad += 1, if consecutive_bad > 64 → Err(Decode("too many corrupt packets")), continue.
+      Other Err → Decode. Ok(buf): consecutive_bad = 0; if buf.frames() == 0 continue;
+      `buf.copy_to_vec_interleaved(out)` (clear out first); frames = buf.frames(); channels = info.channels.
+      Discard: if position + frames <= discard_until → position += frames, continue; else if position <
+      discard_until → drop the first (discard_until - position) * channels samples from `out` (`out.drain(..n)`),
+      frames -= that, position = discard_until. Then position += frames; return Ok(Some(frames)).
+    - `seek(to)`: clamp to duration if known; Time::try_new(to.as_secs() as i64, to.subsec_nanos()) else Seek err;
+      `format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(track_id) })` → Err → Seek(err.to_string());
+      `decoder.reset()`; convert required_ts / actual_ts to frames via ts_to_frames; position = actual frames;
+      discard_until = required frames; return Duration::from_secs_f64(required_frames as f64 / sample_rate as f64).
+    - `fn ts_to_frames(&self, ts: Timestamp) -> u64`: time_base Some → calc_time → secs_f64 * sample_rate, rounded;
+      None → ts.get() as u64 (clamp negative to 0).
+    No unwrap/expect outside tests. Never panic on malformed input.
+
+    Tests (`#[cfg(test)]` in decoder.rs; load fixtures via `std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/..."))` into `Box::new(std::io::Cursor::new(bytes))`):
+    1. info + labels: tone_24_96.flac → FLAC/96000/2/Some(24)/"FLAC 24/96"; .wav (hint "wav") → "WAV 24/96";
+       .m4a (hint "m4a") → "ALAC 24/96"; tone_16_44.flac → "FLAC 16/44.1". total_frames == Some(28800)/Some(13230)
+       for the flacs; duration ≈ 0.3 s (±1 ms).
+    2. bit-exact: decode tone_24_96.{wav,flac,m4a} fully as i32 → identical Vec<i32>, length 28800*2; same for
+       16_44 wav vs flac; every 24-bit i32 sample has its low 8 bits == 0.
+    3. f32 path: frames total 28800 and f32 == (i32 as f64 / 2^31) as f32 for the first 1000 samples.
+    4. accurate seek: seek(150 ms) on tone_24_96.flac → returns 150 ms (±1 µs), position_frames() == 14400, and the
+       next block's first samples equal the full-decode i32 samples starting at frame 14400 (do this for flac and wav).
+    5. seek beyond end (10 s) → Ok, then next_block returns Ok(None) (possibly after zero blocks).
+    6. corrupt input: first 4 KiB of tone_24_96.flac followed by 4 KiB of 0x5A bytes then the rest — decoding must
+       not panic and must return either Ok blocks or an Err; garbage-only input (8 KiB of 0x5A) → new() Err(Unsupported).
+    7. format_khz cases listed above.
 
 ## Phase 4 — Playback pipeline
 - [ ] 4.1 `engine::ring`: rtrb `Producer/Consumer<f32>` sized 2 s @ max rate; `OutputSink` trait
