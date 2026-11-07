@@ -9,7 +9,7 @@ use crate::error::{LibraryError, Result};
 use crate::model::{Album, AlbumSort, Artist, LibraryStats, SearchResults, Track};
 
 /// Track columns plus the album and artist names; every track read goes through this.
-const TRACK_SELECT: &str =
+pub(crate) const TRACK_SELECT: &str =
     "SELECT t.id, t.key, t.size, t.etag, t.title, t.artist, ar.name, al.title,
         t.album_id, al.artist_id, t.track_no, t.disc_no, t.year, t.genre, t.duration_ms,
         t.sample_rate, t.bits_per_sample, t.channels, t.codec, t.cover_id,
@@ -18,7 +18,7 @@ const TRACK_SELECT: &str =
     JOIN albums al ON al.id = t.album_id
     JOIN artists ar ON ar.id = al.artist_id";
 
-const ALBUM_SELECT: &str = "SELECT al.id, al.title, ar.name, al.artist_id, al.year,
+pub(crate) const ALBUM_SELECT: &str = "SELECT al.id, al.title, ar.name, al.artist_id, al.year,
         (SELECT COUNT(*) FROM tracks t WHERE t.album_id = al.id),
         (SELECT COALESCE(SUM(t.duration_ms), 0) FROM tracks t WHERE t.album_id = al.id),
         al.cover_id, al.added_at
@@ -31,7 +31,7 @@ const ARTIST_SELECT: &str = "SELECT ar.id, ar.name,
             WHERE al.artist_id = ar.id)
     FROM artists ar";
 
-fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
+pub(crate) fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
     let size: i64 = row.get(2)?;
     Ok(Track {
         id: row.get(0)?,
@@ -59,7 +59,7 @@ fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
     })
 }
 
-fn row_to_album(row: &Row<'_>) -> rusqlite::Result<Album> {
+pub(crate) fn row_to_album(row: &Row<'_>) -> rusqlite::Result<Album> {
     let track_count: i64 = row.get(5)?;
     let duration_ms: i64 = row.get(6)?;
     Ok(Album {

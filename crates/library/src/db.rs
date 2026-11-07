@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -67,6 +67,39 @@ CREATE VIRTUAL TABLE track_fts USING fts5(
     title, artist, album, album_artist,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+";
+
+/// v2: user data. Keyed by object key (stable across rescans and devices), not track id.
+/// Timestamps in these tables are Unix milliseconds.
+const SCHEMA_V2: &str = "
+CREATE TABLE playlists (
+    id         INTEGER PRIMARY KEY,
+    uuid       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE playlist_items (
+    id          INTEGER PRIMARY KEY,
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    track_key   TEXT NOT NULL
+);
+CREATE INDEX playlist_items_pl ON playlist_items(playlist_id, position);
+CREATE TABLE favorites (
+    track_key  TEXT PRIMARY KEY,
+    favorite   INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE history (
+    id        INTEGER PRIMARY KEY,
+    track_key TEXT NOT NULL,
+    played_at INTEGER NOT NULL,
+    played_ms INTEGER NOT NULL
+);
+CREATE INDEX history_played ON history(played_at);
+CREATE INDEX history_key ON history(track_key);
 ";
 
 const UPSERT_TRACK_SQL: &str = "
@@ -339,11 +372,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             )),
         )));
     }
-    if version < 1 {
-        let tx = conn.transaction()?;
-        tx.execute_batch(SCHEMA_V1)?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tx.commit()?;
+    for (target, sql) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+        if version < target {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            tx.pragma_update(None, "user_version", target)?;
+            tx.commit()?;
+        }
     }
     Ok(())
 }
@@ -396,6 +431,20 @@ pub(crate) fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Current Unix time in milliseconds; 0 if the clock is before the epoch.
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A new `updated_at` for a row last stamped `prev`: now, but always strictly greater than
+/// `prev`, so edits within the same millisecond (or after a clock step back) still win LWW.
+pub(crate) fn next_stamp(prev: i64) -> i64 {
+    now_ms().max(prev.saturating_add(1))
 }
 
 /// Stores a u64 as SQLite INTEGER, saturating at `i64::MAX`.
@@ -875,5 +924,33 @@ mod tests {
             conn.pragma_update(None, "user_version", 99).unwrap();
         }
         assert!(Library::open(&db, &covers).is_err());
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        let conn = lib.lock();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM playlists", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn next_stamp_is_strictly_increasing() {
+        let far_future = now_ms() + 1_000_000;
+        assert_eq!(next_stamp(far_future), far_future + 1);
+        assert!(next_stamp(0) >= now_ms() - 1000);
     }
 }

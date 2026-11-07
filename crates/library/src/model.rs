@@ -1,5 +1,7 @@
 //! Plain data types shared by the library crate.
 
+use serde::{Deserialize, Serialize};
+
 /// Identity and change-detection data for one object in the bucket (or local folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectStamp {
@@ -118,4 +120,52 @@ pub struct PruneStats {
     pub albums: u64,
     pub artists: u64,
     pub covers: u64,
+}
+
+/// A user playlist (not deleted). Timestamps are Unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Playlist {
+    pub id: i64,
+    pub uuid: String,
+    pub name: String,
+    /// Number of entries, including ones whose track is not in the catalogue.
+    pub track_count: u32,
+    /// Sum of durations of the entries whose track is catalogued.
+    pub duration_ms: u64,
+    /// Cover of the first catalogued entry.
+    pub cover_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One playlist slot. `track` is `None` when the key is not (or no longer) catalogued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    pub position: u32,
+    pub track_key: String,
+    pub track: Option<Track>,
+}
+
+/// Sync form of a playlist (`_sonorus/playlists.json`). Last writer wins per `uuid` by
+/// `updated_at` (Unix ms). Deleted playlists stay as tombstones (`deleted = true`, no tracks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistRecord {
+    pub uuid: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    /// Object keys in playlist order.
+    #[serde(default)]
+    pub tracks: Vec<String>,
+}
+
+/// Sync form of a favorite (`_sonorus/favorites.json`). Last writer wins per `track_key` by
+/// `updated_at` (Unix ms); un-favoriting keeps the row with `favorite = false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteRecord {
+    pub track_key: String,
+    pub favorite: bool,
+    pub updated_at: i64,
 }

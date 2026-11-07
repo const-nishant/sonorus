@@ -967,9 +967,52 @@ Accessor `title() artist() album() genre() track() track_total() disk() disk_tot
     search("wave") finds the wav; prune removes nothing when nothing is orphaned.
 - [x] **6.4** Opus review + commit. Review fixes: store_cover re-creates a missing file; album/artist search via FTS column filters (diacritic-insensitive); untagged files take the artist from the grandparent folder (`Artist/Album/track`); a prefix-limited scan only removes tracks under that prefix; scan takes `Arc<dyn MetaSource>` (JoinSet needs `'static`).
 
-## Phase 7 — Playlists, favorites, history + bucket sync
-- [ ] 7.1 tables + CRUD. 7.2 history (recently played). 7.3 JSON export/import to `_sonorus/playlists.json`,
-  `_sonorus/favorites.json` (last-writer-wins by updated_at).
+## Phase 7 — Playlists, favorites, history + bucket sync (crate `sonorus-library`)
+
+Opus did: workspace deps serde (derive) + serde_json (+ fastrand in library); schema **v2** in `db.rs` (`SCHEMA_V2`,
+migration loop v1→v2): `playlists(id, uuid UNIQUE, name, created_at, updated_at, deleted)`,
+`playlist_items(id, playlist_id → playlists ON DELETE CASCADE, position, track_key)`,
+`favorites(track_key PK, favorite, updated_at)`, `history(id, track_key, played_at, played_ms)`. User data is keyed by
+**object key** (stable across rescans/devices), never by track id; its timestamps are **Unix ms**.
+`db.rs`: `pub(crate) fn now_ms() -> i64`, `pub(crate) fn next_stamp(prev) -> i64` (= max(now, prev+1); use it for
+every user edit so LWW always sees edits as newer). `LibraryError::Sync(String)`. model.rs: `Playlist`,
+`PlaylistEntry{position, track_key, track: Option<Track>}`, serde `PlaylistRecord{uuid, name, created_at, updated_at,
+deleted, tracks: Vec<String>}`, `FavoriteRecord{track_key, favorite, updated_at}`. Stub modules playlists/favorites/
+history/sync. Tracks are resolved from keys through `TRACK_SELECT` (query.rs; make it `pub(crate)` with
+`row_to_track`).
+
+- [x] **7.1 `playlists.rs`** (`impl Library`): `create_playlist(name) -> Result<Playlist>` (uuid = 32 hex chars from two
+  `fastrand::u64(..)`, trimmed name, empty → "New Playlist"), `rename_playlist(id, name)`, `delete_playlist(id)`
+  (tombstone: deleted = 1, items removed, updated_at bumped), `playlists() -> Vec<Playlist>` (not deleted, by name
+  NOCASE then id), `playlist(id) -> Playlist` (NotFound if missing/deleted), `playlist_entries(id) -> Vec<PlaylistEntry>`
+  (position order, LEFT JOIN tracks by key), `add_to_playlist(id, &[String])` (append; duplicates allowed),
+  `remove_from_playlist(id, position)`, `move_in_playlist(id, from, to)` (Vec::remove/insert semantics),
+  `playlist_records() -> Vec<PlaylistRecord>` (ALL incl. tombstones, sorted by uuid),
+  `apply_playlist_records(&[PlaylistRecord]) -> Result<u32>` (per uuid: insert if unknown (tombstones too); overwrite
+  name/deleted/updated_at/items only if incoming updated_at > local; never re-stamp; returns rows changed).
+  Every mutation: one transaction, rewrite the whole item list (delete + reinsert 0..n), updated_at = next_stamp(old);
+  mutating a deleted or missing playlist → NotFound; out-of-range position → NotFound.
+- [x] **7.2 `favorites.rs` + `history.rs`** (`impl Library`): `set_favorite(key, bool)` (upsert, next_stamp),
+  `is_favorite(key) -> bool`, `favorite_keys() -> HashSet<String>`, `favorites() -> Vec<Track>` (catalogued only,
+  newest first), `favorite_records()` (all rows incl. favorite = false, sorted by key), `apply_favorite_records(&[..])
+  -> Result<u32>` (LWW like playlists). History: `record_play(key, played_ms: u64)` (played_at = now_ms; then trim to
+  the newest `HISTORY_LIMIT = 5000` rows), `recently_played(limit) -> Vec<Track>` (distinct key by latest play,
+  catalogued only), `recent_albums(limit) -> Vec<Album>` (distinct album by latest play), `clear_history()`.
+  History is device-local (not synced). The caller decides when a play counts (Phase 8/12).
+- [x] **7.3 `sync.rs`**: docs `PlaylistsDoc{version: 1, playlists}`, `FavoritesDoc{version: 1, favorites}` (serde,
+  pretty JSON, records sorted). Pure `merge_playlists(local, remote) -> Vec<PlaylistRecord>` /
+  `merge_favorites(..)`: union by id; winner = max by (updated_at, then deterministic tie-break: deleted/!favorite
+  wins, then name, then tracks) so every device converges. `trait UserDataStore: Send + Sync { get(key) ->
+  BoxFuture<Result<Option<Vec<u8>>>>; put(key, Vec<u8>) -> BoxFuture<Result<()>> }`; `BucketStore{storage, prefix}`
+  (keys `{prefix}_sonorus/playlists.json`, `{prefix}_sonorus/favorites.json`; NotFound → None; content type
+  application/json); `MemoryStore` (pub, for tests and the app's offline mode). `sync_user_data(&Library,
+  &dyn UserDataStore) -> Result<SyncReport{playlists_applied, favorites_applied, playlists_pushed, favorites_pushed}>`:
+  per doc: get remote → parse (bad JSON or version > 1 → `LibraryError::Sync`, nothing written) → merge with local
+  records → `apply_*` → put the merged doc only if it differs from the remote one.
+- [x] **7.4** Opus review + commit. Review fix: `apply_playlist_records`/`apply_favorite_records` use the same
+  winner rule as the merge (`sync::playlist_key`/`favorite_key`, incl. the equal-timestamp tie-break) instead of
+  "strictly newer", otherwise two devices with equal timestamps never converge (test
+  `equal_timestamps_converge_across_devices`). sync validates BOTH remote docs before applying anything.
 
 ## Phase 8 — `sonorus-core` (UniFFI, cdylib `libsonorus_core.so`)
 - [ ] 8.1 UniFFI proc-macro setup, `SonorusCore` object, records/enums mirroring engine/library types.

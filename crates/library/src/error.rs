@@ -12,6 +12,9 @@ pub enum LibraryError {
     Storage(#[from] sonorus_storage::StorageError),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A remote user-data document is corrupt or uses a newer format; it is never overwritten.
+    #[error("sync error: {0}")]
+    Sync(String),
 }
 
 pub type Result<T> = std::result::Result<T, LibraryError>;
