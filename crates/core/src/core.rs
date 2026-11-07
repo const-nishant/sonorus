@@ -168,12 +168,25 @@ impl SonorusCore {
         Ok(())
     }
 
+    /// Checks the configured backend: for a bucket, one ListObjectsV2 call of at most one key
+    /// under the prefix (fails with `AccessDenied` on bad credentials); for a local folder, that
+    /// it still exists. Returns whether anything exists there. Blocking.
+    pub fn check_backend(&self) -> CoreResult<bool> {
+        match self.backend_snapshot() {
+            None => Err(CoreError::NotConfigured),
+            Some(Backend::Local { root }) => Ok(std::fs::read_dir(&root)?.next().is_some()),
+            Some(Backend::Bucket { storage, prefix }) => {
+                Ok(self.runtime()?.block_on(storage.probe(&prefix))?)
+            }
+        }
+    }
+
     /// Uses a local folder as the backend. The folder must exist. The current queue is dropped.
     pub fn configure_local(&self, dir: String) -> CoreResult<()> {
         let root = PathBuf::from(&dir);
         if !root.is_dir() {
             return Err(CoreError::InvalidConfig {
-                message: format!("not a directory: {dir}"),
+                detail: format!("not a directory: {dir}"),
             });
         }
         self.set_backend(Some(Backend::Local { root }));
@@ -255,7 +268,7 @@ impl SonorusCore {
             .is_err()
         {
             return Err(CoreError::Busy {
-                message: "a scan is already running".to_owned(),
+                detail: "a scan is already running".to_owned(),
             });
         }
         let listener = self.listener.clone();
@@ -539,7 +552,7 @@ impl SonorusCore {
 
     fn runtime(&self) -> CoreResult<&Runtime> {
         self.rt.as_ref().ok_or_else(|| CoreError::Internal {
-            message: "the core is shut down".to_owned(),
+            detail: "the core is shut down".to_owned(),
         })
     }
 
@@ -589,7 +602,7 @@ impl SonorusCore {
         let pump =
             spawn_pump(events, Arc::clone(&self.library), self.listener.clone()).map_err(|e| {
                 CoreError::Internal {
-                    message: format!("failed to start the event thread: {e}"),
+                    detail: format!("failed to start the event thread: {e}"),
                 }
             })?;
         Ok(PlayerSlot {
@@ -700,7 +713,7 @@ fn index(value: u32) -> usize {
 
 fn no_tracks() -> CoreError {
     CoreError::NotFound {
-        message: "no catalogued tracks".to_owned(),
+        detail: "no catalogued tracks".to_owned(),
     }
 }
 

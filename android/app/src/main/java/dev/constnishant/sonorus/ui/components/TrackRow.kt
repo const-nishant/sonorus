@@ -1,0 +1,192 @@
+package dev.constnishant.sonorus.ui.components
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Queue
+import androidx.compose.material.icons.rounded.QueuePlayNext
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.constnishant.sonorus.core.TrackInfo
+import dev.constnishant.sonorus.data.repository
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+
+/**
+ * One track in a list. Shows the title, artist (and album when [showArtwork]), duration, a
+ * favorite toggle, and an overflow menu with "Play next", "Add to queue" and "Add to playlist…".
+ *
+ * @param number leading track number, shown when [showArtwork] is false.
+ * @param showArtwork shows the 48dp cover instead of [number] and adds the album to the subtitle.
+ * @param isCurrent true for the track that is playing; its title is drawn in the primary colour.
+ * @param actions the menu and favorite actions.
+ * @param extraMenuItems optional items appended to the overflow menu (for example playlist entry
+ * actions). The callback closes the menu.
+ */
+@Composable
+fun TrackRow(
+    track: TrackInfo,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    number: Int? = null,
+    showArtwork: Boolean = false,
+    isCurrent: Boolean = false,
+    actions: TrackActions,
+    extraMenuItems: (@Composable ColumnScope.(onDismiss: () -> Unit) -> Unit)? = null,
+) {
+    var favorite by remember(track.id) { mutableStateOf(track.isFavorite) }
+    LaunchedEffect(track.isFavorite) { favorite = track.isFavorite }
+    var menuOpen by remember { mutableStateOf(false) }
+    var addOpen by remember { mutableStateOf(false) }
+    val primary = MaterialTheme.colorScheme.primary
+    val leading: (@Composable () -> Unit)? = if (showArtwork || number != null) {
+        { TrackLeading(track, number, showArtwork) }
+    } else {
+        null
+    }
+
+    ListItem(
+        modifier = modifier.clickable(onClick = onClick),
+        leadingContent = leading,
+        headlineContent = {
+            Text(
+                track.title,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = if (isCurrent) primary else Color.Unspecified,
+            )
+        },
+        supportingContent = {
+            Text(
+                if (showArtwork) "${track.artist} · ${track.album}" else track.artist,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (track.isHiRes()) {
+                    Text(
+                        "HI-RES",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(
+                    formatDuration(track.durationMs?.toLong()),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                IconButton(onClick = {
+                    val next = !favorite
+                    favorite = next
+                    actions.setFavorite(track, next, onError = { favorite = !next })
+                }) {
+                    Icon(
+                        if (favorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                        contentDescription = if (favorite) "Remove from favorites" else "Add to favorites",
+                        tint = if (favorite) primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Box {
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "More options")
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Play next") },
+                            leadingIcon = { Icon(Icons.Rounded.QueuePlayNext, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                actions.playNext(listOf(track.id))
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Add to queue") },
+                            leadingIcon = { Icon(Icons.Rounded.Queue, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                actions.addToQueue(listOf(track.id))
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Add to playlist…") },
+                            leadingIcon = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                addOpen = true
+                            },
+                        )
+                        extraMenuItems?.invoke(this) { menuOpen = false }
+                    }
+                }
+            }
+        },
+    )
+
+    if (addOpen) {
+        AddToPlaylistDialog(
+            trackIds = listOf(track.id),
+            onDismiss = { addOpen = false },
+            actions = actions,
+        )
+    }
+}
+
+/** The leading slot: the cover, or the track number. */
+@Composable
+private fun TrackLeading(track: TrackInfo, number: Int?, showArtwork: Boolean) {
+    if (showArtwork) {
+        Artwork(track.coverPath, contentDescription = null, modifier = Modifier.size(48.dp), cornerRadius = 6.dp)
+    } else if (number != null) {
+        Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
+            Text(
+                number.toString(),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * The current track id from the playback state, or null when nothing is loaded. Recomposes only
+ * when the track changes, not on every position update.
+ */
+@Composable
+fun rememberCurrentTrackId(): State<Long?> {
+    val repository = LocalContext.current.repository
+    val ids = remember(repository) {
+        repository.events.playback.map { it.track?.id }.distinctUntilChanged()
+    }
+    return ids.collectAsStateWithLifecycle(initialValue = null)
+}

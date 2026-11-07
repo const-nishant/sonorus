@@ -10,6 +10,10 @@ pub enum StorageError {
     NotFound(String),
     #[error("network error: {0}")]
     Network(String),
+    /// The service refused the credentials or the request (HTTP 401/403): wrong key id or secret,
+    /// a key without access to the bucket, or a region/endpoint mismatch.
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error("S3 error (status {status:?}): {message}")]
     S3 {
         status: Option<u16>,
@@ -37,7 +41,7 @@ impl StorageError {
     }
 }
 
-/// Map any SDK error. Status 404 → NotFound(key). TimeoutError/DispatchFailure/ResponseError → Network.
+/// Map any SDK error. Status 404 → NotFound(key). Status 401/403 → AccessDenied. TimeoutError/DispatchFailure/ResponseError → Network.
 /// ServiceError/ConstructionFailure/other → S3{status from raw_response, message = DisplayErrorContext}.
 pub(crate) fn from_sdk<E>(err: SdkError<E>, key: &str) -> StorageError
 where
@@ -46,6 +50,9 @@ where
     let status = err.raw_response().map(|r| r.status().as_u16());
     if status == Some(404) {
         return StorageError::NotFound(key.to_string());
+    }
+    if matches!(status, Some(401 | 403)) {
+        return StorageError::AccessDenied(DisplayErrorContext(&err).to_string());
     }
     match &err {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {

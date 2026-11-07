@@ -361,6 +361,10 @@ fn unconfigured_core_refuses_backend_work() {
 
     assert!(matches!(core.scan_library(), Err(CoreError::NotConfigured)));
     assert!(matches!(
+        core.check_backend(),
+        Err(CoreError::NotConfigured)
+    ));
+    assert!(matches!(
         core.play_tracks(vec![1], 0),
         Err(CoreError::NotConfigured)
     ));
@@ -413,6 +417,19 @@ fn unconfigured_core_refuses_backend_work() {
     assert!(core.is_configured(), "a rejected local dir changes nothing");
     core.shutdown();
     core.shutdown(); // idempotent
+}
+
+#[test]
+fn check_backend_reports_whether_local_folder_has_files() {
+    let dir = TempDir::new("check");
+    let (core, _rec) = open(&dir, Some(FIXTURES));
+    assert!(core.check_backend().expect("check fixtures"));
+
+    let empty = dir.path().join("empty-music");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    core.configure_local(empty.to_string_lossy().into_owned())
+        .expect("configure empty dir");
+    assert!(!core.check_backend().expect("check empty"));
 }
 
 #[test]

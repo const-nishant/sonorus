@@ -1041,11 +1041,36 @@ library i64 ids (engine `TrackRef.id` = id as string); times are ms (u64). Crede
   thin LTO, 1 CGU, stripped → arm64 `libsonorus_core.so` 15 MB (needs only liblog/libdl/libm/libc).
   NOTE: until Phase 10 the core plays into `NullSink` (silent, real-time paced).
 
-## Phase 9 — Android project
-- [ ] 9.1 Gradle (Kotlin DSL, version catalog), app id `dev.constnishant.sonorus`, minSdk 34, cargo-ndk task
-  building arm64-v8a into `jniLibs`, uniffi-bindgen Kotlin generation.
-- [ ] 9.2 Compose theme + navigation (Library, Album, Artist, Search, Now Playing).
-- [ ] 9.3 Library/Album/Now-playing screens bound to `SonorusCore`.
+## Phase 9 — Android app (Kotlin + Compose)
+
+Opus did: `android/` Gradle project — wrapper 9.8.2 (daemon JVM 17 via gradle-daemon-jvm.properties), version
+catalog (AGP 9.5.1 built-in Kotlin, Kotlin/Compose plugin 2.4.21, Compose BOM 2026.09.00, navigation-compose 2.10.2,
+lifecycle 2.11.0, activity-compose 1.13.0, coroutines 1.11.0, Coil 3.6.3, JNA 5.19.1 aar), app id
+`dev.constnishant.sonorus`, compileSdk 37 (AndroidX needs it) / targetSdk 36 / minSdk 34, arm64-v8a only.
+Per-variant tasks in `app/build.gradle.kts`: `cargoBuild<Variant>` (cargo + NDK r28 clang env → jniLibs; debug uses
+cargo profile `android-dev` = release without LTO, release uses `release`) and `uniffiBindgen<Variant>` (library mode
+on the built .so → generated Kotlin source dir). Fixes found: Cargo release `strip = "debuginfo"` (not "symbols": the
+bindgen reads UniFFI metadata symbols; AGP strips the packaged copy); CoreError fields renamed `message` → `detail`
+(clashed with `Throwable.message`). Generated API: `android/app/build/generated/kotlin/uniffiBindgenDebug/dev/
+constnishant/sonorus/core/sonorus_core.kt` (u32 → `UInt`, u64 → `ULong`, ids `Long`, `CoreException.*(detail)`,
+`CoreEvent.*`). Verified on a vivo V2338 (Android 16) against the B2 bucket with prefix `sonorus-test`.
+NOTE: audio is silent until Phase 10 (NullSink).
+
+- [x] **9.1 data layer** (`data/`): `BucketSettingsStore` (AndroidKeyStore AES-256-GCM for key id + secret; prefs for
+  the rest), `SonorusRepository` (core created on IO, `call {}` helper, fire-and-forget player commands, error flow,
+  library-changed flow), `CoreEvents: EventListener` → `StateFlow<PlaybackUi>` / `StateFlow<ScanUi>`.
+- [x] **9.2 shell**: theme (dark-first Material 3), navigation (bottom bar Home / Library / Search, routes for album,
+  artist, playlist, now playing, settings), mini player, Now Playing screen, Settings (bucket form, scan, sync).
+- [x] **9.3 browse screens**: Home (recently played, recent albums), Library tabs (Albums grid, Artists, Playlists),
+  Album, Artist, Playlist detail, Search; track rows with favorite toggle and "play next / add to queue / add to
+  playlist" menu.
+- [x] **9.4** Opus review + on-device test + commit. Fixes from the device run: `SonorusCore::check_backend()`
+  (one ListObjectsV2 of max 1 key) runs after "Save & connect", so the screen only says "Connected" when the
+  credentials work, and says so when the prefix is empty; `StorageError::AccessDenied` / `CoreError::AccessDenied`
+  for HTTP 401/403; `data/ErrorText.kt` maps every `CoreException` to short UI text (raw detail goes to logcat);
+  debug builds prefill the bucket form from `SONORUS_S3_*` env vars or the repo `.env` (`BuildConfig.DEFAULT_S3_*`,
+  empty in release; the debug APK then holds the secret, so it is not for sharing); `data_extraction_rules.xml`
+  excludes everything from backup/transfer; Home shelves snap back to the newest item; readable scan summary.
 
 ## Phase 10 — AAudio output (ndk crate)
 - [ ] 10.1 `AAudioSink: OutputSink` float + I24_PACKED/I32 formats, device id selection, exclusive/shared.

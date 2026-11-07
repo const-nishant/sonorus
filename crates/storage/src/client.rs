@@ -179,6 +179,21 @@ impl Storage {
         Ok(objects)
     }
 
+    /// Checks that the bucket accepts the credentials with one ListObjectsV2 call of at most one
+    /// key. Returns whether anything exists under `prefix`.
+    pub async fn probe(&self, prefix: &str) -> Result<bool> {
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(|e| from_sdk(e, prefix))?;
+        Ok(!output.contents().is_empty())
+    }
+
     /// [`Storage::list`] filtered to audio keys per [`is_audio_key`].
     pub async fn list_audio(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let mut objects = self.list(prefix).await?;

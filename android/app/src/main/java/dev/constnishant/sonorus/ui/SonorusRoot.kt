@@ -1,0 +1,178 @@
+package dev.constnishant.sonorus.ui
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.LibraryMusic
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavDestination
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import dev.constnishant.sonorus.data.repository
+import dev.constnishant.sonorus.ui.player.MiniPlayer
+import dev.constnishant.sonorus.ui.player.NowPlayingScreen
+import dev.constnishant.sonorus.ui.player.showsPause
+import dev.constnishant.sonorus.ui.screens.AlbumScreen
+import dev.constnishant.sonorus.ui.screens.ArtistScreen
+import dev.constnishant.sonorus.ui.screens.HomeScreen
+import dev.constnishant.sonorus.ui.screens.LibraryScreen
+import dev.constnishant.sonorus.ui.screens.PlaylistScreen
+import dev.constnishant.sonorus.ui.screens.SearchScreen
+import dev.constnishant.sonorus.ui.settings.SettingsScreen
+
+private data class TopLevelTab(val route: String, val label: String, val icon: ImageVector)
+
+private val TopLevelTabs = listOf(
+    TopLevelTab(Routes.HOME, "Home", Icons.Rounded.Home),
+    TopLevelTab(Routes.LIBRARY, "Library", Icons.Rounded.LibraryMusic),
+    TopLevelTab(Routes.SEARCH, "Search", Icons.Rounded.Search),
+)
+
+/** Navigation arguments for the detail routes: a single non-null library id. */
+private val IdArgs = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType })
+
+/** True when this destination is [route] or sits below it in the navigation graph. */
+private fun NavDestination.isUnder(route: String): Boolean {
+    var current: NavDestination? = this
+    while (current != null) {
+        if (current.route == route) return true
+        current = current.parent
+    }
+    return false
+}
+
+private fun NavBackStackEntry.idArg(): Long =
+    checkNotNull(arguments?.getLong(Routes.ARG_ID)) { "missing ${Routes.ARG_ID}" }
+
+/**
+ * The app shell: bottom navigation, mini player, snackbar host and the navigation graph. The
+ * bottom bar and the mini player are hidden on the Now Playing and Settings screens.
+ */
+@Composable
+fun SonorusRoot() {
+    val repository = LocalContext.current.repository
+    val navController = rememberNavController()
+    val playback by repository.events.playback.collectAsStateWithLifecycle()
+    val backStackEntry by navController.currentBackStackEntryAsState()
+    val destination = backStackEntry?.destination
+    val showChrome = destination?.route != Routes.NOW_PLAYING && destination?.route != Routes.SETTINGS
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(repository) {
+        repository.events.errors.collect { snackbarHostState.showSnackbar(it) }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        bottomBar = {
+            if (showChrome) {
+                Column {
+                    if (playback.track != null) {
+                        MiniPlayer(
+                            playback = playback,
+                            onOpen = { navController.navigate(Routes.NOW_PLAYING) },
+                            onPlayPause = {
+                                val pause = playback.state.showsPause()
+                                repository.command { if (pause) it.pause() else it.play() }
+                            },
+                            onNext = { repository.command { it.next() } },
+                        )
+                    }
+                    NavigationBar {
+                        TopLevelTabs.forEach { tab ->
+                            NavigationBarItem(
+                                selected = destination?.isUnder(tab.route) == true,
+                                onClick = {
+                                    navController.navigate(tab.route) {
+                                        popUpTo(Routes.HOME) { saveState = true }
+                                        launchSingleTop = true
+                                        restoreState = true
+                                    }
+                                },
+                                icon = { Icon(tab.icon, contentDescription = null) },
+                                label = { Text(tab.label) },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    ) { innerPadding ->
+        NavHost(
+            navController = navController,
+            startDestination = Routes.HOME,
+            modifier = Modifier.padding(innerPadding),
+        ) {
+            composable(Routes.HOME) {
+                HomeScreen(
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                )
+            }
+            composable(Routes.LIBRARY) {
+                LibraryScreen(
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onArtist = { navController.navigate(Routes.artist(it)) },
+                    onPlaylist = { navController.navigate(Routes.playlist(it)) },
+                )
+            }
+            composable(Routes.SEARCH) {
+                SearchScreen(
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onArtist = { navController.navigate(Routes.artist(it)) },
+                )
+            }
+            composable(Routes.ALBUM, arguments = IdArgs) { entry ->
+                AlbumScreen(
+                    albumId = entry.idArg(),
+                    onArtist = { navController.navigate(Routes.artist(it)) },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.ARTIST, arguments = IdArgs) { entry ->
+                ArtistScreen(
+                    artistId = entry.idArg(),
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.PLAYLIST, arguments = IdArgs) { entry ->
+                PlaylistScreen(
+                    playlistId = entry.idArg(),
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.NOW_PLAYING) {
+                NowPlayingScreen(
+                    onBack = { navController.popBackStack() },
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onArtist = { navController.navigate(Routes.artist(it)) },
+                )
+            }
+            composable(Routes.SETTINGS) {
+                SettingsScreen(onBack = { navController.popBackStack() })
+            }
+        }
+    }
+}

@@ -37,4 +37,13 @@ sonorus-library = { path = "crates/library" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Keep the symbol table: uniffi-bindgen reads its metadata symbols from the .so.
+# AGP strips the packaged copy (stripDebugDebugSymbols / stripReleaseDebugSymbols).
+strip = "debuginfo"
+
+# Fast-to-build optimized profile for Android debug APKs (audio code is too slow unoptimized).
+[profile.android-dev]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
