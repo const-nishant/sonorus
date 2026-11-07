@@ -8,6 +8,6 @@ mod upload;
 pub use client::{
     AUDIO_EXTENSIONS, ObjectInfo, ObjectMeta, Storage, content_type_for_key, is_audio_key,
 };
-pub use config::{StorageConfig, region_from_endpoint};
+pub use config::{StorageConfig, normalize_prefix, region_from_endpoint};
 pub use error::{Result, StorageError};
 pub use upload::{MAX_PART_ATTEMPTS, PART_SIZE, UploadProgress, UploadedPart};

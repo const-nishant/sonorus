@@ -13,6 +13,9 @@ pub struct StorageConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub path_style: bool,
+    /// Key prefix the music lives under ("" = whole bucket, else normalized to end with '/').
+    /// Lets the library share a bucket with unrelated files.
+    pub prefix: String,
 }
 
 impl StorageConfig {
@@ -52,6 +55,7 @@ impl StorageConfig {
             access_key_id,
             secret_access_key,
             path_style,
+            prefix: normalize_prefix(&optional_env("SONORUS_S3_PREFIX").unwrap_or_default()),
         };
         config.validate()?;
         Ok(config)
@@ -66,6 +70,7 @@ impl StorageConfig {
             access_key_id: key_id.to_string(),
             secret_access_key: secret.to_string(),
             path_style: true,
+            prefix: String::new(),
         }
     }
 
@@ -78,6 +83,7 @@ impl StorageConfig {
             access_key_id: key_id.to_string(),
             secret_access_key: secret.to_string(),
             path_style: true,
+            prefix: String::new(),
         }
     }
 
@@ -123,6 +129,7 @@ impl fmt::Debug for StorageConfig {
             .field("access_key_id", &key_hint)
             .field("secret_access_key", &"<redacted>")
             .field("path_style", &self.path_style)
+            .field("prefix", &self.prefix)
             .finish()
     }
 }
@@ -140,6 +147,16 @@ pub fn region_from_endpoint(endpoint: &str) -> Option<String> {
         None
     } else {
         Some(region.to_string())
+    }
+}
+
+/// "music" / "/music/" / "music//" → "music/"; "" or "/" → "" (whole bucket).
+pub fn normalize_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
     }
 }
 
@@ -162,6 +179,15 @@ mod tests {
 
     const SECRET: &str = "wJalrXUtnFEMI-SECRET-VALUE-9z";
     const KEY_ID: &str = "AKIAEXAMPLEKEYID1234";
+
+    #[test]
+    fn prefix_normalization() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("music"), "music/");
+        assert_eq!(normalize_prefix(" /music/ "), "music/");
+        assert_eq!(normalize_prefix("a/b//"), "a/b/");
+    }
 
     #[test]
     fn debug_never_leaks_secret_or_full_key() {

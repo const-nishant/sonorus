@@ -820,10 +820,152 @@ keep the position, show Buffering, reopen + seek back, retry with backoff until 
 - [x] **5.5.3** Opus review + commit.
 
 ## Phase 6 — `sonorus-library`
-- [ ] 6.1 schema + migrations (rusqlite bundled): tracks, albums, artists, covers, scan_state.
-- [ ] 6.2 bucket scan under optional `SONORUS_S3_PREFIX` (bucket is shared with other files): list_audio, diff by etag/size, fetch head bytes (first 1 MiB, + tail for m4a) → lofty tags.
-- [ ] 6.3 cover art extract (embedded or `cover.jpg` in folder) → cache dir, thumbnail later in Kotlin.
-- [ ] 6.4 queries: albums, artists, tracks by album, search (FTS5 over title/artist/album).
+
+Opus did: crate skeleton (deps rusqlite 0.41 [bundled, FTS5 compiled in], lofty 0.25, blake3, bytes, tokio,
+thiserror, log, sonorus-storage); `StorageConfig.prefix` + `normalize_prefix` (env `SONORUS_S3_PREFIX`);
+fixtures `crates/library/tests/fixtures/` laid out like a bucket:
+`Artist A/Album One/01 - First Song.flac` (full tags + embedded JPEG cover + LYRICS), `.../02 - Second Song.m4a`
+(ALAC, artist "Artist A feat. C", album_artist "Artist A", embedded cover), `Artist B/Album Two/01 - Wave Song.wav`
+(INFO tags, no album_artist), `.../03 - Untagged Track.flac` (no tags), `Artist B/Album Two/cover.jpg` (folder art).
+lofty 0.25: `lofty::probe::Probe::new(reader).options(ParseOptions::new().read_cover_art(true)).guess_file_type()?.read()?`
+→ `TaggedFile`; `use lofty::prelude::{TaggedFileExt, AudioFile, Accessor, ItemKey}`; `primary_tag()`/`first_tag()`;
+Accessor `title() artist() album() genre() track() track_total() disk() disk_total() date() -> Option<Timestamp{year:u16,..}>`;
+`tag.get_string(ItemKey::AlbumArtist)`, `ItemKey::Lyrics`, `ItemKey::UnsyncLyrics`, `ItemKey::Year`; `tag.pictures()` →
+`Picture { pic_type() -> PictureType (CoverFront), mime_type() -> Option<&MimeType> (.as_str()), data() -> &[u8] }`;
+`tagged.properties()` → `duration() -> Duration, sample_rate(), bit_depth(), channels(), audio_bitrate()`;
+`tagged.file_type()` → `FileType::{Flac, Mp4, Wav, Aiff, ..}`.
+
+- [x] **6.1 `crates/library/src/{error.rs, model.rs, db.rs, query.rs}`** (+ lib.rs mods/re-exports) — SQLite catalogue.
+    ```rust
+    // error.rs
+    #[derive(Debug, thiserror::Error)] pub enum LibraryError {
+        #[error("database error: {0}")] Db(#[from] rusqlite::Error),
+        #[error("I/O error: {0}")]      Io(#[from] std::io::Error),
+        #[error("tag error: {0}")]      Tags(String),
+        #[error(transparent)]           Storage(#[from] sonorus_storage::StorageError),
+        #[error("not found: {0}")]      NotFound(String),
+    }
+    pub type Result<T> = std::result::Result<T, LibraryError>;
+    // model.rs (all Debug, Clone, PartialEq; Eq where possible)
+    pub struct ObjectStamp { pub key: String, pub size: u64, pub etag: Option<String>, pub last_modified: Option<i64> }
+    pub struct CoverImage { pub data: Vec<u8>, pub mime: String }
+    pub struct TrackMeta { pub title, artist, album_artist, album, genre, lyrics, codec: Option<String>,
+        pub track_no, track_total, disc_no, disc_total: Option<u32>, pub year: Option<i32>,
+        pub duration_ms: Option<u64>, pub sample_rate: Option<u32>, pub bits_per_sample: Option<u8>,
+        pub channels: Option<u8>, pub bitrate_kbps: Option<u32>, pub cover: Option<CoverImage> }   // Default derive
+    pub struct Track { pub id: i64, pub key: String, pub size: u64, pub etag: Option<String>, pub title: String,
+        pub artist: String, pub album_artist: String, pub album: String, pub album_id: i64, pub artist_id: i64,
+        pub track_no: Option<u32>, pub disc_no: Option<u32>, pub year: Option<i32>, pub genre: Option<String>,
+        pub duration_ms: Option<u64>, pub sample_rate: Option<u32>, pub bits_per_sample: Option<u8>,
+        pub channels: Option<u8>, pub codec: Option<String>, pub cover_id: Option<i64>, pub has_lyrics: bool, pub added_at: i64 }
+    pub struct Album { pub id: i64, pub title: String, pub artist: String, pub artist_id: i64, pub year: Option<i32>,
+        pub track_count: u32, pub duration_ms: u64, pub cover_id: Option<i64>, pub added_at: i64 }
+    pub struct Artist { pub id: i64, pub name: String, pub album_count: u32, pub track_count: u32 }
+    pub struct SearchResults { pub tracks: Vec<Track>, pub albums: Vec<Album>, pub artists: Vec<Artist> }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum AlbumSort { #[default] Artist, Title, Year, RecentlyAdded }
+    pub struct LibraryStats { pub tracks: u64, pub albums: u64, pub artists: u64, pub total_bytes: u64, pub total_duration_ms: u64 }
+    ```
+    `db.rs` — `pub struct Library { conn: std::sync::Mutex<rusqlite::Connection>, covers_dir: PathBuf }` (Send + Sync):
+    - `open(db_path: &Path, covers_dir: &Path) -> Result<Library>`, `open_in_memory(covers_dir: &Path)`: create covers_dir;
+      PRAGMA journal_mode=WAL (skip for memory), foreign_keys=ON, busy_timeout 5000; migrate via `PRAGMA user_version`
+      (v0 → v1 creates the schema below in one transaction; unknown newer version → error).
+      Schema v1: `artists(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE)`;
+      `covers(id INTEGER PRIMARY KEY, hash TEXT NOT NULL UNIQUE, mime TEXT NOT NULL, file TEXT NOT NULL, bytes INTEGER NOT NULL)`;
+      `albums(id INTEGER PRIMARY KEY, title TEXT NOT NULL COLLATE NOCASE, artist_id INTEGER NOT NULL REFERENCES artists(id),
+        year INTEGER, cover_id INTEGER REFERENCES covers(id), added_at INTEGER NOT NULL, UNIQUE(title, artist_id))`;
+      `tracks(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, size INTEGER NOT NULL, etag TEXT, last_modified INTEGER,
+        title TEXT NOT NULL, artist TEXT NOT NULL, album_id INTEGER NOT NULL REFERENCES albums(id),
+        track_no INTEGER, track_total INTEGER, disc_no INTEGER, disc_total INTEGER, year INTEGER, genre TEXT,
+        duration_ms INTEGER, sample_rate INTEGER, bits_per_sample INTEGER, channels INTEGER, bitrate_kbps INTEGER,
+        codec TEXT, cover_id INTEGER REFERENCES covers(id), lyrics TEXT, added_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`;
+      indexes on tracks(album_id), albums(artist_id); `CREATE VIRTUAL TABLE track_fts USING fts5(title, artist, album,
+        album_artist, tokenize = 'unicode61 remove_diacritics 2')` with rowid = tracks.id.
+    - Resolution rules (pure helpers in db.rs, unit-tested): `title` = meta.title (trimmed, non-empty) else file stem with a
+      leading track number removed (`"01 - x"`, `"01. x"`, `"01 x"`, `"1-02 x"`) else the stem; `track_no` = meta else that
+      leading number (for "1-02" → disc 1, track 2); `artist` = meta.artist else meta.album_artist else "Unknown Artist";
+      album artist = meta.album_artist else meta.artist else "Unknown Artist"; `album` = meta.album else the key's parent
+      folder name else "Unknown Album". Albums group by (album title, album artist), case-insensitive.
+    - `stamps(&self) -> Result<HashMap<String, ObjectStamp>>` (key → stamp) for the scan diff.
+    - `upsert_track(&self, stamp: &ObjectStamp, meta: &TrackMeta, cover_id: Option<i64>) -> Result<i64>`: one transaction:
+      get-or-create album artist + album (album.year = first non-null; album.cover_id set if NULL and cover_id is Some);
+      insert or update the track by key (keep `added_at` on update, set `updated_at` = now); rewrite its track_fts row
+      (delete + insert with album_artist). Returns track id.
+    - `remove_tracks(&self, keys: &[String]) -> Result<usize>`: delete tracks + fts rows in one transaction.
+    - `store_cover(&self, data: &[u8], mime: &str) -> Result<i64>`: hash = blake3 hex; existing hash → its id; else write
+      `covers_dir/<hash>.<ext>` (ext from mime: jpeg→jpg, png→png, else bin) via temp file + rename, insert row.
+    - `prune(&self) -> Result<PruneStats { albums, artists, covers }>`: delete albums with no tracks, artists with no albums,
+      covers referenced by no track and no album (and delete their files; a missing file is fine).
+    `query.rs` — `impl Library`:
+    - `track(id) -> Result<Track>` (NotFound), `tracks_by_ids(&[i64]) -> Result<Vec<Track>>` (input order, missing skipped),
+      `track_by_key(&str) -> Result<Option<Track>>`, `lyrics(track_id) -> Result<Option<String>>`.
+    - `albums(sort: AlbumSort, limit: u32, offset: u32) -> Result<Vec<Album>>` (Artist: artist name, year, title; Title: title;
+      Year: year DESC NULLS LAST, title; RecentlyAdded: added_at DESC, id DESC); `album(id) -> Result<Album>`;
+      `album_tracks(album_id) -> Result<Vec<Track>>` ordered by disc_no NULLS LAST, track_no NULLS LAST, title.
+    - `artists(limit, offset) -> Result<Vec<Artist>>` by name; `artist(id)`; `artist_albums(artist_id) -> Vec<Album>` by year, title.
+    - `search(query: &str, limit: u32) -> Result<SearchResults>`: split on whitespace, drop FTS-special chars (keep
+      alphanumerics incl. unicode, `'`), each token → `"token"*`, joined with AND (empty → empty results); tracks via
+      `track_fts MATCH ? ORDER BY bm25(track_fts) LIMIT ?`; albums and artists: `title/name LIKE '%' || ? || '%'` per token
+      (all tokens must match), limited, escaping `%`/`_`.
+    - `cover_path(cover_id) -> Result<Option<PathBuf>>`; `stats() -> Result<LibraryStats>`.
+    Track rows are built by one shared `fn row_to_track(&Row)` over a single SELECT joining albums + artists.
+    Tests (in-memory DB + tempdir covers dir under `std::env::temp_dir()/sonorus-test-<random>`): resolution helpers;
+    upsert creates artist/album once for two tracks of the same album (case differences in album name still group);
+    update keeps added_at and id; album_tracks ordering; remove + prune cleans orphans and cover files; store_cover dedupes;
+    search: prefix ("firs" finds "First Song"), diacritics ("beyonce" finds "Beyoncé"), multi-token AND, special chars
+    (`"`, `*`, `(`) don't error; albums sorts; stats.
+- [x] **6.2 `crates/library/src/{remote.rs, tags.rs}`** (parallel with 6.1; uses only model.rs types — 6.1 owns model.rs,
+    so 6.2 must not edit it; if model.rs is not there yet, wait and retry).
+    - `remote.rs`: `pub struct RemoteReader { storage: Storage, key: String, size: u64, rt: tokio::runtime::Handle,
+      blocks: BTreeMap<u64, Bytes>, pos: u64, block_size: u64 /*256 KiB*/, fetched: u64, max_fetch: u64 /*32 MiB*/ }`;
+      `new(storage, key, size, rt) -> Self`; `fetched_bytes()`; `impl Read + Seek`. Read: block = pos / block_size; on miss
+      `rt.block_on(storage.get_range(key, block*bs, min(bs, size - block*bs)))` (map errors to io::Error::other; a fetch
+      that would exceed max_fetch → io::Error::other("tag read budget exceeded")); copy from the block; keep at most 64
+      blocks (evict the lowest index ≠ current). Seek like a file (End relative to size; negative → InvalidInput).
+      MUST be used from a blocking thread (spawn_blocking), never a tokio worker — document it.
+    - `tags.rs`: `pub fn read_meta<R: Read + Seek>(reader: R, ext_hint: Option<&str>) -> Result<TrackMeta>`: lofty Probe
+      with read_cover_art(true); if `guess_file_type` finds nothing and the hint is flac/m4a/wav/aif/aiff use
+      `set_file_type`; tag = primary_tag().or(first_tag()); fill TrackMeta (strings trimmed, empty → None; year from
+      date().year or ItemKey::Year parsed leading 4 digits; lyrics from Lyrics else UnsyncLyrics); properties →
+      duration_ms (0 → None), sample_rate, bits_per_sample, channels, bitrate_kbps; codec from file_type: Flac→"FLAC",
+      Mp4→"ALAC", Wav→"WAV", Aiff→"AIFF", other →
+      Debug name uppercased; cover = CoverFront picture else first picture → CoverImage { data, mime (default
+      "image/jpeg") }. lofty errors → LibraryError::Tags(e.to_string()).
+      `pub fn folder_cover_key(audio_key: &str, all_keys: &HashSet<String>) -> Option<String>`: same folder, first existing
+      of cover.jpg, cover.png, folder.jpg, folder.png, front.jpg, front.png (case-insensitive match against the set).
+    Tests: read_meta on each fixture via `std::fs::File` (all four: titles, artists, album_artist, track/disc numbers,
+    year 2021, genre, lyrics present on the flac, sample_rate/bits/channels, duration ≈ 300 ms, codecs FLAC/ALAC/WAV/FLAC,
+    covers present on flac + m4a with mime image/jpeg, absent on wav/untagged); folder_cover_key cases.
+- [x] **6.3 `crates/library/src/scan.rs`** + `examples/scan.rs` (after 6.1 + 6.2)
+    ```rust
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ScanProgress { pub total: u32, pub done: u32, pub added: u32, pub updated: u32, pub removed: u32, pub failed: u32 }
+    #[derive(Debug, Clone)] pub struct ScanFailure { pub key: String, pub error: String }
+    pub struct ScanReport { pub progress: ScanProgress, pub failures: Vec<ScanFailure>, pub prune: PruneStats }
+    pub trait MetaSource: Send + Sync + 'static {      // lets tests scan a local folder instead of the bucket
+        fn list(&self, prefix: &str) -> BoxFuture<'_, Result<Vec<ObjectStamp>>>;   // ALL objects (audio + images)
+        fn read_meta(&self, stamp: &ObjectStamp) -> BoxFuture<'_, Result<TrackMeta>>;
+        fn get_bytes(&self, key: &str) -> BoxFuture<'_, Result<Vec<u8>>>;          // folder covers
+    }
+    pub struct BucketSource { storage: Storage, rt: Handle }   // read_meta = spawn_blocking(RemoteReader + tags::read_meta)
+    pub struct DirSource { root: PathBuf }                      // keys are '/'-joined paths relative to root
+    pub async fn scan(library: &Library, source: &dyn MetaSource, prefix: &str, concurrency: usize,
+                      on_progress: impl FnMut(&ScanProgress) + Send) -> Result<ScanReport>;
+    ```
+    scan: list → audio stamps (`sonorus_storage::is_audio_key`) + key set; diff with `library.stamps()` by key: new →
+    add, size or etag differs → update, DB keys not listed → remove (`remove_tracks`). Read metadata for add/update with up
+    to `concurrency` (min 1) concurrent `read_meta` futures (tokio::task::JoinSet over Arc'd source, or
+    `futures`-free manual pool); for each result in completion order: cover = embedded → store_cover, else folder cover
+    (cached per folder key: fetch once via get_bytes, store_cover once) → `upsert_track`; failures counted + collected
+    (never abort the scan); on_progress after every file and at the end. Finally prune(). Library DB work happens on the
+    calling task (it is quick); only read_meta runs concurrently.
+    `examples/scan.rs`: dotenv, StorageConfig::from_env, Storage::new, Library::open("sonorus.db", "covers"), scan with
+    BucketSource, prefix = config.prefix, concurrency 4, print progress lines and a final stats() summary + failures.
+    Tests (DirSource over the fixtures dir, temp DB): first scan adds 4, albums = 2 ("Album One" by Artist A with 2
+    tracks, cover from embedded art; "Album Two" by Artist B with 2 tracks — wav + untagged), untagged track titled
+    "Untagged Track" #3 in "Album Two" (folder name) with the folder cover.jpg; second scan → 0 added/updated/removed;
+    after copying the fixtures to a temp dir and deleting one file + changing another's size → removed 1, updated 1;
+    search("wave") finds the wav; prune removes nothing when nothing is orphaned.
+- [x] **6.4** Opus review + commit. Review fixes: store_cover re-creates a missing file; album/artist search via FTS column filters (diacritic-insensitive); untagged files take the artist from the grandparent folder (`Artist/Album/track`); a prefix-limited scan only removes tracks under that prefix; scan takes `Arc<dyn MetaSource>` (JoinSet needs `'static`).
 
 ## Phase 7 — Playlists, favorites, history + bucket sync
 - [ ] 7.1 tables + CRUD. 7.2 history (recently played). 7.3 JSON export/import to `_sonorus/playlists.json`,

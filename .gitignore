@@ -11,3 +11,5 @@ android/.idea/
 *.keystore
 *.jks
 .DS_Store
+sonorus.db*
+covers/
