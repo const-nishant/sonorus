@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
@@ -82,7 +83,7 @@ fun AddToPlaylistDialog(
                         Row(
                             Modifier
                                 .fillMaxWidth()
-                                .clickable {
+                                .clickable(role = Role.Button) {
                                     actions.addToPlaylist(playlist.id, trackIds)
                                     onDismiss()
                                 }
@@ -105,7 +106,7 @@ fun AddToPlaylistDialog(
                 Row(
                     Modifier
                         .fillMaxWidth()
-                        .clickable { creating = true }
+                        .clickable(role = Role.Button) { creating = true }
                         .padding(vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {

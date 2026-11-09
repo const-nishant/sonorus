@@ -9,9 +9,12 @@ import dev.constnishant.sonorus.core.LibraryStatsInfo
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.SonorusRepository
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /** The sections of the Home screen. */
@@ -36,6 +39,11 @@ class HomeViewModel(
     /** The Home sections, or the reason they could not be loaded. */
     val state: StateFlow<LoadState<HomeData>> = _state.asStateFlow()
 
+    /** True while a library scan runs; drives the pull-to-refresh indicator. */
+    val scanning: StateFlow<Boolean> = repository.events.scan
+        .map { it.running }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, repository.events.scan.value.running)
+
     init {
         viewModelScope.launch {
             repository.libraryChangeSignals().collectLatest {
@@ -51,5 +59,10 @@ class HomeViewModel(
                 }
             }
         }
+    }
+
+    /** Starts an incremental library scan, the same one Settings starts. */
+    fun refresh() {
+        repository.startScan()
     }
 }

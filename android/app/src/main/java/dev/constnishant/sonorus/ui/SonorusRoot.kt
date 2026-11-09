@@ -1,7 +1,18 @@
 package dev.constnishant.sonorus.ui
 
 import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Home
@@ -55,6 +66,12 @@ private val TopLevelTabs = listOf(
     TopLevelTab(Routes.SEARCH, R.string.nav_search, Icons.Rounded.Search),
 )
 
+/** Timing of screen-to-screen transitions. */
+private fun <T> navMotion() = tween<T>(durationMillis = 250, easing = FastOutSlowInEasing)
+
+/** Timing of Now Playing rising and falling. */
+private fun <T> sheetMotion() = tween<T>(durationMillis = 350, easing = FastOutSlowInEasing)
+
 /** Navigation arguments for the detail routes: a single non-null library id. */
 private val IdArgs = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType })
 
@@ -70,6 +87,11 @@ fun SonorusRoot() {
     val repository = LocalContext.current.repository
     val navController = rememberNavController()
     val playback by repository.events.playback.collectAsStateWithLifecycle()
+    // The last loaded playback, so the mini player keeps its content while it slides out.
+    var shownPlayback by remember { mutableStateOf(playback) }
+    LaunchedEffect(playback) {
+        if (playback.track != null) shownPlayback = playback
+    }
     val backStackEntry by navController.currentBackStackEntryAsState()
     val destination = backStackEntry?.destination
     val showChrome = destination?.route != Routes.NOW_PLAYING && destination?.route != Routes.SETTINGS
@@ -88,18 +110,25 @@ fun SonorusRoot() {
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
+        // Screens handle the status bar themselves; this Scaffold only reserves the bottom bar.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             if (showChrome) {
                 Column {
-                    if (playback.track != null) {
+                    AnimatedVisibility(
+                        visible = playback.track != null,
+                        enter = slideInVertically { it } + fadeIn(),
+                        exit = slideOutVertically { it } + fadeOut(),
+                    ) {
                         MiniPlayer(
-                            playback = playback,
+                            playback = shownPlayback,
                             onOpen = { navController.navigate(Routes.NOW_PLAYING) },
                             onPlayPause = {
                                 val pause = playback.state.showsPause()
                                 repository.command { if (pause) it.pause() else it.play() }
                             },
                             onNext = { repository.command { it.next() } },
+                            onPrevious = { repository.command { it.previous() } },
                         )
                     }
                     NavigationBar {
@@ -130,7 +159,12 @@ fun SonorusRoot() {
         NavHost(
             navController = navController,
             startDestination = Routes.HOME,
-            modifier = Modifier.padding(innerPadding),
+            modifier = Modifier.padding(innerPadding).consumeWindowInsets(innerPadding),
+            // Shared-axis style: the new screen slides in a little from the side while fading in.
+            enterTransition = { slideInHorizontally(navMotion()) { it / 10 } + fadeIn(navMotion()) },
+            exitTransition = { fadeOut(navMotion()) },
+            popEnterTransition = { fadeIn(navMotion()) },
+            popExitTransition = { slideOutHorizontally(navMotion()) { it / 10 } + fadeOut(navMotion()) },
         ) {
             composable(Routes.HOME) {
                 HomeScreen(
@@ -171,7 +205,14 @@ fun SonorusRoot() {
                     onBack = { navController.popBackStack() },
                 )
             }
-            composable(Routes.NOW_PLAYING) {
+            composable(
+                Routes.NOW_PLAYING,
+                // Now Playing rises from the mini player and drops back down when closed.
+                enterTransition = { slideInVertically(sheetMotion()) { it } },
+                exitTransition = { fadeOut(navMotion()) },
+                popEnterTransition = { fadeIn(navMotion()) },
+                popExitTransition = { slideOutVertically(sheetMotion()) { it } },
+            ) {
                 NowPlayingScreen(
                     onBack = { navController.popBackStack() },
                     onAlbum = { navController.navigate(Routes.album(it)) },

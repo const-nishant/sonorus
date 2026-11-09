@@ -32,12 +32,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -76,6 +78,7 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val configured by repository.configured.collectAsStateWithLifecycle()
+    val scanning by viewModel.scanning.collectAsStateWithLifecycle()
     val currentId by rememberCurrentTrackId()
 
     Scaffold(
@@ -91,42 +94,47 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
             )
         },
     ) { padding ->
-        when (val s = state) {
-            LoadState.Loading -> LoadingContent(Modifier.padding(padding))
-            is LoadState.Failed -> CenteredContent(Modifier.padding(padding)) {
-                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.home_load_failed), s.message)
-            }
-            is LoadState.Ready -> {
-                val data = s.value
-                if (data.isEmpty) {
-                    CenteredContent(Modifier.padding(padding)) {
-                        if (configured) {
-                            EmptyState(
-                                icon = Icons.Rounded.LibraryMusic,
-                                title = stringResource(R.string.home_empty_title),
-                                message = stringResource(R.string.scan_bucket_hint),
-                                action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
-                            )
-                        } else {
-                            EmptyState(
-                                icon = Icons.Rounded.Cloud,
-                                title = stringResource(R.string.home_connect_title),
-                                message = stringResource(R.string.home_connect_message),
-                                action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
-                            )
+        PullToRefreshBox(
+            isRefreshing = scanning,
+            onRefresh = viewModel::refresh,
+            modifier = Modifier.padding(padding),
+        ) {
+            when (val s = state) {
+                LoadState.Loading -> LoadingContent()
+                is LoadState.Failed -> CenteredContent {
+                    EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.home_load_failed), s.message)
+                }
+                is LoadState.Ready -> {
+                    val data = s.value
+                    if (data.isEmpty) {
+                        CenteredContent {
+                            if (configured) {
+                                EmptyState(
+                                    icon = Icons.Rounded.LibraryMusic,
+                                    title = stringResource(R.string.home_empty_title),
+                                    message = stringResource(R.string.scan_bucket_hint),
+                                    action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
+                                )
+                            } else {
+                                EmptyState(
+                                    icon = Icons.Rounded.Cloud,
+                                    title = stringResource(R.string.home_connect_title),
+                                    message = stringResource(R.string.home_connect_message),
+                                    action = { Button(onClick = onOpenSettings) { Text(stringResource(R.string.action_open_settings)) } },
+                                )
+                            }
                         }
+                    } else {
+                        HomeContent(
+                            data = data,
+                            currentId = currentId,
+                            onAlbum = onAlbum,
+                            onPlayTrack = { index ->
+                                val ids = data.recentTracks.map { it.id }
+                                repository.command { core -> core.playTracks(ids, index.toUInt()) }
+                            },
+                        )
                     }
-                } else {
-                    HomeContent(
-                        data = data,
-                        currentId = currentId,
-                        onAlbum = onAlbum,
-                        onPlayTrack = { index ->
-                            val ids = data.recentTracks.map { it.id }
-                            repository.command { core -> core.playTracks(ids, index.toUInt()) }
-                        },
-                        modifier = Modifier.padding(padding),
-                    )
                 }
             }
         }
@@ -227,7 +235,7 @@ private fun AlbumRow(albums: List<AlbumInfo>, onAlbum: (Long) -> Unit) {
 /** A small square cover with the track title, for the "Recently played" shelf. */
 @Composable
 private fun RecentTrackCard(track: TrackInfo, isCurrent: Boolean, onClick: () -> Unit) {
-    Column(Modifier.width(120.dp).clickable(onClick = onClick)) {
+    Column(Modifier.width(120.dp).clickable(role = Role.Button, onClick = onClick)) {
         Artwork(
             path = track.coverPath,
             contentDescription = track.album,

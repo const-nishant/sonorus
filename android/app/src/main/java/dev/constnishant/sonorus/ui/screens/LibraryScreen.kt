@@ -2,21 +2,33 @@
 
 package dev.constnishant.sonorus.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.Sort
@@ -41,18 +53,30 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -75,6 +99,7 @@ import dev.constnishant.sonorus.ui.components.PlaylistNameDialog
 import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.tracksText
+import kotlinx.coroutines.launch
 
 private val LIBRARY_TABS = listOf(
     R.string.library_tab_albums,
@@ -82,9 +107,15 @@ private val LIBRARY_TABS = listOf(
     R.string.library_tab_playlists,
 )
 
+/** Artists lists longer than this get the A–Z index. */
+private const val FAST_SCROLL_MIN_ARTISTS = 30
+
+/** The index letters, top to bottom: '#' for names that do not start with a letter, then A to Z. */
+private val FAST_SCROLL_LETTERS: List<Char> = listOf('#') + ('A'..'Z').toList()
+
 /**
- * The Library screen with three tabs: albums (sortable grid), artists, and playlists. Playlists
- * can be created from the floating button and renamed or deleted from each row's menu.
+ * The Library screen with three swipeable tabs: albums (sortable grid), artists, and playlists, which
+ * can be created, renamed and deleted. Pulling down starts a library scan.
  *
  * @param onAlbum opens an album.
  * @param onArtist opens an artist.
@@ -106,7 +137,11 @@ fun LibraryScreen(
     val sort by viewModel.sort.collectAsStateWithLifecycle()
     val artists by viewModel.artists.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
-    var tab by rememberSaveable { mutableIntStateOf(0) }
+    val scanning by viewModel.scanning.collectAsStateWithLifecycle()
+    var savedPage by rememberSaveable { mutableIntStateOf(0) }
+    val pagerState = rememberPagerState(initialPage = savedPage, pageCount = { LIBRARY_TABS.size })
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(pagerState.currentPage) { savedPage = pagerState.currentPage }
     var creating by rememberSaveable { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<PlaylistInfo?>(null) }
     var deleting by remember { mutableStateOf<PlaylistInfo?>(null) }
@@ -115,7 +150,7 @@ fun LibraryScreen(
         modifier = modifier,
         topBar = { TopAppBar(title = { Text(stringResource(R.string.library_title)) }) },
         floatingActionButton = {
-            if (tab == 2) {
+            if (pagerState.currentPage == 2) {
                 FloatingActionButton(onClick = { creating = true }) {
                     Icon(Icons.Rounded.Add, contentDescription = stringResource(R.string.cd_new_playlist))
                 }
@@ -123,29 +158,40 @@ fun LibraryScreen(
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            PrimaryTabRow(selectedTabIndex = tab) {
+            PrimaryTabRow(selectedTabIndex = pagerState.currentPage) {
                 LIBRARY_TABS.forEachIndexed { index, title ->
                     Tab(
-                        selected = tab == index,
-                        onClick = { tab = index },
+                        selected = pagerState.currentPage == index,
+                        onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
                         text = { Text(stringResource(title)) },
                     )
                 }
             }
-            when (tab) {
-                0 -> AlbumsTab(
-                    state = albums,
-                    sort = sort,
-                    onSort = viewModel::setSort,
-                    onAlbum = onAlbum,
-                )
-                1 -> ArtistsTab(state = artists, onArtist = onArtist)
-                else -> PlaylistsTab(
-                    state = playlists,
-                    onPlaylist = onPlaylist,
-                    onRename = { renaming = it },
-                    onDelete = { deleting = it },
-                )
+            PullToRefreshBox(
+                isRefreshing = scanning,
+                onRefresh = viewModel::refresh,
+                modifier = Modifier.weight(1f),
+            ) {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxSize(),
+                ) { page ->
+                    when (page) {
+                        0 -> AlbumsTab(
+                            state = albums,
+                            sort = sort,
+                            onSort = viewModel::setSort,
+                            onAlbum = onAlbum,
+                        )
+                        1 -> ArtistsTab(state = artists, onArtist = onArtist)
+                        else -> PlaylistsTab(
+                            state = playlists,
+                            onPlaylist = onPlaylist,
+                            onRename = { renaming = it },
+                            onDelete = { deleting = it },
+                        )
+                    }
+                }
             }
         }
     }
@@ -268,9 +314,13 @@ private fun SortMenu(sort: AlbumSort, onSort: (AlbumSort) -> Unit) {
     }
 }
 
-/** The Artists tab: one row per artist with album and track counts. */
+/**
+ * The Artists tab: one row per artist with album and track counts. Lists longer than
+ * [FAST_SCROLL_MIN_ARTISTS] get an A–Z index along the end edge.
+ */
 @Composable
 private fun ArtistsTab(state: LoadState<List<ArtistInfo>>, onArtist: (Long) -> Unit) {
+    val listState = rememberLazyListState()
     when (state) {
         LoadState.Loading -> LoadingContent()
         is LoadState.Failed -> CenteredContent {
@@ -285,21 +335,142 @@ private fun ArtistsTab(state: LoadState<List<ArtistInfo>>, onArtist: (Long) -> U
                 )
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                items(state.value, key = { it.id }) { artist ->
-                    ListItem(
-                        modifier = Modifier.clickable { onArtist(artist.id) },
-                        headlineContent = {
-                            Text(artist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        },
-                        supportingContent = {
-                            Text(albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()))
-                        },
-                        leadingContent = { Icon(Icons.Rounded.Person, contentDescription = null) },
-                    )
+            Box(Modifier.fillMaxSize()) {
+                LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                    items(state.value, key = { it.id }) { artist ->
+                        ListItem(
+                            modifier = Modifier.clickable(role = Role.Button) { onArtist(artist.id) },
+                            headlineContent = {
+                                Text(artist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            },
+                            supportingContent = {
+                                Text(albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()))
+                            },
+                            leadingContent = { Icon(Icons.Rounded.Person, contentDescription = null) },
+                        )
+                    }
+                }
+                if (state.value.size > FAST_SCROLL_MIN_ARTISTS) {
+                    FastScrollIndex(names = state.value.map { it.name }, listState = listState)
                 }
             }
         }
+    }
+}
+
+/**
+ * The A–Z index along the end edge of the artists list. Tapping or dragging a letter scrolls to the
+ * first artist for it, and a bubble shows the letter while dragging.
+ */
+@Composable
+private fun BoxScope.FastScrollIndex(names: List<String>, listState: LazyListState) {
+    val scope = rememberCoroutineScope()
+    val haptics = LocalHapticFeedback.current
+    val label = stringResource(R.string.cd_fast_scroll)
+    var shown by remember { mutableStateOf<Char?>(null) }
+    var dragging by remember { mutableStateOf(false) }
+    var stripHeight by remember { mutableIntStateOf(0) }
+
+    fun letterAt(y: Float): Char {
+        if (stripHeight <= 0) return FAST_SCROLL_LETTERS.first()
+        val cell = stripHeight / FAST_SCROLL_LETTERS.size.toFloat()
+        return FAST_SCROLL_LETTERS[(y / cell).toInt().coerceIn(0, FAST_SCROLL_LETTERS.lastIndex)]
+    }
+
+    fun select(letter: Char, force: Boolean) {
+        if (letter == shown && !force) return
+        if (letter != shown) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        shown = letter
+        val index = artistLetterIndex(names, letter)
+        if (index >= 0) scope.launch { listState.scrollToItem(index) }
+    }
+
+    val stripWidth = 24.dp
+    val bubbleSize = 56.dp
+    shown?.takeIf { dragging }?.let { letter ->
+        Box(
+            Modifier
+                .align(Alignment.TopEnd)
+                .offset {
+                    val cell = stripHeight / FAST_SCROLL_LETTERS.size
+                    val index = FAST_SCROLL_LETTERS.indexOf(letter).coerceAtLeast(0)
+                    IntOffset(
+                        x = -(stripWidth + 8.dp + bubbleSize).roundToPx(),
+                        y = (index * cell + cell / 2 - bubbleSize.roundToPx() / 2).coerceAtLeast(0),
+                    )
+                }
+                .size(bubbleSize)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                letter.toString(),
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
+    }
+
+    Column(
+        Modifier
+            .align(Alignment.TopEnd)
+            .fillMaxHeight()
+            .width(stripWidth)
+            .onSizeChanged { stripHeight = it.height }
+            .semantics { contentDescription = label }
+            .pointerInput(names) {
+                detectTapGestures { offset -> select(letterAt(offset.y), force = true) }
+            }
+            .pointerInput(names) {
+                detectVerticalDragGestures(
+                    onDragStart = { offset ->
+                        dragging = true
+                        select(letterAt(offset.y), force = true)
+                    },
+                    onVerticalDrag = { change, _ ->
+                        change.consume()
+                        select(letterAt(change.position.y), force = false)
+                    },
+                    onDragEnd = { dragging = false },
+                    onDragCancel = { dragging = false },
+                )
+            },
+    ) {
+        FAST_SCROLL_LETTERS.forEach { letter ->
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    letter.toString(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The index of the first artist for [letter] in [names] (already in the core's sort order). '#'
+ * matches the first artist whose name does not start with a letter. A letter with no artists falls
+ * back to the next letter that has some. Returns -1 when there is nothing to jump to.
+ */
+private fun artistLetterIndex(names: List<String>, letter: Char): Int {
+    val exact = names.indexOfFirst { artistIndexLetter(it) == letter }
+    if (exact >= 0 || letter == '#') return exact
+    return names.indexOfFirst { artistIndexLetter(it) > letter }
+}
+
+/**
+ * The index letter of an artist name: its first character upper-cased when it is an ASCII letter,
+ * otherwise '#'. Matches the core's `ORDER BY name COLLATE NOCASE`, which folds ASCII case only and
+ * does not skip a leading "The".
+ */
+private fun artistIndexLetter(name: String): Char {
+    val first = name.firstOrNull() ?: return '#'
+    return when (first) {
+        in 'a'..'z' -> first.uppercaseChar()
+        in 'A'..'Z' -> first
+        else -> '#'
     }
 }
 
@@ -349,7 +520,7 @@ private fun PlaylistRow(
 ) {
     var open by remember { mutableStateOf(false) }
     ListItem(
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier.clickable(role = Role.Button, onClick = onClick),
         leadingContent = {
             Artwork(
                 path = playlist.coverPath,

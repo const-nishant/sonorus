@@ -2,10 +2,14 @@
 
 package dev.constnishant.sonorus.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -27,10 +31,16 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -43,11 +53,14 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.AlbumCard
+import dev.constnishant.sonorus.ui.components.Artwork
 import dev.constnishant.sonorus.ui.components.BackButton
 import dev.constnishant.sonorus.ui.components.CenteredContent
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.albumsText
+import dev.constnishant.sonorus.ui.components.animatedDominant
+import dev.constnishant.sonorus.ui.components.rememberArtworkColors
 import dev.constnishant.sonorus.ui.components.tracksText
 
 /**
@@ -74,6 +87,10 @@ fun ArtistScreen(artistId: Long, onAlbum: (Long) -> Unit, onBack: () -> Unit, mo
             TopAppBar(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { BackButton(onBack) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent,
+                    scrolledContainerColor = MaterialTheme.colorScheme.surface,
+                ),
             )
         },
     ) { padding ->
@@ -101,6 +118,9 @@ private fun ArtistContent(
     modifier: Modifier = Modifier,
 ) {
     val artist = data.artist
+    val dominant by rememberArtworkColors(data.albums.firstOrNull()?.coverPath)
+        .animatedDominant(MaterialTheme.colorScheme.surfaceVariant)
+    val covers = remember(data.albums) { data.albums.mapNotNull { it.coverPath }.distinct().take(4) }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(150.dp),
         modifier = modifier.fillMaxSize(),
@@ -109,7 +129,16 @@ private fun ArtistContent(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item(key = "header", span = { GridItemSpan(maxLineSpan) }) {
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Brush.verticalGradient(listOf(dominant.copy(alpha = 0.7f), dominant.copy(alpha = 0f)))),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                if (covers.isNotEmpty()) {
+                    ArtistCollage(covers = covers)
+                    Spacer(Modifier.height(12.dp))
+                }
                 Text(
                     albumsText(artist.albumCount.toInt()) + " · " + tracksText(artist.trackCount.toInt()),
                     style = MaterialTheme.typography.bodyMedium,
@@ -139,4 +168,46 @@ private fun ArtistContent(
             AlbumCard(album = album, onClick = { onAlbum(album.id) })
         }
     }
+}
+
+/**
+ * A collage of up to four album covers of the artist in a 160dp box with the extra-large corner
+ * radius. One cover fills the box; two split left and right; three put one cover on the left and
+ * two stacked on the right; four form a 2×2 grid. [covers] must not be empty.
+ */
+@Composable
+private fun ArtistCollage(covers: List<String>, modifier: Modifier = Modifier) {
+    val gap = 2.dp
+    Box(modifier.size(160.dp).clip(MaterialTheme.shapes.extraLarge)) {
+        when (covers.size) {
+            1 -> CollageCover(covers[0], Modifier.fillMaxSize())
+            2 -> Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+                CollageCover(covers[0], Modifier.weight(1f).fillMaxHeight())
+                CollageCover(covers[1], Modifier.weight(1f).fillMaxHeight())
+            }
+            3 -> Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+                CollageCover(covers[0], Modifier.weight(1f).fillMaxHeight())
+                Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(gap)) {
+                    CollageCover(covers[1], Modifier.weight(1f).fillMaxWidth())
+                    CollageCover(covers[2], Modifier.weight(1f).fillMaxWidth())
+                }
+            }
+            else -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(gap)) {
+                Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+                    CollageCover(covers[0], Modifier.weight(1f).fillMaxHeight())
+                    CollageCover(covers[1], Modifier.weight(1f).fillMaxHeight())
+                }
+                Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+                    CollageCover(covers[2], Modifier.weight(1f).fillMaxHeight())
+                    CollageCover(covers[3], Modifier.weight(1f).fillMaxHeight())
+                }
+            }
+        }
+    }
+}
+
+/** One square-cornered cover of [ArtistCollage]. */
+@Composable
+private fun CollageCover(path: String, modifier: Modifier) {
+    Artwork(path = path, contentDescription = null, modifier = modifier, shape = RectangleShape)
 }

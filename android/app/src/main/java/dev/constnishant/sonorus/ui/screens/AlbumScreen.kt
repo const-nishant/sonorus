@@ -2,6 +2,7 @@
 
 package dev.constnishant.sonorus.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -26,12 +27,16 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,9 +58,11 @@ import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.PinUi
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
+import dev.constnishant.sonorus.ui.components.animatedDominant
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.isHiRes
 import dev.constnishant.sonorus.ui.components.qualityLabel
+import dev.constnishant.sonorus.ui.components.rememberArtworkColors
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 import dev.constnishant.sonorus.ui.components.rememberTrackActions
 import dev.constnishant.sonorus.ui.components.songsText
@@ -89,6 +96,10 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
             TopAppBar(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { BackButton(onBack) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent,
+                    scrolledContainerColor = MaterialTheme.colorScheme.surface,
+                ),
             )
         },
     ) { padding ->
@@ -131,12 +142,15 @@ private fun AlbumContent(
     val tracks = data.tracks
     val multiDisc = tracks.mapNotNull { it.discNo }.distinct().size > 1
     val first = tracks.firstOrNull()
+    val dominant by rememberArtworkColors(album.coverPath)
+        .animatedDominant(MaterialTheme.colorScheme.surfaceVariant)
 
     LazyColumn(modifier.fillMaxSize()) {
         item(key = "header") {
             Column(
                 Modifier
                     .fillMaxWidth()
+                    .background(Brush.verticalGradient(listOf(dominant.copy(alpha = 0.7f), dominant.copy(alpha = 0f))))
                     .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -158,7 +172,7 @@ private fun AlbumContent(
                     color = MaterialTheme.colorScheme.primary,
                     textAlign = TextAlign.Center,
                     modifier = Modifier
-                        .clickable { onArtist(album.artistId) }
+                        .clickable(role = Role.Button) { onArtist(album.artistId) }
                         .padding(vertical = 4.dp),
                 )
                 Text(

@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.constnishant.sonorus.core.AlbumInfo
@@ -28,7 +29,7 @@ fun AlbumCard(
     modifier: Modifier = Modifier,
 ) {
     val subtitle = listOfNotNull(album.artist, album.year?.toString()).joinToString(" · ")
-    Column(modifier.clickable(onClick = onClick)) {
+    Column(modifier.clickable(role = Role.Button, onClick = onClick)) {
         Artwork(
             path = album.coverPath,
             contentDescription = album.title,

@@ -16,9 +16,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** How long an undo waits for the core to report a re-added queue entry. */
+private const val RESTORE_TIMEOUT_MS = 5_000L
 
 /** A favorite flag the user set for [trackId], shown until the track changes. */
 data class FavoriteOverride(val trackId: Long, val favorite: Boolean)
@@ -118,6 +123,27 @@ class NowPlayingViewModel(
     fun moveInQueue(entryId: ULong, toIndex: Int) {
         val to = toIndex.toUInt()
         repository.command { it.moveInQueue(entryId, to) }
+    }
+
+    /**
+     * Puts [trackId] back in the queue at [index] after a removal was undone. The core only adds to
+     * the end, so the new entry is found in the queue state and then moved to [index].
+     */
+    fun restoreToQueue(trackId: Long, index: Int) {
+        viewModelScope.launch {
+            val known = playback.value.queue.map { it.entryId }.toSet()
+            try {
+                repository.call { it.append(listOf(trackId)) }
+            } catch (e: CoreException) {
+                repository.events.emitError(e.userMessage(context, R.string.error_generic))
+                return@launch
+            }
+            val added = withTimeoutOrNull(RESTORE_TIMEOUT_MS) {
+                playback.first { state -> state.queue.any { it.entryId !in known } }
+                    .queue.last { it.entryId !in known }
+            } ?: return@launch
+            moveInQueue(added.entryId, index)
+        }
     }
 
     /**

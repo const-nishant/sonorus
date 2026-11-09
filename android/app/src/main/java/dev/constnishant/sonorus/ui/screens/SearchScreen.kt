@@ -39,6 +39,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -201,7 +202,7 @@ private fun SearchResults(
             item(key = "artists-title") { SectionTitle(stringResource(R.string.section_artists)) }
             items(result.artists, key = { "artist-${it.id}" }) { artist ->
                 ListItem(
-                    modifier = Modifier.clickable { onArtist(artist.id) },
+                    modifier = Modifier.clickable(role = Role.Button) { onArtist(artist.id) },
                     headlineContent = {
                         Text(artist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     },

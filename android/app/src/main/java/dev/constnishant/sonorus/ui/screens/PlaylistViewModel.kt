@@ -119,6 +119,19 @@ class PlaylistViewModel(
         }
     }
 
+    /**
+     * Puts [trackId] back at [position] after a removal was undone. The core only adds to the end,
+     * so the track is appended and then moved to [position].
+     */
+    fun restoreToPlaylist(trackId: Long, position: UInt) {
+        repository.command { core ->
+            core.addToPlaylist(playlistId, listOf(trackId))
+            val last = core.playlistEntries(playlistId).lastIndex.toUInt()
+            core.moveInPlaylist(playlistId, last, position)
+            repository.notifyLibraryChanged()
+        }
+    }
+
     /** Renames the playlist to [name]. */
     fun rename(name: String) {
         repository.command { core ->

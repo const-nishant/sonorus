@@ -9,10 +9,13 @@ import dev.constnishant.sonorus.core.ArtistInfo
 import dev.constnishant.sonorus.core.PlaylistInfo
 import dev.constnishant.sonorus.data.SonorusRepository
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
@@ -44,6 +47,11 @@ class LibraryViewModel(
     /** All playlists. */
     val playlists: StateFlow<LoadState<List<PlaylistInfo>>> = _playlists.asStateFlow()
 
+    /** True while a library scan runs; drives the pull-to-refresh indicator. */
+    val scanning: StateFlow<Boolean> = repository.events.scan
+        .map { it.running }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, repository.events.scan.value.running)
+
     init {
         viewModelScope.launch {
             combine(_sort, repository.libraryChangeSignals()) { sort, _ -> sort }
@@ -62,6 +70,11 @@ class LibraryViewModel(
     /** Changes the album sort order and reloads the albums. */
     fun setSort(sort: AlbumSort) {
         _sort.value = sort
+    }
+
+    /** Starts an incremental library scan, the same one Settings starts. */
+    fun refresh() {
+        repository.startScan()
     }
 
     /** Creates an empty playlist called [name]. */

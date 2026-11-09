@@ -14,12 +14,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
-import androidx.compose.material.icons.rounded.ArrowDownward
-import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DragHandle
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.MoreVert
@@ -37,16 +37,27 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -68,17 +79,22 @@ import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.PinUi
 import dev.constnishant.sonorus.ui.components.PlaylistNameDialog
+import dev.constnishant.sonorus.ui.components.SwipeRemoveBox
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.rememberCurrentTrackId
 import dev.constnishant.sonorus.ui.components.rememberTrackActions
 import dev.constnishant.sonorus.ui.components.songsText
+import kotlinx.coroutines.launch
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
 
 /**
  * The Playlist screen. Lists the entries in order: catalogued tracks play from that entry on;
- * entries whose track is missing from the library are shown as unavailable. Each entry's menu
- * can remove it or move it up or down. The top bar menu renames or deletes the playlist.
+ * entries whose track is missing from the library are shown as unavailable. Long-pressing an entry
+ * or dragging its handle reorders the playlist, and swiping an entry to the start removes it with
+ * an undo message. The top bar menu renames or deletes the playlist.
  *
  * @param playlistId the playlist to show.
  * @param onBack leaves the screen (also after the playlist is deleted).
@@ -97,6 +113,9 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
     val currentId by rememberCurrentTrackId()
     val actions = rememberTrackActions()
     val data = (state as? LoadState.Ready)?.value
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val undoLabel = stringResource(R.string.action_undo)
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
@@ -142,6 +161,7 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
                 },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         when (val s = state) {
             LoadState.Loading -> LoadingContent(Modifier.padding(padding))
@@ -156,6 +176,18 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
                 onPlayFrom = viewModel::playFrom,
                 onRemove = viewModel::remove,
                 onMove = viewModel::move,
+                onSwipeRemoved = { message, trackId, position ->
+                    scope.launch {
+                        val result = snackbarHostState.showSnackbar(
+                            message = message,
+                            actionLabel = if (trackId != null) undoLabel else null,
+                            duration = SnackbarDuration.Long,
+                        )
+                        if (result == SnackbarResult.ActionPerformed && trackId != null) {
+                            viewModel.restoreToPlaylist(trackId, position.toUInt())
+                        }
+                    }
+                },
                 pin = pin,
                 downloads = downloads,
                 onSetPinned = viewModel::setPinned,
@@ -191,7 +223,30 @@ fun PlaylistScreen(playlistId: Long, onBack: () -> Unit, modifier: Modifier = Mo
     }
 }
 
-/** The loaded playlist: header with Play / Shuffle, then the entries. */
+/**
+ * A playlist entry as the list shows it. [key] stays the same while the entry is moved, and is
+ * unique even when the same track appears more than once.
+ */
+private data class EntryRow(val key: String, val entry: PlaylistEntryInfo)
+
+/**
+ * The entries with keys built from the track key and the occurrence number of that track, so
+ * duplicate tracks get distinct keys.
+ */
+private fun List<PlaylistEntryInfo>.withRowKeys(): List<EntryRow> {
+    val seen = HashMap<String, Int>()
+    return map { entry ->
+        val occurrence = (seen[entry.trackKey] ?: 0) + 1
+        seen[entry.trackKey] = occurrence
+        EntryRow("${entry.trackKey}#$occurrence", entry)
+    }
+}
+
+/**
+ * The loaded playlist: header with Play / Shuffle, then the entries. The entries are reordered
+ * live while dragging and sent to the core once when the drag ends. A swipe removes an entry at
+ * once and reports it through [onSwipeRemoved] so the screen can offer undo.
+ */
 @Composable
 private fun PlaylistContent(
     data: PlaylistData,
@@ -201,16 +256,52 @@ private fun PlaylistContent(
     onPlayFrom: (UInt) -> Unit,
     onRemove: (UInt) -> Unit,
     onMove: (UInt, UInt) -> Unit,
+    onSwipeRemoved: (message: String, trackId: Long?, position: Int) -> Unit,
     pin: PinUi,
     downloads: DownloadsUi,
     onSetPinned: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val playlist = data.playlist
-    val entries = data.entries
-    val lastIndex = entries.lastIndex
+    val listState = rememberLazyListState()
+    val haptics = LocalHapticFeedback.current
+    // The rows shown and reordered live. They follow the core except while a drag is in progress.
+    var rows by remember { mutableStateOf(data.entries.withRowKeys()) }
+    var dragging by remember { mutableStateOf(false) }
+    var draggedKey by remember { mutableStateOf<String?>(null) }
+    var dragOrigin by remember { mutableIntStateOf(-1) }
 
-    LazyColumn(modifier.fillMaxSize()) {
+    LaunchedEffect(data.entries) {
+        if (!dragging) rows = data.entries.withRowKeys()
+    }
+
+    val reorderState = rememberReorderableLazyListState(listState) { from, to ->
+        val fromIndex = rows.indexOfFirst { it.key == from.key }
+        val toIndex = rows.indexOfFirst { it.key == to.key }
+        if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
+            rows = rows.toMutableList().apply { add(toIndex, removeAt(fromIndex)) }
+            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+    }
+
+    fun startDrag(key: String) {
+        dragging = true
+        draggedKey = key
+        dragOrigin = rows.indexOfFirst { it.key == key }
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    fun finishDrag() {
+        dragging = false
+        val key = draggedKey ?: return
+        draggedKey = null
+        val to = rows.indexOfFirst { it.key == key }
+        if (dragOrigin >= 0 && to >= 0 && to != dragOrigin) {
+            onMove(dragOrigin.toUInt(), to.toUInt())
+        }
+    }
+
+    LazyColumn(modifier.fillMaxSize(), state = listState) {
         item(key = "header") {
             Column(
                 Modifier
@@ -224,12 +315,12 @@ private fun PlaylistContent(
                 )
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = { onPlayAll(false) }, enabled = entries.isNotEmpty()) {
+                    Button(onClick = { onPlayAll(false) }, enabled = data.entries.isNotEmpty()) {
                         Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                         Text(stringResource(R.string.action_play))
                     }
-                    OutlinedButton(onClick = { onPlayAll(true) }, enabled = entries.isNotEmpty()) {
+                    OutlinedButton(onClick = { onPlayAll(true) }, enabled = data.entries.isNotEmpty()) {
                         Icon(Icons.Rounded.Shuffle, contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                         Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                         Text(stringResource(R.string.action_shuffle))
@@ -239,7 +330,7 @@ private fun PlaylistContent(
                 DownloadStatusText(state = pin, downloads = downloads)
             }
         }
-        if (entries.isEmpty()) {
+        if (rows.isEmpty()) {
             item(key = "empty") {
                 EmptyState(
                     Icons.AutoMirrored.Rounded.QueueMusic,
@@ -248,64 +339,87 @@ private fun PlaylistContent(
                 )
             }
         }
-        itemsIndexed(entries, key = { _, entry -> "pos-${entry.position}" }) { index, entry ->
-            val canMoveUp = index > 0
-            val canMoveDown = index < lastIndex
-            val menu: @Composable ColumnScope.(() -> Unit) -> Unit = { dismiss ->
-                EntryMenuItems(
-                    canMoveUp = canMoveUp,
-                    canMoveDown = canMoveDown,
-                    onMoveUp = { onMove(entry.position, entries[index - 1].position) },
-                    onMoveDown = { onMove(entry.position, entries[index + 1].position) },
-                    onRemove = { onRemove(entry.position) },
-                    onDismiss = dismiss,
+        items(rows, key = { it.key }) { row ->
+            ReorderableItem(reorderState, key = row.key) { isDragging ->
+                val entry = row.entry
+                val track = entry.track
+                val removedMessage = stringResource(
+                    R.string.snackbar_removed,
+                    track?.title ?: entry.trackKey.substringAfterLast('/'),
                 )
-            }
-            val track = entry.track
-            if (track != null) {
-                TrackRow(
-                    track = track,
-                    onClick = { onPlayFrom(entry.position) },
-                    showArtwork = true,
-                    isCurrent = track.id == currentId,
-                    actions = actions,
-                    extraMenuItems = menu,
-                )
-            } else {
-                UnavailableEntry(entry = entry, menu = menu)
+                val menu: @Composable ColumnScope.(() -> Unit) -> Unit = { dismiss ->
+                    EntryMenuItems(
+                        onRemove = { onRemove(entry.position) },
+                        onDismiss = dismiss,
+                    )
+                }
+                SwipeRemoveBox(
+                    onRemove = {
+                        val index = rows.indexOfFirst { it.key == row.key }.coerceAtLeast(0)
+                        rows = rows.filterNot { it.key == row.key }
+                        onRemove(index.toUInt())
+                        onSwipeRemoved(removedMessage, track?.id, index)
+                    },
+                ) {
+                    Surface(
+                        color = if (isDragging) {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        shadowElevation = if (isDragging) 8.dp else 0.dp,
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .longPressDraggableHandle(
+                                        onDragStarted = { startDrag(row.key) },
+                                        onDragStopped = { finishDrag() },
+                                    ),
+                            ) {
+                                if (track != null) {
+                                    TrackRow(
+                                        track = track,
+                                        onClick = { onPlayFrom(entry.position) },
+                                        showArtwork = true,
+                                        isCurrent = track.id == currentId,
+                                        actions = actions,
+                                        extraMenuItems = menu,
+                                    )
+                                } else {
+                                    UnavailableEntry(entry = entry, menu = menu)
+                                }
+                            }
+                            Box(
+                                Modifier
+                                    .size(48.dp)
+                                    .draggableHandle(
+                                        onDragStarted = { startDrag(row.key) },
+                                        onDragStopped = { finishDrag() },
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Rounded.DragHandle,
+                                    contentDescription = stringResource(R.string.cd_drag_to_reorder),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/** Playlist-specific menu items: move up, move down, remove. */
+/** Playlist-specific menu items: remove. Entries are reordered by dragging them. */
 @Composable
 private fun ColumnScope.EntryMenuItems(
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
     onRemove: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    DropdownMenuItem(
-        text = { Text(stringResource(R.string.action_move_up)) },
-        leadingIcon = { Icon(Icons.Rounded.ArrowUpward, contentDescription = null) },
-        enabled = canMoveUp,
-        onClick = {
-            onDismiss()
-            onMoveUp()
-        },
-    )
-    DropdownMenuItem(
-        text = { Text(stringResource(R.string.action_move_down)) },
-        leadingIcon = { Icon(Icons.Rounded.ArrowDownward, contentDescription = null) },
-        enabled = canMoveDown,
-        onClick = {
-            onDismiss()
-            onMoveDown()
-        },
-    )
     DropdownMenuItem(
         text = { Text(stringResource(R.string.action_remove_from_playlist)) },
         leadingIcon = { Icon(Icons.Rounded.RemoveCircleOutline, contentDescription = null) },
@@ -318,7 +432,7 @@ private fun ColumnScope.EntryMenuItems(
 
 /**
  * A playlist entry whose track is not in the library. Not tappable, but it keeps its menu so the
- * entry can still be moved or removed.
+ * entry can still be removed.
  */
 @Composable
 private fun UnavailableEntry(

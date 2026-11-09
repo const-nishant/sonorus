@@ -23,6 +23,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -111,7 +114,7 @@ fun SettingsScreen(onBack: () -> Unit, onUploads: () -> Unit, modifier: Modifier
             (slideInHorizontally { width -> sign * width / 8 } + fadeIn()) togetherWith
                 (slideOutHorizontally { width -> -sign * width / 8 } + fadeOut())
         },
-        modifier = modifier.fillMaxSize(),
+        modifier = modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
         label = "settings-page",
     ) { current ->
         when (current) {

@@ -1198,11 +1198,19 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   `SettingsGroupLabel`, `SettingsNote`, `SettingsStatus`. Disconnect now asks for confirmation.
 
 ## Phase 16 — UI/UX overhaul (artwork-tinted dark)
-- [ ] Single inset owner (fix double status-bar padding); palette-tinted gradients + blurred backdrop on Now Playing,
-  Album, Artist; Now Playing slide-up/swipe-down, swipe art to skip, haptics, landscape two-pane.
-- [ ] Mini player animation + swipe to skip; drag-to-reorder + swipe-to-remove (queue, playlists) with Undo;
-  swipeable Library tabs, A–Z fast scroll, pull-to-refresh → scan; artist cover collage.
-- [ ] Nav transitions; accessibility semantics. (Settings subpages done in Phase 15.)
+- [x] Single inset owner: root Scaffold `contentWindowInsets = WindowInsets(0)` + NavHost
+  `padding(innerPadding).consumeWindowInsets(innerPadding)`; Scaffold screens inset via TopAppBar, Settings and
+  Now Playing via `safeDrawing`. Dark `surface` = `background` (#0E1014) so lists and bars don't band.
+- [x] Artwork colors (`ui/components/ArtworkColors.kt`: palette-ktx 1.1.0 on a ~128 px decode, LRU(64), dominant
+  darkened to luminance ≤ 0.18, animated). Gradient on Now Playing (+ 48dp blurred cover backdrop), Album and Artist
+  headers, mini player tint.
+- [x] Now Playing: cover swipe to skip / swipe down to dismiss (axis locked after 16 px), top-bar drag to dismiss,
+  AnimatedContent play/pause, haptics, landscape two-pane. Mini player AnimatedVisibility + swipe to skip.
+- [x] Queue and playlist: drag to reorder (sh.calvin.reorderable 3.1.0, one move call on drop), swipe left to remove
+  with Undo (queue: append + move, new entry id; playlist: add + move). Library tabs on a HorizontalPager; A–Z fast
+  scroll on Artists (> 30, matches `COLLATE NOCASE`); pull-to-refresh on Home/Library starts a scan; artist collage.
+- [x] Nav transitions (slide+fade 250 ms; Now Playing slides up/down 350 ms); `Role.Button` on every clickable.
+  (Settings subpages done in Phase 15.)
 
 ## Phase 17 — Playback quality
 - [ ] Next-track prefetch (~20 s before end, fills the cache); gapless when formats match (same ring, no reopen).
