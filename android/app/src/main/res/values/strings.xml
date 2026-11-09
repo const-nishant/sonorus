@@ -53,6 +53,7 @@
     <string name="cd_remove_download">Remove download</string>
     <string name="cd_show_secret">Show secret</string>
     <string name="cd_hide_secret">Hide secret</string>
+    <string name="cd_sleep_timer">Sleep timer</string>
 
     <!-- Snackbars -->
     <string name="snackbar_removed">Removed “%1$s”</string>
@@ -189,6 +190,22 @@
     <string name="signal_device_with_id">%1$s (id %2$s)</string>
     <string name="signal_device_phone">Phone speaker/default</string>
     <string name="khz_unit">%1$s kHz</string>
+    <string name="signal_volume">Volume</string>
+    <string name="signal_volume_unchanged">Unchanged</string>
+    <string name="signal_replay_gain">ReplayGain %1$s</string>
+    <string name="signal_note_no_replay_gain">No ReplayGain for this song (no tags, or bit-perfect output).</string>
+
+    <!-- Sleep timer -->
+    <string name="sleep_timer_title">Sleep timer</string>
+    <plurals name="sleep_timer_minutes">
+        <item quantity="one">%1$d minute</item>
+        <item quantity="other">%1$d minutes</item>
+    </plurals>
+    <string name="sleep_timer_one_hour">1 hour</string>
+    <string name="sleep_timer_end_of_song">End of song</string>
+    <string name="sleep_timer_off">Turn off timer</string>
+    <string name="sleep_chip_in">Sleep in %1$s</string>
+    <string name="sleep_chip_end_of_song">Sleep after this song</string>
 
     <!-- Output sample formats -->
     <string name="sample_format_float">Float</string>
@@ -267,6 +284,15 @@
     <string name="settings_section_playback">Playback</string>
     <string name="settings_group_credentials">Credentials</string>
     <string name="settings_group_options">Options</string>
+    <string name="settings_group_volume">Volume leveling</string>
+    <string name="replaygain_title">ReplayGain</string>
+    <string name="replaygain_off">Off</string>
+    <string name="replaygain_track">Track</string>
+    <string name="replaygain_album">Album</string>
+    <string name="replaygain_summary">ReplayGain: %1$s</string>
+    <string name="replaygain_preamp">Pre-amp</string>
+    <string name="replaygain_note">Evens out loudness using the tags in your files. Only applies on the Float output — bit-perfect output is never changed. Applies from the next song.</string>
+    <string name="db_value">%1$s dB</string>
     <string name="output_format">Output format</string>
     <string name="output_current">Now</string>
     <string name="output_usb_dac">USB DAC</string>
@@ -347,6 +373,8 @@
     <string name="error_bucket_connect">Could not connect to the bucket.</string>
     <string name="error_bucket_store">Could not store the bucket settings securely.</string>
     <string name="error_save_bit_perfect">Could not save the bit-perfect setting.</string>
+    <string name="error_replay_gain_save">Could not save the ReplayGain setting.</string>
+    <string name="error_sleep_timer">Could not set the sleep timer.</string>
     <string name="error_output_settings">Could not change the output settings.</string>
     <string name="error_cache_save">Could not save the cache settings.</string>
     <string name="error_cache_clear">Could not clear the cache.</string>

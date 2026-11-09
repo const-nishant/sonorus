@@ -4,6 +4,7 @@ pub mod aaudio;
 pub mod cache;
 pub mod decoder;
 pub mod error;
+pub mod gain;
 pub mod opener;
 pub mod output;
 pub mod player;

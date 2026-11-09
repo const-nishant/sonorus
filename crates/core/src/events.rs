@@ -11,13 +11,14 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use sonorus_engine::player::{PlayerEvent, PlayerState};
+use sonorus_engine::player::{PlayerEvent, PlayerState, SleepTimer};
 use sonorus_library::Library;
 
-use crate::types::{CoreEvent, duration_ms, parse_track_id, player_event};
+use crate::types::{CoreEvent, SleepTimerInfo, duration_ms, parse_track_id, player_event};
 
 /// Name of the thread that receives player events.
 const EVENT_THREAD: &str = "sonorus-events";
@@ -68,6 +69,114 @@ impl ListenerSlot {
         if catch_unwind(AssertUnwindSafe(|| listener.on_event(event))).is_err() {
             log::error!("event listener panicked; the event was dropped");
         }
+    }
+}
+
+/// Player state the core keeps for its status getters: the gain of the current track and the
+/// sleep timer.
+///
+/// The event pump updates it from every player event before the event is forwarded. The sleep
+/// timer is also set by a request, before the request reaches the player; the player's next
+/// `SleepTimerChanged` event then confirms or replaces it, so the pump keeps it in step with the
+/// player.
+#[derive(Debug)]
+pub(crate) struct PlayerStatus {
+    /// Gain of the last `GainApplied`, in dB. `None` when no gain is applied.
+    replay_gain_db: Mutex<Option<f32>>,
+    /// The sleep timer. `At` holds the deadline.
+    sleep: Mutex<SleepTimer>,
+}
+
+impl Default for PlayerStatus {
+    fn default() -> Self {
+        Self {
+            replay_gain_db: Mutex::new(None),
+            sleep: Mutex::new(SleepTimer::Off),
+        }
+    }
+}
+
+impl PlayerStatus {
+    /// Updates the state from one player event. `now` is when the event was received, and anchors
+    /// the deadline of a timed sleep.
+    pub(crate) fn observe(&self, event: &PlayerEvent, now: Instant) {
+        match event {
+            PlayerEvent::GainApplied { db } => self.set_replay_gain_db(*db),
+            PlayerEvent::SleepTimerChanged {
+                remaining,
+                end_of_track,
+            } => self.set_sleep(timer_from_event(*remaining, *end_of_track, now)),
+            _ => {}
+        }
+    }
+
+    /// The gain of the current track in dB, `None` when no gain is applied.
+    pub(crate) fn replay_gain_db(&self) -> Option<f32> {
+        *lock(&self.replay_gain_db)
+    }
+
+    /// Sets the gain of the current track, `None` for no gain.
+    pub(crate) fn set_replay_gain_db(&self, db: Option<f32>) {
+        *lock(&self.replay_gain_db) = db;
+    }
+
+    /// Records a sleep timer request. The caller sends the same timer to the player.
+    pub(crate) fn request_sleep_timer(&self, timer: SleepTimer) {
+        self.set_sleep(timer);
+    }
+
+    /// The sleep timer a new player starts with. A timed sleep whose deadline has passed is
+    /// dropped (no player was running to pause when it passed) and reported as off from now on.
+    pub(crate) fn sleep_timer_for_new_player(&self, now: Instant) -> SleepTimer {
+        let mut timer = lock(&self.sleep);
+        *timer = live_timer(*timer, now);
+        *timer
+    }
+
+    /// The sleep timer for `SonorusCore::sleep_timer`. An expired timed sleep is dropped, as in
+    /// `sleep_timer_for_new_player`.
+    pub(crate) fn sleep_timer_info(&self, now: Instant) -> SleepTimerInfo {
+        let mut timer = lock(&self.sleep);
+        *timer = live_timer(*timer, now);
+        sleep_info(*timer, now)
+    }
+
+    fn set_sleep(&self, timer: SleepTimer) {
+        *lock(&self.sleep) = timer;
+    }
+}
+
+/// Locks `m`, recovering the value from a poisoned lock: the state is plain data.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The timer a player event describes: a timed sleep ends at `now` plus the remaining time.
+fn timer_from_event(remaining: Option<Duration>, end_of_track: bool, now: Instant) -> SleepTimer {
+    match (remaining, end_of_track) {
+        (Some(left), _) => SleepTimer::At(now + left),
+        (None, true) => SleepTimer::EndOfTrack,
+        (None, false) => SleepTimer::Off,
+    }
+}
+
+/// `timer`, or `Off` when it is a timed sleep whose deadline is at or before `now`.
+fn live_timer(timer: SleepTimer, now: Instant) -> SleepTimer {
+    match timer {
+        SleepTimer::At(deadline) if deadline <= now => SleepTimer::Off,
+        other => other,
+    }
+}
+
+/// The status view of `timer` at `now`: the time left on a timed sleep, and whether an
+/// end-of-track sleep is set.
+fn sleep_info(timer: SleepTimer, now: Instant) -> SleepTimerInfo {
+    SleepTimerInfo {
+        remaining_ms: match timer {
+            SleepTimer::At(deadline) => Some(duration_ms(deadline.saturating_duration_since(now))),
+            SleepTimer::Off | SleepTimer::EndOfTrack => None,
+        },
+        end_of_track: timer == SleepTimer::EndOfTrack,
     }
 }
 
@@ -162,12 +271,14 @@ pub(crate) fn spawn_pump(
     rx: Receiver<PlayerEvent>,
     library: Arc<Library>,
     listener: ListenerSlot,
+    status: Arc<PlayerStatus>,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(EVENT_THREAD.to_owned())
         .spawn(move || {
             let mut tracker = PlayTracker::default();
             for event in rx {
+                status.observe(&event, Instant::now());
                 match &event {
                     PlayerEvent::TrackChanged { track_id, .. } => {
                         record_finished_play(&library, tracker.finish());
@@ -376,6 +487,131 @@ mod tests {
         t.position(1, 900, Some(1_000));
         t.start(2);
         assert_eq!(t.finish(), None, "track 1 was dropped without accounting");
+    }
+
+    #[test]
+    fn sleep_timer_from_events_counts_down_and_clears() {
+        let status = PlayerStatus::default();
+        let t0 = Instant::now();
+        // The player reports a 60 s timed sleep: the deadline is 60 s after the report.
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: Some(Duration::from_secs(60)),
+                end_of_track: false,
+            },
+            t0,
+        );
+        let at = |secs: u64| status.sleep_timer_info(t0 + Duration::from_secs(secs));
+        assert_eq!(at(0).remaining_ms, Some(60_000));
+        assert_eq!(at(20).remaining_ms, Some(40_000));
+        assert!(!at(20).end_of_track);
+        assert_eq!(at(59).remaining_ms, Some(1_000));
+        // Past the deadline the timer is gone, and stays gone.
+        assert_eq!(at(61).remaining_ms, None);
+        assert_eq!(at(10).remaining_ms, None, "expired timer is not revived");
+
+        // The player fired a timer: nothing left to show.
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: false,
+            },
+            t0,
+        );
+        assert_eq!(
+            at(0),
+            SleepTimerInfo {
+                remaining_ms: None,
+                end_of_track: false
+            }
+        );
+    }
+
+    #[test]
+    fn end_of_track_sleep_is_reported_until_cleared() {
+        let status = PlayerStatus::default();
+        let now = Instant::now();
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: true,
+            },
+            now,
+        );
+        assert_eq!(
+            status.sleep_timer_info(now),
+            SleepTimerInfo {
+                remaining_ms: None,
+                end_of_track: true,
+            }
+        );
+        // The end-of-track timer fired: the event clears it.
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: false,
+            },
+            now,
+        );
+        assert!(!status.sleep_timer_info(now).end_of_track);
+    }
+
+    #[test]
+    fn request_then_player_confirmation_keeps_timer() {
+        let status = PlayerStatus::default();
+        let now = Instant::now();
+        // A request is recorded before the player's confirmation arrives.
+        status.request_sleep_timer(SleepTimer::At(now + Duration::from_secs(120)));
+        assert_eq!(status.sleep_timer_info(now).remaining_ms, Some(120_000));
+        // A stale clear from an earlier timer is followed by the confirmation of the new one.
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: false,
+            },
+            now,
+        );
+        status.observe(
+            &PlayerEvent::SleepTimerChanged {
+                remaining: Some(Duration::from_secs(120)),
+                end_of_track: false,
+            },
+            now,
+        );
+        assert_eq!(status.sleep_timer_info(now).remaining_ms, Some(120_000));
+    }
+
+    #[test]
+    fn new_player_drops_an_expired_timed_sleep() {
+        let status = PlayerStatus::default();
+        let now = Instant::now();
+        status.request_sleep_timer(SleepTimer::At(now + Duration::from_secs(5)));
+        assert_eq!(
+            status.sleep_timer_for_new_player(now),
+            SleepTimer::At(now + Duration::from_secs(5)),
+            "a live timer is handed to the new player"
+        );
+        let later = now + Duration::from_secs(6);
+        assert_eq!(status.sleep_timer_for_new_player(later), SleepTimer::Off);
+        assert_eq!(status.sleep_timer_info(later).remaining_ms, None);
+    }
+
+    #[test]
+    fn replay_gain_status_follows_gain_events() {
+        let status = PlayerStatus::default();
+        let now = Instant::now();
+        assert_eq!(status.replay_gain_db(), None);
+        status.observe(&PlayerEvent::GainApplied { db: Some(-4.5) }, now);
+        assert_eq!(status.replay_gain_db(), Some(-4.5));
+        status.observe(&PlayerEvent::GainApplied { db: None }, now);
+        assert_eq!(
+            status.replay_gain_db(),
+            None,
+            "a track with no gain clears it"
+        );
+        status.set_replay_gain_db(Some(1.0));
+        status.set_replay_gain_db(None);
+        assert_eq!(status.replay_gain_db(), None);
     }
 
     /// Counts the events it receives.

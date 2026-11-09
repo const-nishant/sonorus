@@ -6,7 +6,7 @@ use crate::opener::TrackRef;
 
 pub type EntryId = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueEntry {
     pub id: EntryId,
     pub track: TrackRef,
@@ -350,6 +350,7 @@ mod tests {
             id: format!("id{n}"),
             key: format!("music/{n}.flac"),
             size: u64::from(n),
+            gain: None,
         }
     }
 

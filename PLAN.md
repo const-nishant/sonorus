@@ -1213,9 +1213,17 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   (Settings subpages done in Phase 15.)
 
 ## Phase 17 — Playback quality
-- [ ] Next-track prefetch (~20 s before end, fills the cache); gapless when formats match (same ring, no reopen).
-- [ ] ReplayGain (tags → schema, F32 only, off on integer/bit-perfect paths; Off/Track/Album + preamp).
-- [ ] Sleep timer (minutes / end of track; fade-out in F32, pause on integer paths).
+- [x] Prefetch + gapless were already done in Phase 5 (preload 15 s before the end, same-format hand-off). Added a
+  bit-depth guard: `OutputSink::opened_kind()` reports the stream actually open, and a hand-off also needs
+  `lossless_for(kind, current_bits, next_bits)` (I16 never takes a 24-bit track; otherwise cold start).
+- [x] ReplayGain: library schema v5 (`rg_*` columns + `needs_reread` so the next scan re-reads tags; lofty maps ID3
+  TXXX). Engine `gain.rs` (`linear_gain`: Track/Album with fallback, preamp, peak limit, clamp 0..4) applied
+  decode-side per decoder (sample-exact at gapless boundaries) only when the open stream is F32; integer paths are
+  bit-identical. Core `setReplayGain` / `SignalPathInfo.replayGainDb`; Settings → Playback → Volume leveling; signal
+  path "Volume" row.
+- [x] Sleep timer: engine `SleepTimer { At, EndOfTrack }` (10 s linear fade via `RingStats.fade` on F32, pause on
+  integer; end of track suppresses the hand-off and loads the next entry paused). Core `setSleepTimer` /
+  `sleepTimer()` / `CoreEvent.SleepTimerChanged`; Now Playing bedtime button, picker sheet and countdown chip.
 
 ## Phase 18 — Lyrics
 - [ ] `.lrc` sidecars + embedded lyrics at scan; Rust LRC parser; `lyrics_synced`; Now Playing lyrics pane with

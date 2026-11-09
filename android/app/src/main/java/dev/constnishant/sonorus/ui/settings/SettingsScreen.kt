@@ -74,6 +74,7 @@ import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSampleFormat
+import dev.constnishant.sonorus.core.ReplayGainModeInfo
 import dev.constnishant.sonorus.core.ScanProgressInfo
 import dev.constnishant.sonorus.data.GIB
 import dev.constnishant.sonorus.data.ScanUi
@@ -82,6 +83,7 @@ import dev.constnishant.sonorus.ui.components.ConfirmDialog
 import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.formatBytes
 import dev.constnishant.sonorus.ui.components.formatKhz
+import dev.constnishant.sonorus.ui.components.formatSignedDb
 import dev.constnishant.sonorus.ui.components.label
 import dev.constnishant.sonorus.ui.components.tracksText
 import dev.constnishant.sonorus.ui.theme.Dimens
@@ -182,7 +184,13 @@ private fun RootPage(
         )
         SettingsRow(
             title = stringResource(R.string.settings_section_playback),
-            summary = listOfNotNull(formatLabel(state.output.sampleFormat), state.dacName).joinToString(" · "),
+            summary = listOfNotNull(
+                formatLabel(state.output.sampleFormat),
+                state.replayGain.mode.takeIf { it != ReplayGainModeInfo.OFF }?.let {
+                    stringResource(R.string.replaygain_summary, replayGainLabel(it))
+                },
+                state.dacName,
+            ).joinToString(" · "),
             icon = Icons.Rounded.GraphicEq,
             onClick = { onOpen(SettingsPage.PLAYBACK) },
         )
@@ -231,6 +239,19 @@ private fun librarySummary(state: SettingsUiState, scan: ScanUi): String {
 /** The display label of a sample format. */
 @Composable
 private fun formatLabel(format: OutputSampleFormat): String = format.label(LocalContext.current)
+
+/** The display label of a ReplayGain mode: "Off", "Track" or "Album". */
+@Composable
+private fun replayGainLabel(mode: ReplayGainModeInfo): String = stringResource(
+    when (mode) {
+        ReplayGainModeInfo.OFF -> R.string.replaygain_off
+        ReplayGainModeInfo.TRACK -> R.string.replaygain_track
+        ReplayGainModeInfo.ALBUM -> R.string.replaygain_album
+    },
+)
+
+/** The pre-amp choices in dB, from -6 to +6 in steps of 3. */
+private val ReplayGainPreamps = listOf(-6f, -3f, 0f, 3f, 6f)
 
 @Composable
 private fun BucketPage(state: SettingsUiState, viewModel: SettingsViewModel) {
@@ -462,6 +483,23 @@ private fun PlaybackPage(state: SettingsUiState, viewModel: SettingsViewModel) {
         onCheckedChange = viewModel::setBitPerfect,
     )
     SettingsNote(stringResource(R.string.output_changing_stops))
+
+    SettingsGroupLabel(stringResource(R.string.settings_group_volume))
+    SettingsChoice(
+        title = stringResource(R.string.replaygain_title),
+        options = ReplayGainModeInfo.entries.map { it to replayGainLabel(it) },
+        selected = state.replayGain.mode,
+        onSelect = viewModel::setReplayGainMode,
+    )
+    if (state.replayGain.mode != ReplayGainModeInfo.OFF) {
+        SettingsChoice(
+            title = stringResource(R.string.replaygain_preamp),
+            options = ReplayGainPreamps.map { it to stringResource(R.string.db_value, formatSignedDb(it, 0)) },
+            selected = state.replayGain.preampDb,
+            onSelect = viewModel::setReplayGainPreamp,
+        )
+    }
+    SettingsNote(stringResource(R.string.replaygain_note))
 
     SettingsGroupLabel(stringResource(R.string.output_current))
     SettingsRow(

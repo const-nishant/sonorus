@@ -13,9 +13,12 @@ import dev.constnishant.sonorus.core.LibraryStatsInfo
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.OutputSettings
+import dev.constnishant.sonorus.core.ReplayGainModeInfo
+import dev.constnishant.sonorus.core.ReplayGainSettingsInfo
 import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.coreVersion
 import dev.constnishant.sonorus.data.DEFAULT_CACHE_SETTINGS
+import dev.constnishant.sonorus.data.DEFAULT_REPLAY_GAIN
 import dev.constnishant.sonorus.data.ScanUi
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
@@ -80,6 +83,8 @@ data class SettingsUiState(
     val bitPerfect: Boolean = true,
     /** Name of the connected USB DAC, or null when none is connected. */
     val dacName: String? = null,
+    /** Saved ReplayGain settings: mode and pre-amp. Applies from the next song. */
+    val replayGain: ReplayGainSettingsInfo = DEFAULT_REPLAY_GAIN,
     /** Saved offline cache settings. */
     val cache: CacheSettings = DEFAULT_CACHE_SETTINGS,
     /** Cache usage, or null until the first successful read. */
@@ -170,6 +175,10 @@ class SettingsViewModel(
                 _state.update { it.copy(outputInfo = info) }
                 delay(1_000)
             }
+        }
+        viewModelScope.launch {
+            val replayGain = repository.replayGainSettings()
+            _state.update { it.copy(replayGain = replayGain) }
         }
         viewModelScope.launch {
             val enabled = withContext(Dispatchers.IO) { repository.output.bitPerfect() }
@@ -335,6 +344,34 @@ class SettingsViewModel(
                 val saved = withContext(Dispatchers.IO) { repository.output.load() }
                 _state.update { it.copy(output = saved) }
                 repository.events.emitError(e.userMessage(context, R.string.error_output_settings))
+            }
+        }
+    }
+
+    /** Selects the ReplayGain mode (off, track or album) and applies it from the next song. */
+    fun setReplayGainMode(mode: ReplayGainModeInfo) {
+        applyReplayGain(_state.value.replayGain.copy(mode = mode))
+    }
+
+    /** Sets the ReplayGain pre-amp in dB and applies it from the next song. */
+    fun setReplayGainPreamp(db: Float) {
+        applyReplayGain(_state.value.replayGain.copy(preampDb = db))
+    }
+
+    /**
+     * Shows [settings] at once, then saves and applies them. The repository saves before it applies,
+     * so a failed save leaves the core unchanged; the previous settings are shown again and the
+     * failure is shown as an error.
+     */
+    private fun applyReplayGain(settings: ReplayGainSettingsInfo) {
+        val previous = _state.value.replayGain
+        _state.update { it.copy(replayGain = settings) }
+        viewModelScope.launch {
+            try {
+                repository.setReplayGain(settings)
+            } catch (e: IllegalStateException) {
+                _state.update { it.copy(replayGain = previous) }
+                repository.events.emitError(context.getString(R.string.error_replay_gain_save))
             }
         }
     }

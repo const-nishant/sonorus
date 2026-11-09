@@ -1,5 +1,6 @@
 package dev.constnishant.sonorus.data
 
+import android.os.SystemClock
 import dev.constnishant.sonorus.core.CoreEvent
 import dev.constnishant.sonorus.core.EventListener
 import dev.constnishant.sonorus.core.PlaybackState
@@ -35,6 +36,16 @@ data class PlaybackUi(
     val repeat: RepeatMode = RepeatMode.OFF,
     val recovery: Recovery? = null,
 )
+
+/**
+ * The sleep timer as the UI sees it. [deadlineElapsedMs] is the [SystemClock.elapsedRealtime] at
+ * which a timed sleep pauses playback, or null when no timed sleep is set. [endOfTrack] is true
+ * when playback pauses at the end of the current song. The countdown is local: no polling.
+ */
+data class SleepTimerUi(val deadlineElapsedMs: Long?, val endOfTrack: Boolean) {
+    /** True when a timed sleep or an end-of-track sleep is set. */
+    val active: Boolean get() = deadlineElapsedMs != null || endOfTrack
+}
 
 /**
  * Offline download worker state as the UI sees it. [doneTracks] and [totalTracks] count the
@@ -85,6 +96,14 @@ class CoreEvents : EventListener {
 
     /** Current library scan state. */
     val scan: StateFlow<ScanUi> = _scan.asStateFlow()
+
+    private val _sleepTimer = MutableStateFlow(SleepTimerUi(deadlineElapsedMs = null, endOfTrack = false))
+
+    /**
+     * The sleep timer. Updated when the core reports the timer was set, cleared or fired, and when
+     * the repository reads it back after a request.
+     */
+    val sleepTimer: StateFlow<SleepTimerUi> = _sleepTimer.asStateFlow()
 
     private val _errors = MutableSharedFlow<String>(
         extraBufferCapacity = 16,
@@ -163,6 +182,7 @@ class CoreEvents : EventListener {
                 it.copy(queue = event.items, shuffle = event.shuffle, repeat = event.repeat)
             }
             is CoreEvent.TrackEnded -> Unit
+            is CoreEvent.SleepTimerChanged -> applySleepTimer(event.remainingMs, event.endOfTrack)
             is CoreEvent.ScanProgress -> _scan.update {
                 it.copy(running = true, progress = event.progress)
             }
@@ -194,6 +214,15 @@ class CoreEvents : EventListener {
                 it.copy(active = false, pendingTracks = event.pendingTracks)
             }
         }
+    }
+
+    /**
+     * Sets [sleepTimer] from the core's timer state. The deadline is [SystemClock.elapsedRealtime]
+     * plus [remainingMs], so the UI counts down without asking the core again.
+     */
+    internal fun applySleepTimer(remainingMs: ULong?, endOfTrack: Boolean) {
+        val deadline = remainingMs?.let { SystemClock.elapsedRealtime() + it.toLong() }
+        _sleepTimer.value = SleepTimerUi(deadlineElapsedMs = deadline, endOfTrack = endOfTrack)
     }
 
     /** Marks a library scan as started and clears the previous error. */

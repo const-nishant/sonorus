@@ -19,6 +19,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 use crate::error::{EngineError, Result, is_transient_io_kind};
+use crate::gain::MAX_GAIN;
 
 /// Number of consecutive undecodable packets tolerated before giving up.
 const MAX_CONSECUTIVE_BAD: u32 = 64;
@@ -75,6 +76,9 @@ pub struct TrackDecoder {
     consecutive_bad: u32,
     /// Set when a seek was clamped to the exact end of the stream; `next_block` then yields `None`.
     at_end: bool,
+    /// Linear gain the player applies to this decoder's samples (1.0 = none). Travels with the
+    /// decoder, so a gapless hand-off carries the gain of the track it switches to.
+    gain: f32,
 }
 
 impl TrackDecoder {
@@ -181,12 +185,29 @@ impl TrackDecoder {
             skipped_packets: 0,
             consecutive_bad: 0,
             at_end: false,
+            gain: 1.0,
         })
     }
 
     /// Static information about the stream.
     pub fn info(&self) -> &StreamInfo {
         &self.info
+    }
+
+    /// Sets the linear gain applied to the samples the player pushes from this decoder. Non-finite
+    /// values become 1.0; the rest is clamped to `0.0..=4.0`. The decoder itself does not scale
+    /// anything: `next_block` output is unchanged.
+    pub fn set_gain(&mut self, gain: f32) {
+        self.gain = if gain.is_finite() {
+            gain.clamp(0.0, MAX_GAIN)
+        } else {
+            1.0
+        };
+    }
+
+    /// Gain set by [`TrackDecoder::set_gain`]; 1.0 until then.
+    pub fn gain(&self) -> f32 {
+        self.gain
     }
 
     /// Decodes the next block into `out` (cleared first), interleaved.
@@ -711,6 +732,21 @@ mod tests {
             .seek(Duration::from_millis(200))
             .expect_err("seek must fail");
         assert!(err.is_transient(), "{err:?}");
+    }
+
+    #[test]
+    fn set_gain_sanitizes_and_never_changes_decoded_samples() {
+        let mut dec = open(fixture("tone_24_96.wav"), "wav");
+        assert_eq!(dec.gain(), 1.0);
+        dec.set_gain(0.5);
+        assert_eq!(dec.gain(), 0.5);
+        dec.set_gain(f32::NAN);
+        assert_eq!(dec.gain(), 1.0);
+        dec.set_gain(9.0);
+        assert_eq!(dec.gain(), 4.0);
+        // The decoder reports its gain; the scaling happens in the decode loop.
+        dec.set_gain(0.5);
+        assert_eq!(decode_all_i32(&mut dec), full_i32("tone_24_96.wav", "wav"));
     }
 
     // 8. format_khz

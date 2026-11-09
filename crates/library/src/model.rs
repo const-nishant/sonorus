@@ -19,7 +19,7 @@ pub struct CoverImage {
 }
 
 /// Metadata read from an audio file's tags and stream properties.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TrackMeta {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -39,10 +39,18 @@ pub struct TrackMeta {
     pub channels: Option<u8>,
     pub bitrate_kbps: Option<u32>,
     pub cover: Option<CoverImage>,
+    /// ReplayGain track gain in dB (`REPLAYGAIN_TRACK_GAIN`), e.g. `-6.54`.
+    pub track_gain_db: Option<f32>,
+    /// ReplayGain track peak as a linear amplitude (`REPLAYGAIN_TRACK_PEAK`), e.g. `0.988525`.
+    pub track_peak: Option<f32>,
+    /// ReplayGain album gain in dB (`REPLAYGAIN_ALBUM_GAIN`).
+    pub album_gain_db: Option<f32>,
+    /// ReplayGain album peak as a linear amplitude (`REPLAYGAIN_ALBUM_PEAK`).
+    pub album_peak: Option<f32>,
 }
 
 /// A catalogued track with its album and artist names resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     pub id: i64,
     pub key: String,
@@ -66,6 +74,14 @@ pub struct Track {
     pub cover_id: Option<i64>,
     pub has_lyrics: bool,
     pub added_at: i64,
+    /// ReplayGain track gain in dB, if the file carries it.
+    pub track_gain_db: Option<f32>,
+    /// ReplayGain track peak (linear amplitude), if the file carries it.
+    pub track_peak: Option<f32>,
+    /// ReplayGain album gain in dB, if the file carries it.
+    pub album_gain_db: Option<f32>,
+    /// ReplayGain album peak (linear amplitude), if the file carries it.
+    pub album_peak: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +105,7 @@ pub struct Artist {
     pub track_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SearchResults {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
@@ -139,7 +155,7 @@ pub struct Playlist {
 }
 
 /// One playlist slot. `track` is `None` when the key is not (or no longer) catalogued.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistEntry {
     pub position: u32,
     pub track_key: String,

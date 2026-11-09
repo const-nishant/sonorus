@@ -36,7 +36,8 @@ pub struct ScanProgress {
     pub done: u32,
     /// Tracks newly catalogued.
     pub added: u32,
-    /// Existing tracks whose size or etag changed and were re-read.
+    /// Existing tracks whose size or etag changed, or that were flagged for a re-read, and were
+    /// read again.
     pub updated: u32,
     /// Catalogue tracks whose audio object is no longer listed.
     pub removed: u32,
@@ -320,8 +321,9 @@ async fn fetch_cover(library: &Library, source: &dyn MetaSource, cover_key: &str
 ///
 /// Lists the source and removes catalogue tracks under `prefix` whose audio object is no longer
 /// listed (tracks outside `prefix` are left alone). New
-/// audio objects, and existing ones whose size or etag changed, are read with at most
-/// `concurrency` reads in flight (at least one). Each result is stored in completion order, then
+/// audio objects, existing ones whose size or etag changed, and existing ones flagged for a
+/// re-read (see the v5 migration) are read with at most `concurrency` reads in flight (at least
+/// one). Each result is stored in completion order, then
 /// the catalogue is pruned of orphaned albums, artists and covers.
 ///
 /// Per-file errors are recorded in the report and never abort the scan. Errors from listing,
@@ -345,6 +347,7 @@ pub async fn scan(
         .collect();
 
     let existing = library.stamps()?;
+    let stale = library.keys_needing_reread()?;
     let mut progress = ScanProgress::default();
     let mut failures = Vec::new();
 
@@ -363,7 +366,7 @@ pub async fn scan(
         .into_iter()
         .filter(|s| match existing.get(&s.key) {
             None => true,
-            Some(old) => old.size != s.size || old.etag != s.etag,
+            Some(old) => old.size != s.size || old.etag != s.etag || stale.contains(&s.key),
         })
         .collect();
     progress.total = count(pending.len());
@@ -700,6 +703,56 @@ mod tests {
             ]
         );
         assert!(stamps.iter().all(|s| s.etag.is_none() && s.size > 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replaygain_tags_round_trip_through_scan_and_query() {
+        use crate::tags::write_test_tags;
+        use lofty::tag::ItemKey;
+
+        let tmp = TempDir::new();
+        let lib = Library::open_in_memory(&tmp.path().join("covers")).unwrap();
+        let music_dir = TempDir::new();
+        let music = music_dir.path().join("music");
+        copy_dir(&fixtures(), &music);
+        let key = "Artist A/Album One/01 - First Song.flac";
+        write_test_tags(
+            &music.join(key),
+            &[
+                (ItemKey::ReplayGainTrackGain, "-6.54 dB"),
+                (ItemKey::ReplayGainTrackPeak, "0.988525"),
+                (ItemKey::ReplayGainAlbumGain, "+2.10 dB"),
+                (ItemKey::ReplayGainAlbumPeak, "1.000000"),
+            ],
+        );
+
+        let first = scan(&lib, dir_source(&music), "", 2, |_| {}).await.unwrap();
+        assert_eq!(first.progress.added, 4);
+        let t = lib.track_by_key(key).unwrap().expect("track");
+        assert_eq!(t.track_gain_db, Some(-6.54));
+        assert_eq!(t.track_peak, Some(0.988_525));
+        assert_eq!(t.album_gain_db, Some(2.1));
+        assert_eq!(t.album_peak, Some(1.0));
+        let untagged = lib
+            .track_by_key("Artist B/Album Two/03 - Untagged Track.flac")
+            .unwrap()
+            .expect("untagged track");
+        assert_eq!(untagged.track_gain_db, None);
+        assert_eq!(untagged.album_peak, None);
+
+        // A changed file is re-read and the new values replace the old ones.
+        write_test_tags(
+            &music.join(key),
+            &[
+                (ItemKey::TrackTitle, "First Song (remastered edition)"),
+                (ItemKey::ReplayGainTrackGain, "-7.00 dB"),
+            ],
+        );
+        let second = scan(&lib, dir_source(&music), "", 2, |_| {}).await.unwrap();
+        assert_eq!(second.progress.updated, 1);
+        let t = lib.track_by_key(key).unwrap().expect("track");
+        assert_eq!(t.track_gain_db, Some(-7.0));
+        assert_eq!(t.track_peak, Some(0.988_525), "untouched values are kept");
     }
 
     #[test]

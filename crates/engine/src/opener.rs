@@ -11,12 +11,27 @@ use crate::error::Result;
 use crate::source::{BufferHandle, RangeSource, RemoteObject, SourceConfig, StorageObject};
 use sonorus_storage::Storage;
 
+/// ReplayGain values read from a track's tags. Gains in dB, peaks as linear sample amplitude (1.0 = full scale).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReplayGain {
+    /// Track gain in dB (`REPLAYGAIN_TRACK_GAIN`).
+    pub track_gain_db: Option<f32>,
+    /// Track peak, linear (`REPLAYGAIN_TRACK_PEAK`).
+    pub track_peak: Option<f32>,
+    /// Album gain in dB (`REPLAYGAIN_ALBUM_GAIN`).
+    pub album_gain_db: Option<f32>,
+    /// Album peak, linear (`REPLAYGAIN_ALBUM_PEAK`).
+    pub album_peak: Option<f32>,
+}
+
 /// A track to open. `key` is the storage object key (or path relative to a local root).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `gain` holds the track's ReplayGain tags when they are known.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrackRef {
     pub id: String,
     pub key: String,
     pub size: u64,
+    pub gain: Option<ReplayGain>,
 }
 
 /// Result of [`TrackOpener::open`].
@@ -186,6 +201,7 @@ mod tests {
             id: "tone".to_string(),
             key: "tone_24_96.flac".to_string(),
             size: 0,
+            gain: None,
         };
         let opened = opener.open(&track).unwrap();
         assert_eq!(opened.ext_hint.as_deref(), Some("flac"));
@@ -223,6 +239,7 @@ mod tests {
             id: "tone".to_string(),
             key: key.to_string(),
             size,
+            gain: None,
         };
         let mut opened = opener.open(&track).unwrap();
         assert!(opened.buffer.is_none());

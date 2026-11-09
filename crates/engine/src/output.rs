@@ -55,6 +55,13 @@ pub trait OutputSink: Send {
     /// Best estimate of output latency (NullSink: period).
     fn latency(&self) -> Duration;
     fn name(&self) -> &str;
+    /// Sample kind of the stream that is open right now. It can differ from the
+    /// `OutputFormat::sample` that was requested, because a route planner may pick another kind.
+    /// `None` when no stream is open or the sink cannot tell; callers then fall back to the kind
+    /// they requested.
+    fn opened_kind(&self) -> Option<SampleKind> {
+        None
+    }
 }
 
 /// Pacing period of the NullSink render loop.
@@ -177,6 +184,10 @@ impl OutputSink for NullSink {
 
     fn name(&self) -> &str {
         "null"
+    }
+
+    fn opened_kind(&self) -> Option<SampleKind> {
+        self.format.map(|format| format.sample)
     }
 }
 

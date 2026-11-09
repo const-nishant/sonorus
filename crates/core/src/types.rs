@@ -12,6 +12,7 @@ use sonorus_engine::aaudio::{
     StreamInfo as AAudioStreamInfo,
 };
 use sonorus_engine::decoder::StreamInfo;
+use sonorus_engine::gain::{ReplayGainMode, ReplayGainSettings};
 use sonorus_engine::output::SampleKind;
 use sonorus_engine::player::{PlayerEvent, PlayerState};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
@@ -463,6 +464,50 @@ pub struct DownloadStatus {
     pub cached_bytes: u64,
 }
 
+/// Which ReplayGain tag value to apply, see `SonorusCore::set_replay_gain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum ReplayGainModeInfo {
+    /// No gain is applied.
+    #[default]
+    Off,
+    /// Track gain, falling back to album gain.
+    Track,
+    /// Album gain, falling back to track gain.
+    Album,
+}
+
+/// ReplayGain settings. They apply from the next track, see `SonorusCore::set_replay_gain`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, uniffi::Record)]
+pub struct ReplayGainSettingsInfo {
+    /// Which tag values to use.
+    pub mode: ReplayGainModeInfo,
+    /// Offset added to the tag gain, in dB. The core clamps it to -15 to 15 dB.
+    pub preamp_db: f32,
+}
+
+/// A sleep timer request, see `SonorusCore::set_sleep_timer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SleepTimerRequest {
+    /// Clears the sleep timer.
+    Off,
+    /// Pauses playback after `minutes`, counted from the request. Must be 1 to 1440 (24 h).
+    Minutes {
+        /// Minutes until playback pauses.
+        minutes: u32,
+    },
+    /// Pauses playback when the current track ends.
+    EndOfTrack,
+}
+
+/// The sleep timer as the core knows it, see `SonorusCore::sleep_timer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SleepTimerInfo {
+    /// Milliseconds left on a timed sleep, `None` when no timed sleep is set.
+    pub remaining_ms: Option<u64>,
+    /// Whether an end-of-track sleep is set.
+    pub end_of_track: bool,
+}
+
 /// Events pushed to the foreign `EventListener` by the core's event pump.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreEvent {
@@ -574,6 +619,15 @@ pub enum CoreEvent {
         /// Pinned tracks not yet complete in the cache.
         pending_tracks: u32,
     },
+    /// The sleep timer was set, cleared or fired. `remaining_ms` is the time left on a timed sleep
+    /// (`None` when none is set); `end_of_track` is true while an end-of-track sleep is set.
+    /// Poll `SonorusCore::sleep_timer` for the countdown: this event is not sent every second.
+    SleepTimerChanged {
+        /// Milliseconds left on a timed sleep, `None` when no timed sleep is set.
+        remaining_ms: Option<u64>,
+        /// Whether an end-of-track sleep is set.
+        end_of_track: bool,
+    },
 }
 
 /// Sample format the output stream is opened with.
@@ -668,7 +722,7 @@ pub struct RoutePlanInfo {
 }
 
 /// What the engine opened, passed to `OutputRouter::opened` and returned by `SonorusCore::signal_path`.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct SignalPathInfo {
     /// The path the audio takes (`Mixer` when the open failed).
     pub mode: OutputPathMode,
@@ -682,6 +736,10 @@ pub struct SignalPathInfo {
     pub source_rate: u32,
     /// Bit depth of the source, when known.
     pub source_bits: Option<u32>,
+    /// The ReplayGain gain in dB applied to the current track, from the last `GainApplied` event.
+    /// `None` when no gain is applied (ReplayGain off, untagged, integer output, or unity).
+    /// Filled in by `SonorusCore::signal_path`, not by the engine.
+    pub replay_gain_db: Option<f32>,
 }
 
 impl OutputSettings {
@@ -819,6 +877,45 @@ impl From<SignalPath> for SignalPathInfo {
             error: p.error,
             source_rate: p.source_rate,
             source_bits: p.source_bits,
+            replay_gain_db: None,
+        }
+    }
+}
+
+impl From<ReplayGainModeInfo> for ReplayGainMode {
+    fn from(m: ReplayGainModeInfo) -> Self {
+        match m {
+            ReplayGainModeInfo::Off => ReplayGainMode::Off,
+            ReplayGainModeInfo::Track => ReplayGainMode::Track,
+            ReplayGainModeInfo::Album => ReplayGainMode::Album,
+        }
+    }
+}
+
+impl From<ReplayGainMode> for ReplayGainModeInfo {
+    fn from(m: ReplayGainMode) -> Self {
+        match m {
+            ReplayGainMode::Off => ReplayGainModeInfo::Off,
+            ReplayGainMode::Track => ReplayGainModeInfo::Track,
+            ReplayGainMode::Album => ReplayGainModeInfo::Album,
+        }
+    }
+}
+
+impl From<ReplayGainSettingsInfo> for ReplayGainSettings {
+    fn from(s: ReplayGainSettingsInfo) -> Self {
+        ReplayGainSettings {
+            mode: s.mode.into(),
+            preamp_db: s.preamp_db,
+        }
+    }
+}
+
+impl From<ReplayGainSettings> for ReplayGainSettingsInfo {
+    fn from(s: ReplayGainSettings) -> Self {
+        ReplayGainSettingsInfo {
+            mode: s.mode.into(),
+            preamp_db: s.preamp_db,
         }
     }
 }
@@ -1113,7 +1210,9 @@ fn resolve_track(lib: &Library, conv: Option<&Converter<'_>>, id: i64) -> Option
 }
 
 /// Maps one engine event to the core event sent to the UI. Returns `None` for events that
-/// cannot be represented (an unparsable track id in an event that needs one).
+/// cannot be represented (an unparsable track id in an event that needs one), and for
+/// `GainApplied`, which is not sent as an event: the core keeps it as status and reports it in
+/// `SignalPathInfo::replay_gain_db`.
 ///
 /// `conv` is reused for track lookups when given; otherwise a temporary converter is built.
 pub(crate) fn player_event(
@@ -1122,6 +1221,14 @@ pub(crate) fn player_event(
     lib: &Library,
 ) -> Option<CoreEvent> {
     Some(match event {
+        PlayerEvent::GainApplied { .. } => return None,
+        PlayerEvent::SleepTimerChanged {
+            remaining,
+            end_of_track,
+        } => CoreEvent::SleepTimerChanged {
+            remaining_ms: remaining.map(duration_ms),
+            end_of_track,
+        },
         PlayerEvent::StateChanged(state) => CoreEvent::StateChanged {
             state: state.into(),
         },
@@ -1579,6 +1686,7 @@ mod tests {
                 error: None,
                 source_rate: 96_000,
                 source_bits: Some(24),
+                replay_gain_db: None,
             }
         );
     }
@@ -1838,6 +1946,7 @@ mod tests {
                 id: track_id.to_string(),
                 key: String::new(),
                 size: 0,
+                gain: None,
             },
         };
         let ev = PlayerEvent::QueueChanged {
@@ -1863,6 +1972,75 @@ mod tests {
                 shuffle: true,
                 repeat: RepeatMode::All,
             })
+        );
+    }
+
+    #[test]
+    fn player_event_maps_sleep_timer_changed() {
+        let f = fixture("sleep-event");
+        let ev = |remaining: Option<Duration>, end_of_track: bool| {
+            player_event(
+                PlayerEvent::SleepTimerChanged {
+                    remaining,
+                    end_of_track,
+                },
+                None,
+                &f.lib,
+            )
+        };
+        assert_eq!(
+            ev(Some(Duration::from_millis(90_000)), false),
+            Some(CoreEvent::SleepTimerChanged {
+                remaining_ms: Some(90_000),
+                end_of_track: false,
+            })
+        );
+        assert_eq!(
+            ev(None, true),
+            Some(CoreEvent::SleepTimerChanged {
+                remaining_ms: None,
+                end_of_track: true,
+            })
+        );
+        assert_eq!(
+            ev(None, false),
+            Some(CoreEvent::SleepTimerChanged {
+                remaining_ms: None,
+                end_of_track: false,
+            })
+        );
+    }
+
+    #[test]
+    fn player_event_gain_applied_is_status_not_an_event() {
+        let f = fixture("gain-event");
+        assert_eq!(
+            player_event(PlayerEvent::GainApplied { db: Some(-3.0) }, None, &f.lib),
+            None
+        );
+        assert_eq!(
+            player_event(PlayerEvent::GainApplied { db: None }, None, &f.lib),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_gain_settings_convert_both_ways() {
+        let info = ReplayGainSettingsInfo {
+            mode: ReplayGainModeInfo::Album,
+            preamp_db: -2.5,
+        };
+        let engine: ReplayGainSettings = info.into();
+        assert_eq!(engine.mode, ReplayGainMode::Album);
+        assert_eq!(engine.preamp_db, -2.5);
+        assert_eq!(ReplayGainSettingsInfo::from(engine), info);
+        assert_eq!(
+            ReplayGainModeInfo::from(ReplayGainMode::Track),
+            ReplayGainModeInfo::Track
+        );
+        assert_eq!(
+            ReplayGainMode::from(ReplayGainModeInfo::Off),
+            ReplayGainMode::Off
         );
     }
 }

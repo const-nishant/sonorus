@@ -7,8 +7,10 @@ import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.RepeatMode
 import dev.constnishant.sonorus.core.SignalPathInfo
+import dev.constnishant.sonorus.core.SleepTimerRequest
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.PlaybackUi
+import dev.constnishant.sonorus.data.SleepTimerUi
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.data.userMessage
@@ -46,6 +48,9 @@ class NowPlayingViewModel(
     /** The connected USB DAC, or null when none is connected. */
     val dac: StateFlow<UsbDac?> = repository.dac
 
+    /** The sleep timer: the deadline of a timed sleep, or end-of-track. */
+    val sleepTimer: StateFlow<SleepTimerUi> = repository.events.sleepTimer
+
     private val _favoriteOverride = MutableStateFlow<FavoriteOverride?>(null)
 
     /** Optimistic favorite flag for the current track, or null to use the track's own flag. */
@@ -75,6 +80,20 @@ class NowPlayingViewModel(
     fun togglePlayPause() {
         val pause = playback.value.state.showsPause()
         repository.command { if (pause) it.pause() else it.play() }
+    }
+
+    /**
+     * Sets, replaces or clears the sleep timer. The countdown changes once the core accepts the
+     * request. A rejected request is shown through the error flow.
+     */
+    fun setSleepTimer(request: SleepTimerRequest) {
+        viewModelScope.launch {
+            try {
+                repository.setSleepTimer(request)
+            } catch (e: CoreException) {
+                repository.events.emitError(e.userMessage(context, R.string.error_sleep_timer))
+            }
+        }
     }
 
     /** Skips to the next queue entry. */

@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "android")]
 use sonorus_engine::aaudio::{AAudioHandle, AAudioSink};
 use sonorus_engine::aaudio::{DefaultPlanner, RoutePlanner};
-use sonorus_engine::opener::{CachingOpener, FileOpener, StorageOpener, TrackOpener, TrackRef};
+use sonorus_engine::opener::{
+    CachingOpener, FileOpener, ReplayGain, StorageOpener, TrackOpener, TrackRef,
+};
 #[cfg(not(target_os = "android"))]
 use sonorus_engine::output::NullSink;
 use sonorus_engine::output::OutputSink;
-use sonorus_engine::player::{Player, PlayerConfig};
+use sonorus_engine::player::{Player, PlayerConfig, SleepTimer};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_engine::source::SourceConfig;
 use sonorus_library::sync::sync_user_data as run_user_data_sync;
@@ -38,7 +40,7 @@ use sonorus_storage::{ObjectMeta, Storage};
 use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
-use crate::events::{EventListener, ListenerSlot, spawn_pump};
+use crate::events::{EventListener, ListenerSlot, PlayerStatus, spawn_pump};
 use crate::offline::{CACHE_DIR, Offline, cache_id_for};
 use crate::router::{OutputRouter, RouterPlanner};
 #[cfg(target_os = "android")]
@@ -46,8 +48,9 @@ use crate::types::output_info_from;
 use crate::types::{
     AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, Converter, CoreConfig,
     CoreEvent, DownloadStatus, LibraryStatsInfo, OutputInfo, OutputSettings, PlaylistEntryInfo,
-    PlaylistInfo, RepeatMode, S3Settings, ScanProgressInfo, ScanSummary, SearchResult,
-    SignalPathInfo, SyncSummary, TrackInfo, UploadJobInfo,
+    PlaylistInfo, RepeatMode, ReplayGainSettingsInfo, S3Settings, ScanProgressInfo, ScanSummary,
+    SearchResult, SignalPathInfo, SleepTimerInfo, SleepTimerRequest, SyncSummary, TrackInfo,
+    UploadJobInfo,
 };
 use crate::upload::{
     CancelRoute, RunEnv, UploadClaim, UploadControl, cancel_job, prepare_job, request_cancel,
@@ -60,6 +63,10 @@ const SCAN_CONCURRENCY: usize = 4;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// How long dropping the core waits for runtime tasks to finish.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
+/// ReplayGain preamp limit: the preamp is clamped to `-PREAMP_LIMIT_DB..=PREAMP_LIMIT_DB`.
+const PREAMP_LIMIT_DB: f32 = 15.0;
+/// Longest timed sleep, in minutes (24 h).
+const MAX_SLEEP_MINUTES: u32 = 24 * 60;
 
 /// Where the music comes from.
 #[derive(Clone)]
@@ -129,6 +136,11 @@ pub struct SonorusCore {
     scanning: AtomicBool,
     /// Output settings applied to the next player.
     output: Mutex<OutputSettings>,
+    /// ReplayGain settings applied to the next player and kept across player rebuilds. The preamp
+    /// is stored clamped.
+    replay_gain: Mutex<ReplayGainSettingsInfo>,
+    /// Gain of the current track and the sleep timer, shared with the event pump.
+    status: Arc<PlayerStatus>,
     /// The route planner (the [`RouterPlanner`] adapter) set by `set_output_router`. `None` means
     /// the default planner. Lock order: never held while the `player` mutex is taken.
     router: Mutex<Option<Arc<dyn RoutePlanner>>>,
@@ -176,6 +188,8 @@ impl SonorusCore {
             listener,
             scanning: AtomicBool::new(false),
             output: Mutex::new(OutputSettings::default()),
+            replay_gain: Mutex::new(ReplayGainSettingsInfo::default()),
+            status: Arc::new(PlayerStatus::default()),
             router: Mutex::new(None),
             rt: Some(rt),
             upload_control: Mutex::new(UploadControl::default()),
@@ -710,6 +724,58 @@ impl SonorusCore {
         *self.output.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Sets the ReplayGain mode and preamp. The preamp is clamped to -15 to 15 dB and the clamped
+    /// value is stored. The settings apply from the next track, and are kept when the player is
+    /// rebuilt. Gain applies only on the float output path; bit-perfect output is never scaled.
+    /// Non-blocking.
+    pub fn set_replay_gain(&self, settings: ReplayGainSettingsInfo) {
+        let settings = ReplayGainSettingsInfo {
+            preamp_db: clamp_preamp(settings.preamp_db),
+            ..settings
+        };
+        log::info!("replay gain: {settings:?}");
+        // Held across the store and the send, so a player built meanwhile sees one of the two
+        // values, never a mix.
+        let guard = self.lock_player();
+        *self
+            .replay_gain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = settings;
+        if let Some(slot) = guard.as_ref() {
+            slot.player.set_replay_gain(settings.into());
+        }
+    }
+
+    /// The ReplayGain settings in effect, with the preamp as clamped. Non-blocking.
+    pub fn replay_gain_settings(&self) -> ReplayGainSettingsInfo {
+        *self
+            .replay_gain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sets the sleep timer, replacing any other. `Minutes` pauses playback after that many
+    /// minutes (1 to 1440); `EndOfTrack` pauses when the current track ends; `Off` clears it. The
+    /// timer is kept when the player is rebuilt, and is set on the next player if none runs now.
+    /// Fails with `InvalidConfig` for a minute count of 0 or above 1440. Non-blocking.
+    pub fn set_sleep_timer(&self, request: SleepTimerRequest) -> CoreResult<()> {
+        let timer = sleep_timer_for(request, Instant::now())?;
+        log::info!("sleep timer: {request:?}");
+        let guard = self.lock_player();
+        self.status.request_sleep_timer(timer);
+        if let Some(slot) = guard.as_ref() {
+            slot.player.set_sleep_timer(timer);
+        }
+        Ok(())
+    }
+
+    /// The sleep timer: the time left on a timed sleep and whether an end-of-track sleep is set.
+    /// The countdown is computed here; `CoreEvent::SleepTimerChanged` reports when a timer is set,
+    /// cleared or fires. Non-blocking.
+    pub fn sleep_timer(&self) -> SleepTimerInfo {
+        self.status.sleep_timer_info(Instant::now())
+    }
+
     /// The output stream as the device actually opened it. `None` when there is no player, no
     /// open stream, or when not running on Android.
     pub fn output_info(&self) -> Option<OutputInfo> {
@@ -734,7 +800,9 @@ impl SonorusCore {
     /// What the engine last opened or tried to open: mode, plan, stream and error. `None` before
     /// the first open, when there is no player, or when not running on Android.
     pub fn signal_path(&self) -> Option<SignalPathInfo> {
-        self.aaudio_signal_path()
+        let mut path = self.aaudio_signal_path()?;
+        path.replay_gain_db = self.status.replay_gain_db();
+        Some(path)
     }
 
     /// Sets the offline cache settings and applies them now: the byte limit evicts down to it
@@ -1035,12 +1103,29 @@ impl SonorusCore {
         #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
         let (sink, handle) = make_sink(settings, self.current_planner())?;
         let (player, events) = Player::new(sink, opener, config);
-        let pump =
-            spawn_pump(events, Arc::clone(&self.library), self.listener.clone()).map_err(|e| {
-                CoreError::Internal {
-                    detail: format!("failed to start the event thread: {e}"),
-                }
-            })?;
+        let pump = spawn_pump(
+            events,
+            Arc::clone(&self.library),
+            self.listener.clone(),
+            Arc::clone(&self.status),
+        )
+        .map_err(|e| CoreError::Internal {
+            detail: format!("failed to start the event thread: {e}"),
+        })?;
+        // The gain of the player being replaced is no longer the current one. Its event thread
+        // was joined when it was dropped, so nothing can set the gain again after this.
+        self.status.set_replay_gain_db(None);
+        // Settings stored while no player existed, or before this rebuild, are applied now. The
+        // event thread is already running, so the sleep timer's confirmation event is seen.
+        let replay_gain = *self
+            .replay_gain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        player.set_replay_gain(replay_gain.into());
+        let timer = self.status.sleep_timer_for_new_player(Instant::now());
+        if timer != SleepTimer::Off {
+            player.set_sleep_timer(timer);
+        }
         Ok(PlayerSlot {
             player,
             _pump: PumpHandle(Some(pump)),
@@ -1172,7 +1257,53 @@ fn track_ref(track: &Track) -> TrackRef {
         id: track.id.to_string(),
         key: track.key.clone(),
         size: track.size,
+        gain: replay_gain_of(track),
     }
+}
+
+/// The ReplayGain tags of a library track: `Some` when any of its four values is known.
+fn replay_gain_of(track: &Track) -> Option<ReplayGain> {
+    let any = track.track_gain_db.is_some()
+        || track.track_peak.is_some()
+        || track.album_gain_db.is_some()
+        || track.album_peak.is_some();
+    any.then_some(ReplayGain {
+        track_gain_db: track.track_gain_db,
+        track_peak: track.track_peak,
+        album_gain_db: track.album_gain_db,
+        album_peak: track.album_peak,
+    })
+}
+
+/// The preamp in dB, clamped to `-PREAMP_LIMIT_DB..=PREAMP_LIMIT_DB`. A NaN preamp is 0 dB.
+fn clamp_preamp(db: f32) -> f32 {
+    if db.is_nan() {
+        0.0
+    } else {
+        db.clamp(-PREAMP_LIMIT_DB, PREAMP_LIMIT_DB)
+    }
+}
+
+/// The engine timer for a request, with a timed sleep ending `minutes` after `now`. Rejects 0
+/// minutes and more than 24 h.
+fn sleep_timer_for(request: SleepTimerRequest, now: Instant) -> CoreResult<SleepTimer> {
+    Ok(match request {
+        SleepTimerRequest::Off => SleepTimer::Off,
+        SleepTimerRequest::EndOfTrack => SleepTimer::EndOfTrack,
+        SleepTimerRequest::Minutes { minutes } => {
+            if minutes == 0 {
+                return Err(CoreError::InvalidConfig {
+                    detail: "a sleep timer needs at least 1 minute".to_owned(),
+                });
+            }
+            if minutes > MAX_SLEEP_MINUTES {
+                return Err(CoreError::InvalidConfig {
+                    detail: format!("a sleep timer can last at most {MAX_SLEEP_MINUTES} minutes"),
+                });
+            }
+            SleepTimer::At(now + Duration::from_secs(u64::from(minutes) * 60))
+        }
+    })
 }
 
 /// A list index from a UI value. Values beyond `usize` (never on 64-bit) saturate.
@@ -1189,11 +1320,181 @@ fn no_tracks() -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ReplayGainModeInfo;
 
     #[test]
     fn index_saturates_on_overflow_only() {
         assert_eq!(index(0), 0);
         assert_eq!(index(u32::MAX), u32::MAX as usize);
+    }
+
+    fn track_with_gain(
+        track_gain_db: Option<f32>,
+        track_peak: Option<f32>,
+        album_gain_db: Option<f32>,
+        album_peak: Option<f32>,
+    ) -> Track {
+        Track {
+            id: 7,
+            key: "music/a.flac".to_owned(),
+            size: 1_000,
+            etag: None,
+            title: "t".to_owned(),
+            artist: "a".to_owned(),
+            album_artist: "a".to_owned(),
+            album: "al".to_owned(),
+            album_id: 1,
+            artist_id: 1,
+            track_no: None,
+            disc_no: None,
+            year: None,
+            genre: None,
+            duration_ms: None,
+            sample_rate: None,
+            bits_per_sample: None,
+            channels: None,
+            codec: None,
+            cover_id: None,
+            has_lyrics: false,
+            added_at: 0,
+            track_gain_db,
+            track_peak,
+            album_gain_db,
+            album_peak,
+        }
+    }
+
+    #[test]
+    fn track_ref_carries_gain_when_any_tag_is_known() {
+        let plain = track_ref(&track_with_gain(None, None, None, None));
+        assert_eq!(plain.gain, None);
+        assert_eq!((plain.id.as_str(), plain.size), ("7", 1_000));
+
+        let track = track_ref(&track_with_gain(Some(-6.5), Some(0.9), None, None));
+        assert_eq!(
+            track.gain,
+            Some(ReplayGain {
+                track_gain_db: Some(-6.5),
+                track_peak: Some(0.9),
+                album_gain_db: None,
+                album_peak: None,
+            })
+        );
+
+        let album_only = track_ref(&track_with_gain(None, None, Some(-3.0), None));
+        assert_eq!(
+            album_only.gain,
+            Some(ReplayGain {
+                track_gain_db: None,
+                track_peak: None,
+                album_gain_db: Some(-3.0),
+                album_peak: None,
+            })
+        );
+    }
+
+    #[test]
+    fn preamp_is_clamped_to_fifteen_db() {
+        assert_eq!(clamp_preamp(20.0), 15.0);
+        assert_eq!(clamp_preamp(-40.0), -15.0);
+        assert_eq!(clamp_preamp(-3.5), -3.5);
+        assert_eq!(clamp_preamp(15.0), 15.0);
+        assert_eq!(clamp_preamp(f32::NAN), 0.0);
+        assert_eq!(clamp_preamp(f32::INFINITY), 15.0);
+    }
+
+    #[test]
+    fn sleep_timer_request_validation() {
+        let now = Instant::now();
+        assert_eq!(
+            sleep_timer_for(SleepTimerRequest::Off, now).expect("off"),
+            SleepTimer::Off
+        );
+        assert_eq!(
+            sleep_timer_for(SleepTimerRequest::EndOfTrack, now).expect("end"),
+            SleepTimer::EndOfTrack
+        );
+        assert_eq!(
+            sleep_timer_for(SleepTimerRequest::Minutes { minutes: 1 }, now).expect("1"),
+            SleepTimer::At(now + Duration::from_secs(60))
+        );
+        assert_eq!(
+            sleep_timer_for(SleepTimerRequest::Minutes { minutes: 1440 }, now).expect("max"),
+            SleepTimer::At(now + Duration::from_secs(24 * 3600))
+        );
+        assert!(matches!(
+            sleep_timer_for(SleepTimerRequest::Minutes { minutes: 0 }, now),
+            Err(CoreError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            sleep_timer_for(SleepTimerRequest::Minutes { minutes: 1441 }, now),
+            Err(CoreError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            sleep_timer_for(SleepTimerRequest::Minutes { minutes: u32::MAX }, now),
+            Err(CoreError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn set_sleep_timer_rejects_invalid_and_keeps_previous() {
+        let dir = std::env::temp_dir().join(format!("sonorus-core-sleep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let core = SonorusCore::new(CoreConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            s3: None,
+            local_music_dir: None,
+        })
+        .expect("open core");
+        core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 5 })
+            .expect("5 minutes");
+        assert!(matches!(
+            core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 0 }),
+            Err(CoreError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 1441 }),
+            Err(CoreError::InvalidConfig { .. })
+        ));
+        let info = core.sleep_timer();
+        let left = info.remaining_ms.expect("timer still set");
+        assert!(left > 299_000 && left <= 300_000, "{left}");
+        drop(core);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_gain_settings_are_clamped_and_stored() {
+        let dir = std::env::temp_dir().join(format!("sonorus-core-rg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let core = SonorusCore::new(CoreConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            s3: None,
+            local_music_dir: None,
+        })
+        .expect("open core");
+        assert_eq!(
+            core.replay_gain_settings(),
+            ReplayGainSettingsInfo::default()
+        );
+        core.set_replay_gain(ReplayGainSettingsInfo {
+            mode: ReplayGainModeInfo::Album,
+            preamp_db: 40.0,
+        });
+        assert_eq!(
+            core.replay_gain_settings(),
+            ReplayGainSettingsInfo {
+                mode: ReplayGainModeInfo::Album,
+                preamp_db: 15.0,
+            }
+        );
+        core.set_replay_gain(ReplayGainSettingsInfo {
+            mode: ReplayGainModeInfo::Track,
+            preamp_db: -99.0,
+        });
+        assert_eq!(core.replay_gain_settings().preamp_db, -15.0);
+        drop(core);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

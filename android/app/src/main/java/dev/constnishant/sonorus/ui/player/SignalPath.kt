@@ -18,10 +18,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.OutputPathMode
+import dev.constnishant.sonorus.core.ReplayGainModeInfo
 import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.data.audio.UsbDac
 import dev.constnishant.sonorus.ui.components.SonorusChip
 import dev.constnishant.sonorus.ui.components.formatKhz
+import dev.constnishant.sonorus.ui.components.formatSignedDb
 import dev.constnishant.sonorus.ui.components.label
 
 /**
@@ -38,11 +40,17 @@ fun SignalPathChip(path: SignalPathInfo, onClick: () -> Unit) {
 }
 
 /**
- * "Signal path" details: source, output stream, device, mode and any error. [dac] is the connected
- * USB DAC, if any, used to name the device.
+ * "Signal path" details: source, output stream, device, mode, volume and any error. [dac] is the
+ * connected USB DAC, if any, used to name the device. [replayGainMode] is the saved ReplayGain
+ * mode; when it is not off but no gain was applied to this song, the volume row says why.
  */
 @Composable
-fun SignalPathDialog(path: SignalPathInfo, dac: UsbDac?, onDismiss: () -> Unit) {
+fun SignalPathDialog(
+    path: SignalPathInfo,
+    dac: UsbDac?,
+    replayGainMode: ReplayGainModeInfo,
+    onDismiss: () -> Unit,
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
@@ -60,6 +68,11 @@ fun SignalPathDialog(path: SignalPathInfo, dac: UsbDac?, onDismiss: () -> Unit) 
                     label = stringResource(R.string.signal_mode),
                     value = modeLabel(path.mode),
                     note = modeNote(path.mode),
+                )
+                SignalRow(
+                    label = stringResource(R.string.signal_volume),
+                    value = volumeText(path),
+                    note = volumeNote(path, replayGainMode),
                 )
                 path.error?.let { message ->
                     Text(
@@ -117,6 +130,25 @@ private fun modeNote(mode: OutputPathMode): String = stringResource(
         OutputPathMode.MIXER -> R.string.signal_note_mixer
     },
 )
+
+/** "ReplayGain −6.5 dB" when a gain is applied to this song, otherwise "Unchanged". */
+@Composable
+private fun volumeText(path: SignalPathInfo): String {
+    val db = path.replayGainDb ?: return stringResource(R.string.signal_volume_unchanged)
+    return stringResource(R.string.signal_replay_gain, stringResource(R.string.db_value, formatSignedDb(db, 1)))
+}
+
+/**
+ * The explanation under the volume value: shown when ReplayGain is on but no gain was applied,
+ * which happens for untagged songs and on bit-perfect output. Null otherwise.
+ */
+@Composable
+private fun volumeNote(path: SignalPathInfo, replayGainMode: ReplayGainModeInfo): String? =
+    if (replayGainMode != ReplayGainModeInfo.OFF && path.replayGainDb == null) {
+        stringResource(R.string.signal_note_no_replay_gain)
+    } else {
+        null
+    }
 
 /** "24-bit / 96 kHz", or "Unknown bit depth / 44.1 kHz". */
 @Composable

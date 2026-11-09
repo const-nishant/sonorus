@@ -7,6 +7,9 @@ import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.OutputSampleFormat
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.GIB
+import kotlin.math.abs
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /** `m:ss`, or `h:mm:ss` from one hour; "--:--" when unknown. */
@@ -27,6 +30,24 @@ fun formatTotal(context: Context, ms: Long): String {
     } else {
         context.getString(R.string.duration_minutes, minutes)
     }
+}
+
+/** The real minus sign (U+2212), used for negative dB values. */
+private const val MINUS_SIGN = "\u2212"
+
+/**
+ * A dB value with its sign and [decimals] decimal places, without the unit: "+3", "0", "−6.5".
+ * Negative values use a real minus sign. A value that rounds to zero has no sign.
+ */
+fun formatSignedDb(db: Float, decimals: Int): String {
+    val scale = 10f.pow(decimals)
+    val rounded = (db * scale).roundToInt() / scale
+    val sign = when {
+        rounded > 0f -> "+"
+        rounded < 0f -> MINUS_SIGN
+        else -> ""
+    }
+    return sign + "%.${decimals}f".format(abs(rounded))
 }
 
 /** Kilohertz without a trailing ".0": 44100 → "44.1", 96000 → "96". */

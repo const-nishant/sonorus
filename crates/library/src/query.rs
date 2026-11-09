@@ -13,7 +13,8 @@ pub(crate) const TRACK_SELECT: &str =
     "SELECT t.id, t.key, t.size, t.etag, t.title, t.artist, ar.name, al.title,
         t.album_id, al.artist_id, t.track_no, t.disc_no, t.year, t.genre, t.duration_ms,
         t.sample_rate, t.bits_per_sample, t.channels, t.codec, t.cover_id,
-        (t.lyrics IS NOT NULL AND t.lyrics <> ''), t.added_at
+        (t.lyrics IS NOT NULL AND t.lyrics <> ''), t.added_at,
+        t.rg_track_gain, t.rg_track_peak, t.rg_album_gain, t.rg_album_peak
     FROM tracks t
     JOIN albums al ON al.id = t.album_id
     JOIN artists ar ON ar.id = al.artist_id";
@@ -56,6 +57,10 @@ pub(crate) fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
         cover_id: row.get(19)?,
         has_lyrics: row.get(20)?,
         added_at: row.get(21)?,
+        track_gain_db: row.get(22)?,
+        track_peak: row.get(23)?,
+        album_gain_db: row.get(24)?,
+        album_peak: row.get(25)?,
     })
 }
 

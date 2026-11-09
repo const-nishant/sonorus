@@ -13,7 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sonorus_core::router::OutputRouter;
 use sonorus_core::types::{
     AlbumInfo, AlbumSort, CoreConfig, CoreEvent, OutputSampleFormat, OutputSettings, PlaybackState,
-    RoutePlanInfo, RouteRequestInfo, S3Settings, SignalPathInfo, TrackInfo,
+    ReplayGainModeInfo, ReplayGainSettingsInfo, RoutePlanInfo, RouteRequestInfo, S3Settings,
+    SignalPathInfo, SleepTimerInfo, SleepTimerRequest, TrackInfo,
 };
 use sonorus_core::{CoreError, EventListener, SonorusCore};
 
@@ -608,4 +609,164 @@ fn output_router_set_and_clear_keeps_playback_working() {
     );
     core.stop();
     core.clear_output_router(); // idempotent
+}
+
+#[test]
+fn sleep_timer_reports_countdown_and_events_while_playing() {
+    let dir = TempDir::new("sleep-playing");
+    let (core, rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+    let album = album_by_title(&core, "Album One");
+    core.play_album(album.id, 0).expect("play album");
+    rec.wait_for(
+        |e| {
+            matches!(
+                e,
+                CoreEvent::StateChanged {
+                    state: PlaybackState::Playing
+                }
+            )
+        },
+        "playing",
+    );
+
+    core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 2 })
+        .expect("2 minutes");
+    rec.wait_for(
+        |e| {
+            matches!(
+                e,
+                CoreEvent::SleepTimerChanged { remaining_ms: Some(ms), end_of_track: false }
+                    if *ms > 119_000 && *ms <= 120_000
+            )
+        },
+        "timed sleep confirmed by the player",
+    );
+    let first = core.sleep_timer().remaining_ms.expect("timer set");
+    thread::sleep(Duration::from_millis(30));
+    let second = core.sleep_timer().remaining_ms.expect("timer still set");
+    assert!(
+        second < first,
+        "countdown must decrease: {first} then {second}"
+    );
+
+    // Invalid requests change nothing.
+    assert!(matches!(
+        core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 0 }),
+        Err(CoreError::InvalidConfig { .. })
+    ));
+    assert!(matches!(
+        core.set_sleep_timer(SleepTimerRequest::Minutes {
+            minutes: 24 * 60 + 1
+        }),
+        Err(CoreError::InvalidConfig { .. })
+    ));
+    assert!(core.sleep_timer().remaining_ms.is_some());
+
+    core.set_sleep_timer(SleepTimerRequest::EndOfTrack)
+        .expect("end of track");
+    rec.wait_for(
+        |e| {
+            matches!(
+                e,
+                CoreEvent::SleepTimerChanged {
+                    remaining_ms: None,
+                    end_of_track: true
+                }
+            )
+        },
+        "end-of-track sleep confirmed",
+    );
+    assert_eq!(
+        core.sleep_timer(),
+        SleepTimerInfo {
+            remaining_ms: None,
+            end_of_track: true,
+        }
+    );
+
+    core.set_sleep_timer(SleepTimerRequest::Off).expect("off");
+    rec.wait_for(
+        |e| {
+            matches!(
+                e,
+                CoreEvent::SleepTimerChanged {
+                    remaining_ms: None,
+                    end_of_track: false
+                }
+            )
+        },
+        "sleep timer cleared",
+    );
+    assert_eq!(
+        core.sleep_timer(),
+        SleepTimerInfo {
+            remaining_ms: None,
+            end_of_track: false,
+        }
+    );
+    core.stop();
+}
+
+#[test]
+fn sleep_timer_set_before_playback_is_applied_to_the_first_player() {
+    let dir = TempDir::new("sleep-early");
+    let (core, rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+    // No player exists yet: the request is kept and the player gets it when it is built.
+    core.set_sleep_timer(SleepTimerRequest::Minutes { minutes: 3 })
+        .expect("3 minutes");
+    assert!(core.sleep_timer().remaining_ms.is_some());
+
+    let album = album_by_title(&core, "Album One");
+    core.play_album(album.id, 0).expect("play album");
+    rec.wait_for(
+        |e| {
+            matches!(
+                e,
+                CoreEvent::SleepTimerChanged { remaining_ms: Some(ms), .. } if *ms > 179_000
+            )
+        },
+        "timer applied to the new player",
+    );
+    core.stop();
+}
+
+#[test]
+fn replay_gain_settings_are_clamped_and_kept_across_playback() {
+    let dir = TempDir::new("replay-gain");
+    let (core, rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+    core.set_replay_gain(ReplayGainSettingsInfo {
+        mode: ReplayGainModeInfo::Track,
+        preamp_db: 30.0,
+    });
+    assert_eq!(
+        core.replay_gain_settings(),
+        ReplayGainSettingsInfo {
+            mode: ReplayGainModeInfo::Track,
+            preamp_db: 15.0,
+        }
+    );
+    let album = album_by_title(&core, "Album One");
+    let first = core
+        .album_tracks(album.id)
+        .expect("album tracks")
+        .first()
+        .expect("first track")
+        .id;
+    // Set before the player exists: the player is built with it, and playback still runs.
+    core.play_album(album.id, 0).expect("play album");
+    rec.wait_for(
+        |e| matches!(e, CoreEvent::Position { track_id, .. } if *track_id == first),
+        "position with replay gain set",
+    );
+    // No AAudio stream off Android, so no signal path carries the gain.
+    assert!(core.signal_path().is_none());
+    core.set_replay_gain(ReplayGainSettingsInfo {
+        mode: ReplayGainModeInfo::Off,
+        preamp_db: -99.0,
+    });
+    assert_eq!(core.replay_gain_settings().preamp_db, -15.0);
+    core.stop();
 }

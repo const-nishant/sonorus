@@ -35,6 +35,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.outlined.Bedtime
+import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
@@ -58,6 +60,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -87,8 +90,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.RepeatMode
+import dev.constnishant.sonorus.core.ReplayGainModeInfo
 import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.PlaybackUi
+import dev.constnishant.sonorus.data.SleepTimerUi
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.Artwork
 import dev.constnishant.sonorus.ui.components.SonorusChip
@@ -126,8 +131,14 @@ fun NowPlayingScreen(
     val repository = LocalContext.current.repository
     val viewModel: NowPlayingViewModel = viewModel { NowPlayingViewModel(checkNotNull(this[APPLICATION_KEY]), repository) }
     val playback by viewModel.playback.collectAsStateWithLifecycle()
+    val sleepTimer by viewModel.sleepTimer.collectAsStateWithLifecycle()
     val track = playback.track
     var showQueue by rememberSaveable { mutableStateOf(false) }
+    var showSleepPicker by rememberSaveable { mutableStateOf(false) }
+    // The saved ReplayGain mode, for the signal path dialog. Read from the settings store on entry.
+    val replayGainMode by produceState(initialValue = ReplayGainModeInfo.OFF) {
+        value = repository.replayGainSettings().mode
+    }
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val dismissY = remember { Animatable(0f) }
@@ -169,7 +180,12 @@ fun NowPlayingScreen(
             val landscape = maxWidth > maxHeight
             val scroll = rememberScrollState()
             Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 8.dp)) {
-                NowPlayingTopBar(onBack = onBack, dismissY = dismissY)
+                NowPlayingTopBar(
+                    onBack = onBack,
+                    dismissY = dismissY,
+                    sleepTimer = sleepTimer,
+                    onSleepTimer = { showSleepPicker = true },
+                )
 
                 when {
                     track == null -> Column(Modifier.weight(1f).verticalScroll(scroll)) {
@@ -200,6 +216,9 @@ fun NowPlayingScreen(
                                 playback = playback,
                                 track = track,
                                 viewModel = viewModel,
+                                sleepTimer = sleepTimer,
+                                replayGainMode = replayGainMode,
+                                onSleepTimer = { showSleepPicker = true },
                                 onAlbum = onAlbum,
                                 onArtist = onArtist,
                             )
@@ -221,6 +240,9 @@ fun NowPlayingScreen(
                             playback = playback,
                             track = track,
                             viewModel = viewModel,
+                            sleepTimer = sleepTimer,
+                            replayGainMode = replayGainMode,
+                            onSleepTimer = { showSleepPicker = true },
                             onAlbum = onAlbum,
                             onArtist = onArtist,
                         )
@@ -234,14 +256,30 @@ fun NowPlayingScreen(
     if (showQueue) {
         QueueSheet(viewModel = viewModel, onDismiss = { showQueue = false })
     }
+    if (showSleepPicker) {
+        SleepTimerSheet(
+            active = sleepTimer.active,
+            onSelect = { request ->
+                showSleepPicker = false
+                viewModel.setSleepTimer(request)
+            },
+            onDismiss = { showSleepPicker = false },
+        )
+    }
 }
 
 /**
- * The collapse button and title row. Dragging it down moves the whole screen with the finger;
- * releasing past 150 dp, or flinging down, calls [onBack], otherwise the screen springs back.
+ * The collapse button, title row and sleep timer button. Dragging it down moves the whole screen
+ * with the finger; releasing past 150 dp, or flinging down, calls [onBack], otherwise the screen
+ * springs back. [onSleepTimer] opens the sleep timer picker; the icon is filled while a timer is set.
  */
 @Composable
-private fun NowPlayingTopBar(onBack: () -> Unit, dismissY: Animatable<Float, AnimationVector1D>) {
+private fun NowPlayingTopBar(
+    onBack: () -> Unit,
+    dismissY: Animatable<Float, AnimationVector1D>,
+    sleepTimer: SleepTimerUi,
+    onSleepTimer: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
     val currentOnBack by rememberUpdatedState(onBack)
     Row(
@@ -282,7 +320,13 @@ private fun NowPlayingTopBar(onBack: () -> Unit, dismissY: Animatable<Float, Ani
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Spacer(Modifier.size(48.dp))
+        IconButton(onClick = onSleepTimer) {
+            Icon(
+                imageVector = if (sleepTimer.active) Icons.Rounded.Bedtime else Icons.Outlined.Bedtime,
+                contentDescription = stringResource(R.string.cd_sleep_timer),
+                tint = if (sleepTimer.active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -417,13 +461,17 @@ private fun UpNextButton(onClick: () -> Unit) {
 
 /**
  * Everything below the cover when a track is loaded: recovery notice, title and links, quality
- * chips, seek bar and transport controls.
+ * chips (with the sleep countdown chip while a timer is set), seek bar and transport controls.
+ * [replayGainMode] is passed to the signal path dialog; [onSleepTimer] opens the sleep timer picker.
  */
 @Composable
 private fun NowPlayingDetails(
     playback: PlaybackUi,
     track: TrackInfo,
     viewModel: NowPlayingViewModel,
+    sleepTimer: SleepTimerUi,
+    replayGainMode: ReplayGainModeInfo,
+    onSleepTimer: () -> Unit,
     onAlbum: (Long) -> Unit,
     onArtist: (Long) -> Unit,
 ) {
@@ -500,7 +548,7 @@ private fun NowPlayingDetails(
         }
     }
 
-    if (quality != null || pathChip != null) {
+    if (quality != null || pathChip != null || sleepTimer.active) {
         Spacer(Modifier.height(8.dp))
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -512,6 +560,9 @@ private fun NowPlayingDetails(
             if (pathChip != null) {
                 SignalPathChip(path = pathChip, onClick = { showSignalPath = true })
             }
+            if (sleepTimer.active) {
+                SleepChip(timer = sleepTimer, onClick = onSleepTimer)
+            }
         }
     }
 
@@ -519,6 +570,7 @@ private fun NowPlayingDetails(
         SignalPathDialog(
             path = pathChip,
             dac = dac,
+            replayGainMode = replayGainMode,
             onDismiss = { showSignalPath = false },
         )
     }

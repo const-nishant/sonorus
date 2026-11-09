@@ -29,6 +29,9 @@ pub struct RingStats {
     pub decoder_done: AtomicBool,
     /// f32 bits, default 1.0.
     volume_bits: AtomicU32,
+    /// f32 bits, default 1.0. Sleep-timer fade, applied with the volume on the float path only;
+    /// the user volume is left alone.
+    fade_bits: AtomicU32,
 }
 
 impl RingStats {
@@ -40,6 +43,7 @@ impl RingStats {
             underruns: AtomicU64::new(0),
             decoder_done: AtomicBool::new(false),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
+            fade_bits: AtomicU32::new(1.0f32.to_bits()),
         }
     }
 
@@ -52,6 +56,17 @@ impl RingStats {
     /// Current volume in `0.0..=1.0`.
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
+    }
+
+    /// Clamps `v` to `0.0..=1.0`; NaN becomes 1.0. Multiplies the float output (see `fade`).
+    pub fn set_fade(&self, v: f32) {
+        let v = if v.is_nan() { 1.0 } else { v.clamp(0.0, 1.0) };
+        self.fade_bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Current fade in `0.0..=1.0`, default 1.0. Only the float renderer applies it.
+    pub fn fade(&self) -> f32 {
+        f32::from_bits(self.fade_bits.load(Ordering::Relaxed))
     }
 
     /// Samples pushed but not yet played.
@@ -100,9 +115,9 @@ pub fn render_f32(
     let frames_avail = consumer.slots() / channels;
     let n = frames_wanted.min(frames_avail);
 
-    // Volume applied once per callback; `I32_TO_F32_SCALE` is a power of two, so folding it
-    // into the gain does not change rounding.
-    let gain = stats.volume() * I32_TO_F32_SCALE;
+    // Volume and fade applied once per callback; `I32_TO_F32_SCALE` is a power of two, so folding
+    // it into the gain does not change rounding. A fade of 1.0 leaves the output unchanged.
+    let gain = stats.volume() * I32_TO_F32_SCALE * stats.fade();
 
     let mut frames = 0;
     if n > 0
@@ -333,6 +348,38 @@ mod tests {
         render_f32(&mut c, &mut out, CH, &stats);
         assert_eq!(out[0], -0.5);
         assert_eq!(out[1], 0.25);
+    }
+
+    #[test]
+    fn fade_scales_float_output_only() {
+        let stats = RingStats::new();
+        stats.set_fade(0.5);
+        assert_eq!(stats.fade(), 0.5);
+        assert_eq!(stats.volume(), 1.0, "fade must not touch the volume");
+        let (mut p, mut c) = ring(16);
+        push_frames(&mut p, &[i32::MIN, 1 << 30], CH, &stats);
+        let mut out = [0.0f32; 2];
+        render_f32(&mut c, &mut out, CH, &stats);
+        assert_eq!(out, [-0.5, 0.25]);
+
+        // The integer renderer ignores fade, like volume.
+        stats.set_fade(0.1);
+        push_frames(&mut p, &[7, 8], CH, &stats);
+        let mut ints = [0i32; 2];
+        render_i32(&mut c, &mut ints, CH, &stats);
+        assert_eq!(ints, [7, 8]);
+    }
+
+    #[test]
+    fn set_fade_clamps_and_nan_is_one() {
+        let stats = RingStats::new();
+        assert_eq!(stats.fade(), 1.0);
+        stats.set_fade(2.0);
+        assert_eq!(stats.fade(), 1.0);
+        stats.set_fade(-1.0);
+        assert_eq!(stats.fade(), 0.0);
+        stats.set_fade(f32::NAN);
+        assert_eq!(stats.fade(), 1.0);
     }
 
     #[test]

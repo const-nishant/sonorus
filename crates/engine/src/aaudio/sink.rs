@@ -19,7 +19,7 @@ use super::{
     StreamInfo, latency_for, path_mode,
 };
 use crate::error::{EngineError, Result};
-use crate::output::{OutputFormat, OutputSink};
+use crate::output::{OutputFormat, OutputSink, SampleKind};
 use crate::render::RingStats;
 
 /// Capacity of the supervisor channel.
@@ -432,6 +432,13 @@ impl OutputSink for AAudioSink {
 
     fn name(&self) -> &str {
         "aaudio"
+    }
+
+    /// The kind of the open stream, as negotiated: `Stream::open` only keeps a stream whose
+    /// format equals the planned one, and the plan may differ from the requested kind. `None`
+    /// while no stream is open (not started, stopped, or parked after a failed reopen).
+    fn opened_kind(&self) -> Option<SampleKind> {
+        lock(&self.shared).info.map(|info| info.sample)
     }
 }
 

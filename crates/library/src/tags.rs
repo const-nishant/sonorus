@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 use lofty::config::ParseOptions;
+#[cfg(test)]
+use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::probe::Probe;
@@ -66,6 +68,36 @@ fn codec_name(file_type: FileType) -> String {
     }
 }
 
+/// Largest accepted ReplayGain gain magnitude, in dB.
+const MAX_GAIN_DB: f32 = 64.0;
+/// Largest accepted ReplayGain peak (linear amplitude; 1.0 is full scale).
+const MAX_PEAK: f32 = 10.0;
+
+/// Removes a case-insensitive `dB` suffix and the whitespace before it.
+fn strip_db_suffix(s: &str) -> &str {
+    match s.len().checked_sub(2).and_then(|i| s.get(i..)) {
+        Some(tail) if tail.eq_ignore_ascii_case("db") => s[..s.len() - 2].trim_end(),
+        _ => s,
+    }
+}
+
+/// Parses a ReplayGain gain value such as `"-6.54 dB"`, `"+2.10 dB"`, `"-6.54"` or `"−6.54 dB"`
+/// (with a Unicode minus sign). Surrounding whitespace and a case-insensitive `dB` suffix are
+/// optional. Returns `None` for text that is not a number, for non-finite values, and for gains
+/// outside ±64 dB.
+pub fn parse_gain_db(s: &str) -> Option<f32> {
+    let number = strip_db_suffix(s.trim()).trim();
+    let value: f32 = number.replace('\u{2212}', "-").parse().ok()?;
+    (value.is_finite() && value.abs() <= MAX_GAIN_DB).then_some(value)
+}
+
+/// Parses a ReplayGain peak such as `"0.988525"` or `"1.000000"`. Returns `None` for text that is
+/// not a number, for non-finite values, and for peaks that are not in `(0, 10]`.
+pub fn parse_peak(s: &str) -> Option<f32> {
+    let value: f32 = s.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0 && value <= MAX_PEAK).then_some(value)
+}
+
 fn tag_text(tag: Option<&Tag>, get: impl Fn(&Tag) -> Option<Cow<'_, str>>) -> Option<String> {
     tag.and_then(get).and_then(|s| text(&s))
 }
@@ -105,6 +137,11 @@ pub fn read_meta<R: Read + Seek>(reader: R, ext_hint: Option<&str>) -> Result<Tr
 
     let lyrics = tag_item(tag, ItemKey::Lyrics).or_else(|| tag_item(tag, ItemKey::UnsyncLyrics));
 
+    // lofty maps ID3v2 `TXXX` frames to these keys by their description (case-insensitively),
+    // so MP3 files need no separate lookup.
+    let gain = |key| tag_item(tag, key).and_then(|s| parse_gain_db(&s));
+    let peak = |key| tag_item(tag, key).and_then(|s| parse_peak(&s));
+
     let cover = tag.and_then(|t| {
         let pictures = t.pictures();
         pictures
@@ -142,6 +179,10 @@ pub fn read_meta<R: Read + Seek>(reader: R, ext_hint: Option<&str>) -> Result<Tr
         channels: props.channels(),
         bitrate_kbps: props.audio_bitrate(),
         cover,
+        track_gain_db: gain(ItemKey::ReplayGainTrackGain),
+        track_peak: peak(ItemKey::ReplayGainTrackPeak),
+        album_gain_db: gain(ItemKey::ReplayGainAlbumGain),
+        album_peak: peak(ItemKey::ReplayGainAlbumPeak),
     })
 }
 
@@ -168,6 +209,37 @@ pub fn folder_cover_key(audio_key: &str, all_keys: &HashSet<String>) -> Option<S
         }
     }
     best.map(|(_, key)| key.clone())
+}
+
+/// Writes `items` into the primary tag of the audio file at `path` (creating the tag if the file
+/// has none), keeping the file's other tags. Used by tests to build tagged copies of fixtures.
+#[cfg(test)]
+pub(crate) fn write_test_tags(path: &std::path::Path, items: &[(ItemKey, &str)]) {
+    let mut tagged = lofty::read_from_path(path).expect("read fixture for tagging");
+    let tag_type = tagged.primary_tag_type();
+    if tagged.tag_mut(tag_type).is_none() {
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged.tag_mut(tag_type).expect("tag was just inserted");
+    for (key, value) in items {
+        tag.insert_text(*key, (*value).to_owned());
+    }
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .expect("write tags");
+}
+
+/// A silent MPEG-1 Layer III stream (128 kbps, 44.1 kHz, stereo) of `frames` frames, without tags.
+#[cfg(test)]
+pub(crate) fn silent_mp3(frames: usize) -> Vec<u8> {
+    const FRAME_LEN: usize = 417; // 144 * 128000 / 44100
+    let mut out = Vec::with_capacity(FRAME_LEN * frames);
+    for _ in 0..frames {
+        let mut frame = vec![0u8; FRAME_LEN];
+        frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        out.extend_from_slice(&frame);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -243,6 +315,46 @@ mod tests {
             Some("cover.png".to_owned())
         );
         assert_eq!(folder_cover_key("song.flac", &keys(&["x/cover.png"])), None);
+    }
+
+    #[test]
+    fn gain_parses_common_spellings() {
+        assert_eq!(parse_gain_db("-6.54 dB"), Some(-6.54));
+        assert_eq!(parse_gain_db("+2.10 dB"), Some(2.1));
+        assert_eq!(parse_gain_db("-6.54"), Some(-6.54));
+        assert_eq!(parse_gain_db("\u{2212}6.54 dB"), Some(-6.54));
+        assert_eq!(parse_gain_db("  -6.54 DB  "), Some(-6.54));
+        assert_eq!(parse_gain_db("-6.54dB"), Some(-6.54));
+        assert_eq!(parse_gain_db("0.00 dB"), Some(0.0));
+        assert_eq!(parse_gain_db("64 dB"), Some(64.0));
+        assert_eq!(parse_gain_db("-64.0 dB"), Some(-64.0));
+    }
+
+    #[test]
+    fn gain_rejects_bad_values() {
+        assert_eq!(parse_gain_db(""), None);
+        assert_eq!(parse_gain_db("dB"), None);
+        assert_eq!(parse_gain_db("   "), None);
+        assert_eq!(parse_gain_db("loud"), None);
+        assert_eq!(parse_gain_db("inf dB"), None);
+        assert_eq!(parse_gain_db("NaN"), None);
+        assert_eq!(parse_gain_db("65 dB"), None);
+        assert_eq!(parse_gain_db("-64.01 dB"), None);
+        assert_eq!(parse_gain_db("1e9"), None);
+    }
+
+    #[test]
+    fn peak_parses_and_rejects() {
+        assert_eq!(parse_peak("0.988525"), Some(0.988525));
+        assert_eq!(parse_peak(" 1.000000 "), Some(1.0));
+        assert_eq!(parse_peak("10"), Some(10.0));
+        assert_eq!(parse_peak("0"), None);
+        assert_eq!(parse_peak("-0.5"), None);
+        assert_eq!(parse_peak("10.5"), None);
+        assert_eq!(parse_peak("inf"), None);
+        assert_eq!(parse_peak("NaN"), None);
+        assert_eq!(parse_peak("0.5 dB"), None);
+        assert_eq!(parse_peak(""), None);
     }
 
     #[test]
@@ -345,6 +457,88 @@ mod fixture_tests {
         assert_eq!(m.channels, Some(2));
         assert!(m.duration_ms.is_some());
         assert!(m.cover.is_none());
+        assert_eq!(m.track_gain_db, None);
+        assert_eq!(m.track_peak, None);
+        assert_eq!(m.album_gain_db, None);
+        assert_eq!(m.album_peak, None);
+    }
+
+    const REPLAYGAIN: [(ItemKey, &str); 4] = [
+        (ItemKey::ReplayGainTrackGain, "-6.54 dB"),
+        (ItemKey::ReplayGainTrackPeak, "0.988525"),
+        (ItemKey::ReplayGainAlbumGain, "+2.10 dB"),
+        (ItemKey::ReplayGainAlbumPeak, "1.000000"),
+    ];
+
+    fn assert_replaygain(m: &TrackMeta) {
+        assert_close(m.track_gain_db, -6.54);
+        assert_close(m.track_peak, 0.988_525);
+        assert_close(m.album_gain_db, 2.10);
+        assert_close(m.album_peak, 1.0);
+    }
+
+    fn assert_close(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("replaygain value");
+        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn replaygain_tags_are_read_from_flac() {
+        let dir = crate::db::test_support::TempDir::new();
+        let path = dir.path().join("replaygain.flac");
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Artist A/Album One/01 - First Song.flac"
+        );
+        std::fs::copy(src, &path).expect("copy fixture");
+        write_test_tags(&path, &REPLAYGAIN);
+
+        let file = std::fs::File::open(&path).expect("open tagged copy");
+        let m = read_meta(file, Some("flac")).expect("read_meta");
+        assert_replaygain(&m);
+        assert_eq!(
+            m.title.as_deref(),
+            Some("First Song"),
+            "other tags are kept"
+        );
+    }
+
+    #[test]
+    fn replaygain_tags_are_read_from_mp3_txxx_frames() {
+        let dir = crate::db::test_support::TempDir::new();
+        let path = dir.path().join("replaygain.mp3");
+        std::fs::write(&path, silent_mp3(40)).expect("write mp3");
+        write_test_tags(&path, &REPLAYGAIN);
+
+        let file = std::fs::File::open(&path).expect("open tagged mp3");
+        let m = read_meta(file, Some("mp3")).expect("read_meta");
+        assert_replaygain(&m);
+    }
+
+    #[test]
+    fn replaygain_invalid_values_are_ignored() {
+        let dir = crate::db::test_support::TempDir::new();
+        let path = dir.path().join("bad.flac");
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Artist A/Album One/01 - First Song.flac"
+        );
+        std::fs::copy(src, &path).expect("copy fixture");
+        write_test_tags(
+            &path,
+            &[
+                (ItemKey::ReplayGainTrackGain, "loud"),
+                (ItemKey::ReplayGainTrackPeak, "0"),
+                (ItemKey::ReplayGainAlbumGain, "200 dB"),
+                (ItemKey::ReplayGainAlbumPeak, "11.0"),
+            ],
+        );
+        let file = std::fs::File::open(&path).expect("open tagged copy");
+        let m = read_meta(file, Some("flac")).expect("read_meta");
+        assert_eq!(m.track_gain_db, None);
+        assert_eq!(m.track_peak, None);
+        assert_eq!(m.album_gain_db, None);
+        assert_eq!(m.album_peak, None);
     }
 
     #[test]

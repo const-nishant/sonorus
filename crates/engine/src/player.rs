@@ -30,7 +30,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rtrb::Producer;
 
 use crate::decoder::{StreamInfo, TrackDecoder};
-use crate::opener::{OpenedSource, TrackOpener, TrackRef};
+use crate::gain::{ReplayGainSettings, linear_gain, scale_samples};
+use crate::opener::{OpenedSource, ReplayGain, TrackOpener, TrackRef};
 use crate::output::{OutputFormat, OutputSink, SampleKind};
 use crate::queue::{EntryId, Queue, QueueEntry, RepeatMode};
 use crate::render::{self, RingStats};
@@ -46,6 +47,25 @@ const PRELOAD_THREAD: &str = "sonorus-preload";
 const RING_FULL_WAIT: Duration = Duration::from_millis(5);
 /// `previous` restarts the current track when it is further in than this.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+/// Length of the fade before a timed sleep: the float output ramps from full level to silence.
+#[cfg(not(test))]
+const SLEEP_FADE_WINDOW: Duration = Duration::from_secs(10);
+/// Shortened in tests so the fade can be observed within a test run.
+#[cfg(test)]
+const SLEEP_FADE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Sleep timer, set with [`Player::set_sleep_timer`]. Only one timer is active at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepTimer {
+    /// No timer.
+    Off,
+    /// Pause at this instant. On the float output path the level fades out over the last 10 s
+    /// before it. On the integer path there is no fade.
+    At(Instant),
+    /// Pause when the current track ends: the next queue entry is loaded but paused. Gapless
+    /// hand-off to the next track is suppressed while this is set.
+    EndOfTrack,
+}
 
 /// Playback state as seen by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +116,18 @@ pub enum PlayerEvent {
         current: Option<EntryId>,
         shuffle: bool,
         repeat: RepeatMode,
+    },
+    /// The ReplayGain applied to the track that just started (or was reached by a gapless
+    /// hand-off, or restarted by a seek). `db` is the gain in dB, and `None` when no gain is
+    /// applied: ReplayGain off, track untagged, integer output, or a gain of exactly 1.0.
+    GainApplied {
+        db: Option<f32>,
+    },
+    /// The sleep timer was set, cleared or fired. `remaining` is the time left when an `At` timer
+    /// was set (`None` otherwise). `end_of_track` is true while an `EndOfTrack` timer is set.
+    SleepTimerChanged {
+        remaining: Option<Duration>,
+        end_of_track: bool,
     },
 }
 
@@ -168,6 +200,8 @@ impl Player {
             preload: None,
             preload_failed: None,
             recovery: None,
+            replay_gain: ReplayGainSettings::default(),
+            sleep_timer: SleepTimer::Off,
         };
         let thread = match thread::Builder::new()
             .name(PLAYER_THREAD.to_owned())
@@ -274,6 +308,19 @@ impl Player {
         self.send(Command::SetVolume(volume));
     }
 
+    /// Sets the ReplayGain settings. Applies from the next track: a track keeps the gain it was
+    /// started (or handed off) with, so a change during a track takes effect at the next one.
+    /// Gain is applied only on the float output path; integer (bit-perfect) output is never scaled.
+    pub fn set_replay_gain(&self, settings: ReplayGainSettings) {
+        self.send(Command::SetReplayGain(settings));
+    }
+
+    /// Sets the sleep timer, replacing any previous one. [`SleepTimer::Off`] clears it. The state
+    /// change is reported as [`PlayerEvent::SleepTimerChanged`].
+    pub fn set_sleep_timer(&self, timer: SleepTimer) {
+        self.send(Command::SetSleepTimer(timer));
+    }
+
     fn send(&self, cmd: Command) {
         // The controller only disappears after Shutdown or a panic; both leave nothing to do.
         let _ = self.tx.send(Msg::Cmd(cmd));
@@ -319,6 +366,8 @@ enum Command {
     Stop,
     Seek(Duration),
     SetVolume(f32),
+    SetReplayGain(ReplayGainSettings),
+    SetSleepTimer(SleepTimer),
     Shutdown,
 }
 
@@ -370,6 +419,8 @@ enum DecoderCmd {
     Start {
         producer: Producer<i32>,
         stats: Arc<RingStats>,
+        /// Linear gain for the decoder, set before its first block is pushed.
+        gain: f32,
     },
     Seek {
         to: Duration,
@@ -380,6 +431,8 @@ enum DecoderCmd {
         track_seq: u64,
         producer: Producer<i32>,
         stats: Arc<RingStats>,
+        /// Linear gain for the decoder, as for `Start`.
+        gain: f32,
     },
     /// Queues a gapless continuation, replacing any queued one.
     Next {
@@ -410,6 +463,8 @@ struct Preload {
     state: PreloadState,
     /// Stream description once the preload has finished opening.
     info: Option<StreamInfo>,
+    /// Gain in dB the decoder was handed off with (see `TrackGain::db`).
+    gain_db: Option<f32>,
 }
 
 enum PreloadState {
@@ -439,6 +494,8 @@ struct Boundary {
     track: TrackRef,
     info: StreamInfo,
     at_samples: u64,
+    /// Gain in dB the decoder was handed off with (see `TrackGain::db`).
+    gain_db: Option<f32>,
 }
 
 /// The currently loaded track and its decode thread.
@@ -502,6 +559,10 @@ struct Controller {
     preload_failed: Option<EntryId>,
     /// Set while a transient failure is being retried.
     recovery: Option<Recovery>,
+    /// ReplayGain settings. Read when a track's decoder is started or handed off.
+    replay_gain: ReplayGainSettings,
+    /// Active sleep timer.
+    sleep_timer: SleepTimer,
 }
 
 impl Controller {
@@ -572,6 +633,8 @@ impl Controller {
             Command::Stop => self.on_stop(),
             Command::Seek(to) => self.on_seek(to),
             Command::SetVolume(volume) => self.on_set_volume(volume),
+            Command::SetReplayGain(settings) => self.replay_gain = settings,
+            Command::SetSleepTimer(timer) => self.on_set_sleep_timer(timer),
             Command::Shutdown => self.stop_session(),
         }
     }
@@ -902,19 +965,23 @@ impl Controller {
         if !self.is_current(generation) {
             return;
         }
-        let track = match self.preload.take_if(|p| p.entry_id == entry_id) {
-            Some(preload) => preload.track,
+        let (track, gain_db) = match self.preload.take_if(|p| p.entry_id == entry_id) {
+            Some(preload) => (preload.track, preload.gain_db),
             None => match self.queue.get(entry_id) {
-                Some(entry) => entry.track.clone(),
+                Some(entry) => (entry.track.clone(), None),
                 None => {
                     // Removed from the queue after the hand-off. Its boundary can only be
                     // stale, so the track itself is never shown.
                     log::warn!("hand-off to entry {entry_id}, which is no longer queued");
-                    TrackRef {
-                        id: String::new(),
-                        key: String::new(),
-                        size: 0,
-                    }
+                    (
+                        TrackRef {
+                            id: String::new(),
+                            key: String::new(),
+                            size: 0,
+                            gain: None,
+                        },
+                        None,
+                    )
                 }
             },
         };
@@ -925,6 +992,7 @@ impl Controller {
                 track,
                 info,
                 at_samples: boundary_samples,
+                gain_db,
             });
         }
     }
@@ -947,7 +1015,7 @@ impl Controller {
         if !wanted {
             return;
         }
-        let decoder = match result {
+        let mut decoder = match result {
             Ok(decoder) => decoder,
             Err(message) => {
                 log::warn!("preload of entry {entry_id} failed: {message}");
@@ -957,22 +1025,34 @@ impl Controller {
             }
         };
         let info = decoder.info().clone();
+        // Queried before the borrows below. The open stream's kind decides both the bit depth
+        // a hand-off may carry and whether ReplayGain applies.
+        let kind = self.sink.opened_kind();
+        let float_path = float_output(kind, self.config.output_kind);
         let (Some(session), Some(preload)) = (self.session.as_ref(), self.preload.as_mut()) else {
             return;
         };
         preload.info = Some(info);
-        // The hand-off keeps the ring's format, so only a matching stream can continue it.
+        // The hand-off keeps the ring's format, so only a matching stream can continue it, and
+        // only when the open stream can hold every bit of the next track.
         let fits = match (session.info.as_ref(), preload.info.as_ref()) {
             (Some(current), Some(next)) => {
-                current.sample_rate == next.sample_rate && current.channels == next.channels
+                current.sample_rate == next.sample_rate
+                    && current.channels == next.channels
+                    && lossless_for(kind, current.bits_per_sample, next.bits_per_sample)
             }
             _ => false,
         };
         if fits {
+            // The gain is set on the decoder itself, so it switches exactly at the boundary.
+            let gain = track_gain(float_path, preload.track.gain.as_ref(), &self.replay_gain);
+            decoder.set_gain(gain.linear);
             // A failed send means the decode thread already exited; nothing will switch.
             let _ = session.cmd.send(DecoderCmd::Next { entry_id, decoder });
+            preload.gain_db = gain.db;
             preload.state = PreloadState::HandedOff;
         } else {
+            // Not handed off: a cold start at the boundary, which sets the gain when it starts.
             preload.state = PreloadState::Ready(decoder);
         }
     }
@@ -985,21 +1065,28 @@ impl Controller {
         let Some((producer, stats)) = self.start_ring(&info) else {
             return;
         };
+        let float_path = self.is_float_path();
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        let gain = track_gain(float_path, session.track.gain.as_ref(), &self.replay_gain);
         session.stats = Some(Arc::clone(&stats));
         session.base_frames = 0;
         session.sink_playing = false;
         session.last_underruns = 0;
         // A failed send means the decode thread already exited; nothing more will arrive.
-        let _ = session.cmd.send(DecoderCmd::Start { producer, stats });
+        let _ = session.cmd.send(DecoderCmd::Start {
+            producer,
+            stats,
+            gain: gain.linear,
+        });
         let next = if self.want_play {
             PlayerState::Buffering
         } else {
             PlayerState::Paused
         };
         self.set_state(next);
+        self.emit(PlayerEvent::GainApplied { db: gain.db });
     }
 
     /// Seeks an opened stream: new ring and output, decoder told to seek, position emitted.
@@ -1015,9 +1102,11 @@ impl Controller {
         let Some((producer, stats)) = self.start_ring(&info) else {
             return;
         };
+        let float_path = self.is_float_path();
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        let gain = track_gain(float_path, session.track.gain.as_ref(), &self.replay_gain);
         session.pending_seek = None;
         session.seek_seq = session.seek_seq.wrapping_add(1);
         session.seek_target = Some(to);
@@ -1035,6 +1124,7 @@ impl Controller {
             track_seq,
             producer,
             stats,
+            gain: gain.linear,
         });
         let next = if self.want_play {
             PlayerState::Buffering
@@ -1043,6 +1133,7 @@ impl Controller {
         };
         self.set_state(next);
         self.emit_position();
+        self.emit(PlayerEvent::GainApplied { db: gain.db });
     }
 
     /// Creates a ring and its stats, and starts the (paused) sink on them. Reports errors itself.
@@ -1209,7 +1300,12 @@ impl Controller {
 
     /// Drops the preload when auto-advance no longer wants it, cancelling a queued hand-off.
     fn sync_preload(&mut self) {
-        let want = self.queue.peek_auto_next().map(|e| e.id);
+        // An end-of-track timer keeps every next entry out: nothing is preloaded or handed off.
+        let want = if self.sleep_timer == SleepTimer::EndOfTrack {
+            None
+        } else {
+            self.queue.peek_auto_next().map(|e| e.id)
+        };
         let Some(preload) = self.preload.as_ref() else {
             return;
         };
@@ -1226,6 +1322,9 @@ impl Controller {
 
     /// Opens the entry auto-advance will play, once the current track is near its end.
     fn maybe_start_preload(&mut self) {
+        if self.sleep_timer == SleepTimer::EndOfTrack {
+            return;
+        }
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -1272,6 +1371,7 @@ impl Controller {
                     track,
                     state: PreloadState::Opening,
                     info: None,
+                    gain_db: None,
                 });
             }
             Err(e) => {
@@ -1306,10 +1406,12 @@ impl Controller {
             self.emit(PlayerEvent::TrackEnded { track_id: ended_id });
 
             if self.queue.peek_auto_next().map(|e| e.id) != Some(boundary.entry_id) {
-                // The queue changed after the hand-off: play what it now says instead.
+                // The queue changed after the hand-off: play what it now says instead. An
+                // end-of-track timer ends playback here, so the entry is loaded paused.
+                let end_of_track = self.take_end_of_track();
                 match self.queue.advance_auto().cloned() {
                     Some(entry) => {
-                        self.start_entry(entry, self.want_play, None);
+                        self.start_entry(entry, self.want_play && !end_of_track, None);
                         self.emit_queue();
                     }
                     None => self.go_idle(),
@@ -1322,6 +1424,7 @@ impl Controller {
             let at_samples = boundary.at_samples;
             let track_id = boundary.track.id.clone();
             let info = boundary.info;
+            let gain_db = boundary.gain_db;
             if let Some(session) = self.session.as_mut() {
                 session.track = boundary.track;
                 session.entry_id = entry_id;
@@ -1334,9 +1437,15 @@ impl Controller {
                 track_id: track_id.clone(),
             });
             self.emit(PlayerEvent::TrackLoaded { track_id, info });
+            self.emit(PlayerEvent::GainApplied { db: gain_db });
             self.emit_queue();
             self.emit_position();
             self.sync_preload();
+            // An end-of-track timer stops at this boundary: the new track is loaded, but paused.
+            if self.take_end_of_track() {
+                self.on_pause();
+                return true;
+            }
         }
     }
 
@@ -1378,6 +1487,88 @@ impl Controller {
         self.emit(event);
     }
 
+    /// Whether the output is on the float path, where ReplayGain and the sleep fade apply.
+    fn is_float_path(&self) -> bool {
+        float_output(self.sink.opened_kind(), self.config.output_kind)
+    }
+
+    /// Sets the sleep timer. Reports the new state; an `EndOfTrack` timer also drops any
+    /// hand-off or preload, which `sync_preload` cancels.
+    fn on_set_sleep_timer(&mut self, timer: SleepTimer) {
+        self.sleep_timer = timer;
+        // The fade is recomputed on the next tick for an `At` timer; anything else is full level.
+        self.set_fade(1.0);
+        let event = match timer {
+            SleepTimer::Off => PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: false,
+            },
+            SleepTimer::At(deadline) => PlayerEvent::SleepTimerChanged {
+                remaining: Some(deadline.saturating_duration_since(Instant::now())),
+                end_of_track: false,
+            },
+            SleepTimer::EndOfTrack => PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: true,
+            },
+        };
+        self.emit(event);
+        self.sync_preload();
+    }
+
+    /// Timed sleep step, run on every tick. Fades the float output inside the last
+    /// `SLEEP_FADE_WINDOW` before an `At` deadline, and fires the timer once the deadline passed.
+    /// While paused the timer is kept but the level is full.
+    fn tick_sleep_timer(&mut self) {
+        let SleepTimer::At(deadline) = self.sleep_timer else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            self.fire_sleep_timer();
+            return;
+        }
+        let fade = if self.want_play && self.is_float_path() {
+            sleep_fade(deadline.saturating_duration_since(now), SLEEP_FADE_WINDOW)
+        } else {
+            1.0
+        };
+        self.set_fade(fade);
+    }
+
+    /// The deadline of an `At` timer passed: pauses as `on_pause` does, restores the level and
+    /// clears the timer.
+    fn fire_sleep_timer(&mut self) {
+        self.sleep_timer = SleepTimer::Off;
+        self.on_pause();
+        self.set_fade(1.0);
+        self.emit(PlayerEvent::SleepTimerChanged {
+            remaining: None,
+            end_of_track: false,
+        });
+    }
+
+    /// Clears an `EndOfTrack` timer and reports it. Returns true when one was set, i.e. the
+    /// track that just ended is the one the timer was waiting for.
+    fn take_end_of_track(&mut self) -> bool {
+        if self.sleep_timer != SleepTimer::EndOfTrack {
+            return false;
+        }
+        self.sleep_timer = SleepTimer::Off;
+        self.emit(PlayerEvent::SleepTimerChanged {
+            remaining: None,
+            end_of_track: false,
+        });
+        true
+    }
+
+    /// Sets the fade multiplier on the current ring (no effect without a session).
+    fn set_fade(&self, fade: f32) {
+        if let Some(stats) = self.session.as_ref().and_then(|s| s.stats.as_ref()) {
+            stats.set_fade(fade);
+        }
+    }
+
     /// The output has played out the last track: final position, `TrackEnded`, then the next
     /// queue entry (cold or preloaded) or idle.
     fn drain_end(&mut self) {
@@ -1385,9 +1576,11 @@ impl Controller {
         if let Some(track_id) = self.session.as_ref().map(|s| s.track.id.clone()) {
             self.emit(PlayerEvent::TrackEnded { track_id });
         }
+        // An end-of-track timer ends playback here: the next entry is loaded, but paused.
+        let end_of_track = self.take_end_of_track();
         match self.queue.advance_auto().cloned() {
             Some(entry) => {
-                self.start_entry(entry, true, None);
+                self.start_entry(entry, !end_of_track, None);
                 self.emit_queue();
             }
             None => self.go_idle(),
@@ -1398,6 +1591,7 @@ impl Controller {
     /// end detection, preload start, position reporting. Does nothing without a session that
     /// has stats.
     fn tick(&mut self) {
+        self.tick_sleep_timer();
         if self.retry_recovery() {
             return;
         }
@@ -1470,6 +1664,70 @@ impl Controller {
     }
 }
 
+/// Whether output of kind `kind` is the float path. `None` (the sink cannot tell) falls back to the
+/// requested kind.
+fn float_output(kind: Option<SampleKind>, requested: SampleKind) -> bool {
+    kind.unwrap_or(requested) == SampleKind::F32
+}
+
+/// Gain of one track on the decode side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TrackGain {
+    /// Linear factor the decoder applies (1.0 = none).
+    linear: f32,
+    /// The same factor in dB for `GainApplied`. `None` when no gain is applied (factor 1.0).
+    db: Option<f32>,
+}
+
+/// The gain for a track with tags `rg`. ReplayGain is applied only on the float path (integer
+/// output is never scaled); everything else is unity.
+fn track_gain(
+    float_path: bool,
+    rg: Option<&ReplayGain>,
+    settings: &ReplayGainSettings,
+) -> TrackGain {
+    let linear = if float_path {
+        linear_gain(rg, settings)
+    } else {
+        1.0
+    };
+    let db = (linear != 1.0).then(|| 20.0 * linear.log10());
+    TrackGain { linear, db }
+}
+
+/// Whether a gapless hand-off to a track of `next_bits` keeps every bit of it on an output of
+/// `kind`. `current_bits` is the bit depth of the track being output. `kind == None` means the
+/// sink cannot tell, so the bit depth must not grow.
+fn lossless_for(
+    kind: Option<SampleKind>,
+    current_bits: Option<u32>,
+    next_bits: Option<u32>,
+) -> bool {
+    match kind {
+        Some(SampleKind::F32) => true,
+        Some(SampleKind::I32) => next_bits.is_none_or(|bits| bits <= 32),
+        Some(SampleKind::I24Packed) => match next_bits {
+            Some(bits) => bits <= 24,
+            None => current_bits.is_some_and(|bits| bits <= 24),
+        },
+        Some(SampleKind::I16) => next_bits.is_some_and(|bits| bits <= 16),
+        None => match (current_bits, next_bits) {
+            (None, None) => true,
+            (Some(current), Some(next)) => next <= current,
+            _ => false,
+        },
+    }
+}
+
+/// Output level during a sleep fade: linear from 1.0 at `window` before the deadline to 0.0 at it.
+fn sleep_fade(remaining: Duration, window: Duration) -> f32 {
+    if remaining >= window {
+        return 1.0;
+    }
+    // `remaining < window`, so the window is positive.
+    (remaining.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0)
+}
+
 /// Shuffle seed: `configured` when non-zero, otherwise nanoseconds since the Unix epoch.
 fn resolve_seed(configured: u64) -> u64 {
     if configured != 0 {
@@ -1540,7 +1798,11 @@ impl DecodeLoop {
 
             if self.offset >= self.block.len() {
                 match self.decoder.next_block::<i32>(&mut self.block) {
-                    Ok(Some(_)) => self.offset = 0,
+                    Ok(Some(_)) => {
+                        // The decoder's own gain, applied once per block before it reaches the ring.
+                        scale_samples(&mut self.block, self.decoder.gain());
+                        self.offset = 0;
+                    }
                     // Only reached once the previous block is fully pushed (`offset == len`).
                     Ok(None) => match self.next.take() {
                         Some((entry_id, decoder)) => self.switch(entry_id, decoder),
@@ -1635,6 +1897,7 @@ impl DecodeLoop {
                 track_seq,
                 producer,
                 stats,
+                gain,
             } => {
                 if track_seq != self.track_seq {
                     // The seek was meant for a track this thread has already finished. The
@@ -1650,6 +1913,7 @@ impl DecodeLoop {
                 }
                 self.producer = producer;
                 self.stats = stats;
+                self.decoder.set_gain(gain);
                 self.block.clear();
                 self.offset = 0;
                 self.eof = false;
@@ -1708,15 +1972,24 @@ fn decode_main(
     let mut next = None;
     let (producer, stats) = loop {
         match cmd_rx.recv() {
-            Ok(DecoderCmd::Start { producer, stats }) => break (producer, stats),
+            Ok(DecoderCmd::Start {
+                producer,
+                stats,
+                gain,
+            }) => {
+                decoder.set_gain(gain);
+                break (producer, stats);
+            }
             // No switch can happen before the loop starts, so `track_seq` is always 0 here.
             Ok(DecoderCmd::Seek {
                 to,
                 seq,
                 producer,
                 stats,
+                gain,
                 ..
             }) => {
+                decoder.set_gain(gain);
                 if !seek_decoder(&mut decoder, to, seq, generation, &msg_tx) {
                     return;
                 }
@@ -1809,6 +2082,7 @@ fn report(tx: &Sender<Msg>, msg: DecoderMsg) {
 mod tests {
     use super::*;
     use crate::error::Result;
+    use crate::gain::{ReplayGainMode, linear_gain};
     use crate::opener::FileOpener;
     use crate::output::NullSink;
     use std::collections::HashSet;
@@ -1844,6 +2118,18 @@ mod tests {
             id: key.to_string(),
             key: key.to_string(),
             size: 0,
+            gain: None,
+        }
+    }
+
+    /// A track whose tags give `track_gain_db` as its track gain.
+    fn tagged(key: &str, track_gain_db: f32) -> TrackRef {
+        TrackRef {
+            gain: Some(ReplayGain {
+                track_gain_db: Some(track_gain_db),
+                ..ReplayGain::default()
+            }),
+            ..track(key)
         }
     }
 
@@ -2256,6 +2542,7 @@ mod tests {
             .send(DecoderCmd::Start {
                 producer,
                 stats: Arc::clone(&stats),
+                gain: 1.0,
             })
             .expect("send start");
         cmd_tx
@@ -2339,7 +2626,11 @@ mod tests {
             })
             .expect("send next");
         cmd_tx
-            .send(DecoderCmd::Start { producer, stats })
+            .send(DecoderCmd::Start {
+                producer,
+                stats,
+                gain: 1.0,
+            })
             .expect("send start");
 
         let wait_for =
@@ -2370,6 +2661,7 @@ mod tests {
                 track_seq: 0,
                 producer: stale_producer,
                 stats: Arc::new(RingStats::new()),
+                gain: 1.0,
             })
             .expect("send seek");
         wait_for("SeekRejected", &mut msgs, &mut consumer);
@@ -2389,6 +2681,7 @@ mod tests {
                 track_seq: 1,
                 producer: fresh_producer,
                 stats: Arc::new(RingStats::new()),
+                gain: 1.0,
             })
             .expect("send seek");
         wait_for("Seeked", &mut msgs, &mut fresh_consumer);
@@ -2403,6 +2696,8 @@ mod tests {
         quit: Arc<AtomicBool>,
         playing: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        /// Kind of the stream started last; reported as `opened_kind` while started.
+        kind: Option<SampleKind>,
     }
 
     impl CaptureSink {
@@ -2412,6 +2707,7 @@ mod tests {
                 quit: Arc::new(AtomicBool::new(false)),
                 playing: Arc::new(AtomicBool::new(false)),
                 thread: None,
+                kind: None,
             }
         }
 
@@ -2433,11 +2729,12 @@ mod tests {
     impl OutputSink for CaptureSink {
         fn start(
             &mut self,
-            _format: OutputFormat,
+            format: OutputFormat,
             mut consumer: rtrb::Consumer<i32>,
             stats: Arc<RingStats>,
         ) -> Result<()> {
             self.halt();
+            self.kind = Some(format.sample);
             self.quit = Arc::new(AtomicBool::new(false));
             self.playing = Arc::new(AtomicBool::new(false));
             let quit = Arc::clone(&self.quit);
@@ -2481,6 +2778,7 @@ mod tests {
 
         fn stop(&mut self) {
             self.halt();
+            self.kind = None;
         }
 
         fn latency(&self) -> Duration {
@@ -2489,6 +2787,10 @@ mod tests {
 
         fn name(&self) -> &str {
             "capture"
+        }
+
+        fn opened_kind(&self) -> Option<SampleKind> {
+            self.kind
         }
     }
 
@@ -2896,5 +3198,444 @@ mod tests {
         let settled = opener.opens();
         thread::sleep(Duration::from_millis(200));
         assert_eq!(opener.opens(), settled, "reopened after stop");
+    }
+
+    /// Events between the first `TrackEnded` and the `TrackChanged` that follows it.
+    fn first_gap(events: &[PlayerEvent]) -> &[PlayerEvent] {
+        let end = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+            .expect("track ended");
+        let next = events[end..]
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::TrackChanged { .. }))
+            .map(|i| i + end)
+            .expect("second TrackChanged");
+        &events[end..next]
+    }
+
+    /// Output that renders with `NullSink` and keeps the stats of the ring it was started on, so
+    /// a test can read the fade the controller set.
+    struct StatsProbe {
+        inner: NullSink,
+        stats: Arc<Mutex<Option<Arc<RingStats>>>>,
+    }
+
+    impl OutputSink for StatsProbe {
+        fn start(
+            &mut self,
+            format: OutputFormat,
+            consumer: rtrb::Consumer<i32>,
+            stats: Arc<RingStats>,
+        ) -> Result<()> {
+            if let Ok(mut slot) = self.stats.lock() {
+                *slot = Some(Arc::clone(&stats));
+            }
+            self.inner.start(format, consumer, stats)
+        }
+
+        fn play(&mut self) -> Result<()> {
+            self.inner.play()
+        }
+
+        fn pause(&mut self) -> Result<()> {
+            self.inner.pause()
+        }
+
+        fn stop(&mut self) {
+            self.inner.stop();
+        }
+
+        fn latency(&self) -> Duration {
+            self.inner.latency()
+        }
+
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn opened_kind(&self) -> Option<SampleKind> {
+            self.inner.opened_kind()
+        }
+    }
+
+    /// Fade of the most recently started ring, if any.
+    fn current_fade(slot: &Mutex<Option<Arc<RingStats>>>) -> Option<f32> {
+        slot.lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|stats| stats.fade()))
+    }
+
+    fn is_fired(e: &PlayerEvent) -> bool {
+        matches!(
+            e,
+            PlayerEvent::SleepTimerChanged {
+                remaining: None,
+                end_of_track: false
+            }
+        )
+    }
+
+    /// Output gains reported by `GainApplied`, in order.
+    fn gain_events(events: &[PlayerEvent]) -> Vec<Option<f32>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::GainApplied { db } => Some(*db),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Multiplies `samples` by `gain` the way the decode thread does, written out independently of
+    /// `scale_samples` so the tests check the rule, not the helper.
+    fn scaled(samples: &[i32], gain: f32) -> Vec<i32> {
+        samples
+            .iter()
+            .map(|&s| {
+                (f64::from(s) * f64::from(gain)).clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+                    as i32
+            })
+            .collect()
+    }
+
+    fn track_mode() -> ReplayGainSettings {
+        ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+        }
+    }
+
+    /// A `CaptureSink` player with the given config and the captured-samples handle.
+    fn capture_player(
+        config: PlayerConfig,
+    ) -> (Player, Receiver<PlayerEvent>, Arc<Mutex<Vec<i32>>>) {
+        let captured = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let sink = Box::new(CaptureSink::new(Arc::clone(&captured)));
+        let (player, rx) = Player::new(sink, fixture_opener(), config);
+        (player, rx, captured)
+    }
+
+    fn captured_samples(captured: &Arc<Mutex<Vec<i32>>>) -> Vec<i32> {
+        captured.lock().expect("capture lock").clone()
+    }
+
+    #[test]
+    fn lossless_for_follows_the_sample_kind() {
+        use SampleKind::{F32, I16, I24Packed, I32};
+        // Float holds everything.
+        assert!(lossless_for(Some(F32), Some(16), Some(24)));
+        // 32-bit integers hold every PCM depth, and an unknown depth is accepted.
+        assert!(lossless_for(Some(I32), Some(16), Some(32)));
+        assert!(lossless_for(Some(I32), None, None));
+        // 24-bit packed: 24 bits or fewer; an unknown depth only when the current track is known to
+        // be 24 bits or fewer.
+        assert!(lossless_for(Some(I24Packed), Some(16), Some(24)));
+        assert!(!lossless_for(Some(I24Packed), Some(24), Some(32)));
+        assert!(lossless_for(Some(I24Packed), Some(24), None));
+        assert!(lossless_for(Some(I24Packed), Some(16), None));
+        assert!(!lossless_for(Some(I24Packed), None, None));
+        assert!(!lossless_for(Some(I24Packed), Some(32), None));
+        // 16-bit: only 16-bit sources; unknown depth is refused.
+        assert!(lossless_for(Some(I16), Some(16), Some(16)));
+        assert!(!lossless_for(Some(I16), Some(16), Some(24)));
+        assert!(!lossless_for(Some(I16), Some(16), None));
+        // Unknown sink kind: the depth must not grow.
+        assert!(lossless_for(None, None, None));
+        assert!(lossless_for(None, Some(24), Some(16)));
+        assert!(lossless_for(None, Some(24), Some(24)));
+        assert!(!lossless_for(None, Some(16), Some(24)));
+        assert!(!lossless_for(None, None, Some(16)));
+        assert!(!lossless_for(None, Some(16), None));
+    }
+
+    #[test]
+    fn sleep_fade_is_linear_inside_the_window() {
+        let window = Duration::from_secs(10);
+        assert_eq!(sleep_fade(Duration::from_secs(20), window), 1.0);
+        assert_eq!(sleep_fade(window, window), 1.0);
+        assert!((sleep_fade(Duration::from_secs(5), window) - 0.5).abs() < 1e-6);
+        assert_eq!(sleep_fade(Duration::ZERO, window), 0.0);
+    }
+
+    #[test]
+    fn narrow_output_cold_starts_for_a_wider_track() {
+        // 16-bit output: a 24-bit track at the same rate cannot be handed off without losing bits.
+        let config = PlayerConfig {
+            output_kind: SampleKind::I16,
+            ..test_config()
+        };
+        let (player, rx) = Player::new(
+            Box::new(NullSink::with_speed(4.0)),
+            fixture_opener(),
+            config,
+        );
+        player.set_queue(
+            vec![track("tone_16_44.flac"), track("tone_24_44.wav")],
+            0,
+            true,
+        );
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1, 2], "{events:#?}");
+        let rates: Vec<(u32, Option<u32>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlayerEvent::TrackLoaded { info, .. } => {
+                    Some((info.sample_rate, info.bits_per_sample))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rates,
+            vec![(44_100, Some(16)), (44_100, Some(24))],
+            "{events:#?}"
+        );
+        // A cold start goes through Loading between the two tracks; a hand-off never does.
+        assert!(
+            first_gap(&events)
+                .iter()
+                .any(|e| is_state(e, PlayerState::Loading)),
+            "no cold start: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn narrow_output_hands_off_a_track_of_the_same_width() {
+        let config = PlayerConfig {
+            output_kind: SampleKind::I16,
+            ..test_config()
+        };
+        let (player, rx) = Player::new(
+            Box::new(NullSink::with_speed(4.0)),
+            fixture_opener(),
+            config,
+        );
+        player.set_queue(
+            vec![track("tone_16_44.flac"), track("tone_16_44.wav")],
+            0,
+            true,
+        );
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1, 2], "{events:#?}");
+        assert!(
+            !first_gap(&events)
+                .iter()
+                .any(|e| is_state(e, PlayerState::Loading)),
+            "16-bit into 16-bit output must hand off: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn float_session_applies_replay_gain() {
+        let db = -6.0206;
+        let (player, rx, captured) = capture_player(test_config());
+        player.set_replay_gain(track_mode());
+        player.load(tagged("tone_24_96.flac", db), true);
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+
+        let raw = decode_fixture("tone_24_96.flac", "flac");
+        let g = linear_gain(tagged("x", db).gain.as_ref(), &track_mode());
+        assert!((g - 0.5).abs() < 0.001, "{g}");
+        let got = captured_samples(&captured);
+        assert!(got == scaled(&raw, g), "samples not scaled by {g}");
+        assert!(
+            got.iter()
+                .zip(&raw)
+                .all(|(a, b)| (i64::from(*a) - i64::from(*b) / 2).abs() <= 1),
+            "not halved"
+        );
+        let gains = gain_events(&events);
+        assert_eq!(gains.len(), 1, "{events:#?}");
+        assert!(
+            matches!(gains[0], Some(x) if (x - db).abs() < 0.01),
+            "{gains:?}"
+        );
+    }
+
+    #[test]
+    fn integer_session_is_bit_identical_with_gain_set() {
+        let config = PlayerConfig {
+            output_kind: SampleKind::I32,
+            ..test_config()
+        };
+        let (player, rx, captured) = capture_player(config);
+        player.set_replay_gain(track_mode());
+        player.load(tagged("tone_24_96.flac", -6.0206), true);
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert!(
+            captured_samples(&captured) == decode_fixture("tone_24_96.flac", "flac"),
+            "integer output must not be scaled"
+        );
+        assert_eq!(gain_events(&events), vec![None], "{events:#?}");
+    }
+
+    #[test]
+    fn gapless_handoff_switches_gain_at_the_boundary() {
+        let (player, rx, captured) = capture_player(test_config());
+        player.set_replay_gain(track_mode());
+        player.set_queue(
+            vec![
+                tagged("tone_24_96.flac", 0.0),
+                tagged("tone_24_96.wav", -6.0206),
+            ],
+            0,
+            true,
+        );
+        let events = collect_until(&rx, ends_idle);
+        assert!(ends_idle(&events), "not idle at end: {events:#?}");
+        assert_eq!(changed_ids(&events), vec![1, 2], "{events:#?}");
+
+        let flac = decode_fixture("tone_24_96.flac", "flac");
+        let wav = decode_fixture("tone_24_96.wav", "wav");
+        let gain_b = linear_gain(tagged("x", -6.0206).gain.as_ref(), &track_mode());
+        let mut expected = flac.clone();
+        expected.extend(scaled(&wav, gain_b));
+        let got = captured_samples(&captured);
+        assert!(
+            got[..flac.len()] == flac[..],
+            "the first track must stay unscaled"
+        );
+        assert!(
+            got == expected,
+            "boundary mismatch; first difference at {:?}",
+            got.iter().zip(&expected).position(|(a, b)| a != b)
+        );
+
+        let gains = gain_events(&events);
+        assert_eq!(gains.len(), 2, "{events:#?}");
+        assert_eq!(gains[0], None);
+        assert!(
+            matches!(gains[1], Some(x) if (x + 6.0206).abs() < 0.01),
+            "{gains:?}"
+        );
+    }
+
+    #[test]
+    fn sleep_deadline_in_the_past_pauses_on_the_next_tick() {
+        let (player, rx) = player_with(fixture_opener(), 1.0);
+        player.load(track("tone_24_96.flac"), true);
+        let mut events = collect_until(&rx, |e| has_state(e, PlayerState::Playing));
+        player.set_sleep_timer(SleepTimer::At(Instant::now()));
+        events.extend(collect_until(&rx, |e| e.iter().any(is_fired)));
+        assert!(
+            events.iter().any(|e| is_state(e, PlayerState::Paused)),
+            "not paused at the deadline: {events:#?}"
+        );
+        // The fired timer leaves no fade behind and no further pause events.
+        assert!(
+            !events
+                .iter()
+                .skip_while(|e| !is_fired(e))
+                .any(|e| is_state(e, PlayerState::Playing)),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn sleep_fade_lowers_the_float_level_then_resets_at_the_deadline() {
+        let slot = Arc::new(Mutex::new(None::<Arc<RingStats>>));
+        let sink = Box::new(StatsProbe {
+            inner: NullSink::with_speed(1.0),
+            stats: Arc::clone(&slot),
+        });
+        let (player, rx) = Player::new(sink, fixture_opener(), test_config());
+        // The 0.3 s track repeats, so the window (1 s in tests) is reached at real time.
+        player.set_repeat(RepeatMode::One);
+        player.load(track("tone_24_96.flac"), true);
+        let mut events = collect_until(&rx, |e| has_state(e, PlayerState::Playing));
+        player.set_sleep_timer(SleepTimer::At(Instant::now() + Duration::from_millis(600)));
+
+        thread::sleep(Duration::from_millis(150));
+        let fade = current_fade(&slot).expect("ring started");
+        assert!(fade > 0.0 && fade < 1.0, "fade inside the window: {fade}");
+
+        events.extend(collect_until(&rx, |e| e.iter().any(is_fired)));
+        assert!(has_state(&events, PlayerState::Paused), "{events:#?}");
+        assert_eq!(current_fade(&slot), Some(1.0));
+        player.stop();
+    }
+
+    #[test]
+    fn end_of_track_timer_stops_after_the_current_track_paused() {
+        let (player, rx) = player_with(fixture_opener(), 1.0);
+        player.set_queue(
+            vec![
+                track("tone_24_96.flac"),
+                track("tone_24_96.wav"),
+                track("tone_24_96.flac"),
+            ],
+            0,
+            true,
+        );
+        let mut events = collect_until(&rx, |e| has_state(e, PlayerState::Playing));
+        player.set_sleep_timer(SleepTimer::EndOfTrack);
+        events.extend(collect_until(&rx, |e| has_state(e, PlayerState::Paused)));
+        events.extend(collect_for(&rx, Duration::from_millis(500)));
+
+        assert_eq!(changed_ids(&events), vec![1, 2], "{events:#?}");
+        let second = events
+            .iter()
+            .rposition(|e| matches!(e, PlayerEvent::TrackChanged { entry_id: 2, .. }))
+            .expect("second track");
+        assert!(
+            !events[second..]
+                .iter()
+                .any(|e| is_state(e, PlayerState::Playing)),
+            "second track played: {events:#?}"
+        );
+        assert!(!has_state(&events, PlayerState::Idle), "{events:#?}");
+        assert!(events.iter().any(is_fired), "{events:#?}");
+        let current = queue_snapshots(&events).last().and_then(|s| s.1);
+        assert_eq!(current, Some(2));
+        player.stop();
+    }
+
+    #[test]
+    fn sleep_timer_set_and_clear_report_their_state() {
+        let (player, rx) = player_with(fixture_opener(), 4.0);
+        player.set_sleep_timer(SleepTimer::At(Instant::now() + Duration::from_secs(60)));
+        let events = collect_until(&rx, |e| {
+            e.iter().any(|x| {
+                matches!(
+                    x,
+                    PlayerEvent::SleepTimerChanged {
+                        remaining: Some(_),
+                        end_of_track: false
+                    }
+                )
+            })
+        });
+        let remaining = events
+            .iter()
+            .find_map(|e| match e {
+                PlayerEvent::SleepTimerChanged {
+                    remaining: Some(r), ..
+                } => Some(*r),
+                _ => None,
+            })
+            .expect("remaining reported");
+        assert!(remaining > Duration::from_secs(59), "{remaining:?}");
+
+        player.set_sleep_timer(SleepTimer::EndOfTrack);
+        let end = collect_until(&rx, |e| {
+            e.iter().any(|x| {
+                matches!(
+                    x,
+                    PlayerEvent::SleepTimerChanged {
+                        remaining: None,
+                        end_of_track: true
+                    }
+                )
+            })
+        });
+        assert!(!end.is_empty());
+        player.set_sleep_timer(SleepTimer::Off);
+        let off = collect_until(&rx, |e| e.iter().any(is_fired));
+        assert!(off.iter().any(is_fired), "{off:#?}");
     }
 }

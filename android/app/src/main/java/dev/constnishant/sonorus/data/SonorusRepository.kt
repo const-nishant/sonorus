@@ -13,8 +13,10 @@ import dev.constnishant.sonorus.core.CoreException
 import dev.constnishant.sonorus.core.DownloadStatus
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSettings
+import dev.constnishant.sonorus.core.ReplayGainSettingsInfo
 import dev.constnishant.sonorus.core.S3Settings
 import dev.constnishant.sonorus.core.SignalPathInfo
+import dev.constnishant.sonorus.core.SleepTimerRequest
 import dev.constnishant.sonorus.core.SonorusCore
 import dev.constnishant.sonorus.core.SyncSummary
 import dev.constnishant.sonorus.core.UploadJobInfo
@@ -62,6 +64,9 @@ class SonorusRepository(private val app: Context) {
 
     /** Persisted offline cache settings (limit, expiry, downloads on mobile data). */
     val cache = CacheSettingsStore(app)
+
+    /** Persisted ReplayGain settings (mode and pre-amp). Applied to the core when it opens. */
+    val replayGain = ReplayGainSettingsStore(app)
 
     /** UI state built from core events. */
     val events = CoreEvents()
@@ -112,6 +117,7 @@ class SonorusRepository(private val app: Context) {
             it.setListener(events)
             it.setOutputSettings(output.load())
             it.setCacheSettings(cache.load())
+            it.setReplayGain(replayGain.load())
             _configured.value = it.isConfigured()
         }
     }
@@ -231,6 +237,33 @@ class SonorusRepository(private val app: Context) {
     suspend fun setCacheSettings(settings: CacheSettings) {
         call { it.setCacheSettings(settings) }
         withContext(Dispatchers.IO) { cache.save(settings) }
+    }
+
+    /** The saved ReplayGain settings. Reads the preferences; blocking reads run on IO. */
+    suspend fun replayGainSettings(): ReplayGainSettingsInfo =
+        withContext(Dispatchers.IO) { replayGain.load() }
+
+    /**
+     * Stores the ReplayGain settings and applies them in the core. They take effect from the next
+     * track; the current one keeps its gain. Nothing is applied when the save fails, in which case
+     * it throws if the preferences cannot be written.
+     */
+    suspend fun setReplayGain(settings: ReplayGainSettingsInfo) {
+        withContext(Dispatchers.IO) { replayGain.save(settings) }
+        call { it.setReplayGain(settings) }
+    }
+
+    /**
+     * Sets, replaces or clears the sleep timer, then reads the timer state back from the core into
+     * [events]. The read-back makes the countdown show even when no player runs yet, because the
+     * core sends no event in that case. Throws a [CoreException] when the request is rejected.
+     */
+    suspend fun setSleepTimer(request: SleepTimerRequest) {
+        val info = call { sonorus ->
+            sonorus.setSleepTimer(request)
+            sonorus.sleepTimer()
+        }
+        events.applySleepTimer(info.remainingMs, info.endOfTrack)
     }
 
     /** How much the offline cache holds, and the settings in effect. */

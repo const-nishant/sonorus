@@ -1,7 +1,7 @@
 //! SQLite catalogue: schema and migrations, metadata resolution rules, and the write paths
 //! (upserts, removals, covers, pruning). Read queries live in `query.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -135,12 +135,31 @@ CREATE TABLE pins (
 );
 ";
 
+/// v5: ReplayGain values from the tags, plus the flag that makes the next scan re-read old rows.
+///
+/// Rows written before v5 have no ReplayGain values, and nothing in their stored stamp
+/// (size, etag) shows that they are stale. A NULL etag cannot serve as the trigger: a bucket
+/// object always has an etag, so NULL differs and re-reads, but a local-folder object has no
+/// etag (`None`), and `NULL` compared with `None` counts as unchanged, so it would never re-read.
+/// The migration therefore sets `needs_reread = 1` on every existing row. The scan treats that
+/// flag as a change for the key, and the upsert that stores the re-read track clears it. A row
+/// whose re-read fails keeps the flag and is retried by the next scan.
+const SCHEMA_V5: &str = "
+ALTER TABLE tracks ADD COLUMN rg_track_gain REAL;
+ALTER TABLE tracks ADD COLUMN rg_track_peak REAL;
+ALTER TABLE tracks ADD COLUMN rg_album_gain REAL;
+ALTER TABLE tracks ADD COLUMN rg_album_peak REAL;
+ALTER TABLE tracks ADD COLUMN needs_reread INTEGER NOT NULL DEFAULT 0;
+UPDATE tracks SET needs_reread = 1;
+";
+
 const UPSERT_TRACK_SQL: &str = "
 INSERT INTO tracks (key, size, etag, last_modified, title, artist, album_id, track_no, track_total,
     disc_no, disc_total, year, genre, duration_ms, sample_rate, bits_per_sample, channels,
-    bitrate_kbps, codec, cover_id, lyrics, added_at, updated_at)
+    bitrate_kbps, codec, cover_id, lyrics, added_at, updated_at,
+    rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, needs_reread)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-    ?21, ?22, ?23)
+    ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0)
 ON CONFLICT(key) DO UPDATE SET
     size = excluded.size,
     etag = excluded.etag,
@@ -162,7 +181,12 @@ ON CONFLICT(key) DO UPDATE SET
     codec = excluded.codec,
     cover_id = excluded.cover_id,
     lyrics = excluded.lyrics,
-    updated_at = excluded.updated_at
+    updated_at = excluded.updated_at,
+    rg_track_gain = excluded.rg_track_gain,
+    rg_track_peak = excluded.rg_track_peak,
+    rg_album_gain = excluded.rg_album_gain,
+    rg_album_peak = excluded.rg_album_peak,
+    needs_reread = 0
 RETURNING id
 ";
 
@@ -231,6 +255,14 @@ impl Library {
         Ok(out)
     }
 
+    /// Keys of catalogued tracks flagged for a re-read by the next scan (see `SCHEMA_V5`).
+    pub(crate) fn keys_needing_reread(&self) -> Result<HashSet<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT key FROM tracks WHERE needs_reread = 1")?;
+        let keys = stmt.query_map([], |r| r.get(0))?;
+        Ok(keys.collect::<rusqlite::Result<HashSet<String>>>()?)
+    }
+
     /// Inserts or updates the track for `stamp.key` together with its album and artist.
     /// Returns the track id.
     pub fn upsert_track(
@@ -278,6 +310,10 @@ impl Library {
                 meta.lyrics.as_deref().filter(|s| !s.is_empty()),
                 now,
                 now,
+                meta.track_gain_db,
+                meta.track_peak,
+                meta.album_gain_db,
+                meta.album_peak,
             ],
             |r| r.get(0),
         )?;
@@ -410,6 +446,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (2, SCHEMA_V2),
         (3, SCHEMA_V3),
         (4, SCHEMA_V4),
+        (5, SCHEMA_V5),
     ] {
         if version < target {
             let tx = conn.transaction()?;
@@ -672,6 +709,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{TempDir, meta, stamp};
     use super::*;
+    use crate::scan::{DirSource, MetaSource, scan};
+    use std::sync::Arc;
 
     #[test]
     fn leading_number_forms() {
@@ -1041,7 +1080,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, SCHEMA_VERSION);
         let favorites: i64 = conn
             .query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))
             .unwrap();
@@ -1050,6 +1089,89 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pins", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pins, 0);
+    }
+
+    #[test]
+    fn v4_database_upgrades_to_v5_flagging_existing_rows() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v4.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO artists (name) VALUES ('A');
+                 INSERT INTO albums (title, artist_id, added_at) VALUES ('B', 1, 0);
+                 INSERT INTO tracks (key, size, etag, title, artist, album_id, added_at, updated_at)
+                    VALUES ('a/b.flac', 5, 'etag-1', 't', 'A', 1, 0, 0);",
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        {
+            let conn = lib.lock();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 5);
+            let (gain, peak, flag): (Option<f64>, Option<f64>, i64) = conn
+                .query_row(
+                    "SELECT rg_track_gain, rg_track_peak, needs_reread FROM tracks WHERE key = 'a/b.flac'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((gain, peak, flag), (None, None, 1));
+        }
+        assert!(lib.keys_needing_reread().unwrap().contains("a/b.flac"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v4_rows_are_reread_by_the_next_scan() {
+        let fixtures = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"));
+        let key = "Artist A/Album One/01 - First Song.flac";
+        let size = std::fs::metadata(fixtures.join(key)).unwrap().len();
+        let dir = TempDir::new();
+        let db = dir.path().join("v4.db");
+        {
+            // A local-folder row: its etag is NULL, which equals the local source's `None`, so
+            // only the migration flag can make the scan read it again.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO artists (name) VALUES ('Artist A');
+                 INSERT INTO albums (title, artist_id, added_at) VALUES ('Album One', 1, 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tracks (key, size, etag, title, artist, album_id, added_at, updated_at)
+                 VALUES (?1, ?2, NULL, 'First Song', 'Artist A', 1, 0, 0)",
+                params![key, size as i64],
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        let source: Arc<dyn MetaSource> = Arc::new(DirSource::new(&fixtures));
+
+        let report = scan(&lib, Arc::clone(&source), "", 2, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(report.progress.updated, 1, "migrated row is re-read");
+        assert_eq!(report.progress.added, 3);
+        assert!(lib.keys_needing_reread().unwrap().is_empty());
+
+        let report = scan(&lib, source, "", 2, |_| {}).await.unwrap();
+        assert_eq!(
+            report.progress.total, 0,
+            "flag is cleared after the re-read"
+        );
     }
 
     #[test]
