@@ -4,7 +4,6 @@ import android.os.SystemClock
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -269,19 +268,14 @@ private fun List<LyricLineInfo>.currentLineIndex(positionMs: Long): Int {
 }
 
 /**
- * Scrolls so the line at [index] sits in the middle of the list. The line is first brought on
- * screen if it is off screen, then the remaining distance is animated.
+ * Scrolls so the line at [index] sits in the middle of the list. The list's top content padding is
+ * half the viewport, so an item scrolled to the start has its top edge at the center; scrolling a
+ * further half of its height centers it. Works whether or not the line is on screen yet.
  */
 private suspend fun centerLine(state: LazyListState, index: Int) {
     if (index < 0) return
-    if (state.layoutInfo.visibleItemsInfo.none { it.index == index }) {
-        state.scrollToItem(index)
-    }
-    val info = state.layoutInfo
-    val item = info.visibleItemsInfo.firstOrNull { it.index == index } ?: return
-    val itemCenter = item.offset + item.size / 2
-    val viewportCenter = info.viewportSize.height / 2
-    state.animateScrollBy((itemCenter - viewportCenter).toFloat())
+    val half = state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == index }?.size?.div(2) ?: 0
+    state.animateScrollToItem(index, scrollOffset = half)
 }
 
 /**

@@ -1234,7 +1234,8 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
 - [x] Now Playing lyrics pane (`LyricsPane.kt`): replaces the cover (portrait) / left pane (landscape), current line
   highlighted and centered with frame-interpolated position, manual scroll pauses auto-centering 4 s, tap to seek,
   plain-text fallback. A track without lyrics always shows its cover.
-- [ ] On-device check pending (phone was disconnected at commit time). Test data: `sonorus-test/Test Tones/Long
+- [x] Device check: sidecar picked up by the scan; auto-centering fixed (it ignored the half-viewport top padding;
+  now one `animateScrollToItem(index, scrollOffset = itemHeight / 2)`). Test data: `sonorus-test/Test Tones/Long
   Tones/01 - A440 Hi-Res.lrc` (45 lines, 4 s apart); "First Song" embeds a one-line LRC.
 
 ## Phase 19 — Discovery and stats
