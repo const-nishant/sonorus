@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -151,6 +151,24 @@ ALTER TABLE tracks ADD COLUMN rg_album_gain REAL;
 ALTER TABLE tracks ADD COLUMN rg_album_peak REAL;
 ALTER TABLE tracks ADD COLUMN needs_reread INTEGER NOT NULL DEFAULT 0;
 UPDATE tracks SET needs_reread = 1;
+";
+
+/// v6: sidecar `.lrc` lyrics, one row per track that has a sidecar object next to its audio file.
+///
+/// The row is keyed by the track's object key, like the user-data tables, so it survives re-reads
+/// of the audio file. `lrc_key` names the `.lrc` object the text came from; `size` and `etag` are
+/// its stamp, compared by the scan to decide whether to fetch it again. There is no foreign key:
+/// the tables that hang off a track by key (`track_fts` aside) are cleaned up by hand, and
+/// `Library::remove_tracks` deletes the row together with its track. `text` is empty when the
+/// sidecar holds only whitespace.
+const SCHEMA_V6: &str = "
+CREATE TABLE lyrics_sidecars (
+    track_key TEXT PRIMARY KEY,
+    lrc_key   TEXT NOT NULL,
+    size      INTEGER NOT NULL,
+    etag      TEXT,
+    text      TEXT NOT NULL
+);
 ";
 
 const UPSERT_TRACK_SQL: &str = "
@@ -334,12 +352,69 @@ impl Library {
         Ok(track_id)
     }
 
-    /// Deletes the tracks (and their search rows) for `keys`. Returns how many existed.
+    /// Stored sidecar rows keyed by track key (see `SCHEMA_V6`).
+    pub(crate) fn sidecar_rows(&self) -> Result<HashMap<String, SidecarRow>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT track_key, lrc_key, size, etag FROM lyrics_sidecars")?;
+        let rows = stmt.query_map([], |r| {
+            let size: i64 = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                SidecarRow {
+                    lrc_key: r.get(1)?,
+                    size: u64::try_from(size).unwrap_or(0),
+                    etag: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Stores (or replaces) the sidecar row of `track_key`. `text` is the decoded `.lrc` text.
+    pub(crate) fn upsert_sidecar(
+        &self,
+        track_key: &str,
+        lrc_key: &str,
+        size: u64,
+        etag: Option<&str>,
+        text: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO lyrics_sidecars (track_key, lrc_key, size, etag, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(track_key) DO UPDATE SET
+                lrc_key = excluded.lrc_key,
+                size = excluded.size,
+                etag = excluded.etag,
+                text = excluded.text",
+            params![track_key, lrc_key, to_i64(size), etag, text],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the sidecar row of `track_key`, if there is one.
+    pub(crate) fn remove_sidecar(&self, track_key: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM lyrics_sidecars WHERE track_key = ?1",
+            params![track_key],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the tracks (and their search and sidecar rows) for `keys`. Returns how many
+    /// existed.
     pub fn remove_tracks(&self, keys: &[String]) -> Result<usize> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut removed = 0;
         for key in keys {
+            tx.execute(
+                "DELETE FROM lyrics_sidecars WHERE track_key = ?1",
+                params![key],
+            )?;
             let id: Option<i64> = tx
                 .query_row("SELECT id FROM tracks WHERE key = ?1", params![key], |r| {
                     r.get(0)
@@ -431,6 +506,17 @@ impl Library {
     }
 }
 
+/// What a stored sidecar row remembers about its `.lrc` object (see `SCHEMA_V6`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidecarRow {
+    /// Object key of the `.lrc` the text was read from.
+    pub lrc_key: String,
+    /// Size of that object when it was read.
+    pub size: u64,
+    /// Etag of that object when it was read; `None` for a local folder.
+    pub etag: Option<String>,
+}
+
 fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
@@ -447,6 +533,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (3, SCHEMA_V3),
         (4, SCHEMA_V4),
         (5, SCHEMA_V5),
+        (6, SCHEMA_V6),
     ] {
         if version < target {
             let tx = conn.transaction()?;
@@ -1116,7 +1203,7 @@ mod tests {
             let v: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 5);
+            assert_eq!(v, SCHEMA_VERSION);
             let (gain, peak, flag): (Option<f64>, Option<f64>, i64) = conn
                 .query_row(
                     "SELECT rg_track_gain, rg_track_peak, needs_reread FROM tracks WHERE key = 'a/b.flac'",
@@ -1171,6 +1258,57 @@ mod tests {
         assert_eq!(
             report.progress.total, 0,
             "flag is cleared after the re-read"
+        );
+    }
+
+    #[test]
+    fn v5_database_upgrades_to_v6_with_no_sidecars() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v5.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.execute_batch(
+                "INSERT INTO artists (name) VALUES ('A');
+                 INSERT INTO albums (title, artist_id, added_at) VALUES ('B', 1, 0);
+                 INSERT INTO tracks (key, size, etag, title, artist, album_id, added_at, updated_at)
+                    VALUES ('a/b/c.flac', 5, 'etag-1', 't', 'A', 1, 0, 0);",
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        {
+            let conn = lib.lock();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 6);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM lyrics_sidecars", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        assert!(lib.sidecar_rows().unwrap().is_empty());
+
+        lib.upsert_sidecar("a/b/c.flac", "a/b/c.lrc", 9, Some("etag-1"), "[00:01.00]x")
+            .unwrap();
+        assert_eq!(
+            lib.sidecar_rows().unwrap().get("a/b/c.flac"),
+            Some(&SidecarRow {
+                lrc_key: "a/b/c.lrc".into(),
+                size: 9,
+                etag: Some("etag-1".into()),
+            })
+        );
+        assert_eq!(lib.remove_tracks(&["a/b/c.flac".to_owned()]).unwrap(), 1);
+        assert!(
+            lib.sidecar_rows().unwrap().is_empty(),
+            "removing a track removes its sidecar row"
         );
     }
 

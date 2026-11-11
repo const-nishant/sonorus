@@ -1,10 +1,13 @@
 package dev.constnishant.sonorus.ui.player
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CoreException
+import dev.constnishant.sonorus.core.LyricLineInfo
+import dev.constnishant.sonorus.core.LyricsInfo
 import dev.constnishant.sonorus.core.RepeatMode
 import dev.constnishant.sonorus.core.SignalPathInfo
 import dev.constnishant.sonorus.core.SleepTimerRequest
@@ -17,7 +20,9 @@ import dev.constnishant.sonorus.data.userMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -27,8 +32,26 @@ import kotlinx.coroutines.withTimeoutOrNull
 /** How long an undo waits for the core to report a re-added queue entry. */
 private const val RESTORE_TIMEOUT_MS = 5_000L
 
+/** Tag for the log lines this file writes. */
+private const val TAG = "NowPlayingViewModel"
+
 /** A favorite flag the user set for [trackId], shown until the track changes. */
 data class FavoriteOverride(val trackId: Long, val favorite: Boolean)
+
+/** The lyrics of the current track as the Now Playing screen shows them. */
+sealed interface LyricsUi {
+    /** The core is still reading the lyrics. */
+    data object Loading : LyricsUi
+
+    /** The track has no lyrics, or they could not be read. */
+    data object None : LyricsUi
+
+    /** Lyrics without timestamps, shown as one block of [text]. */
+    data class Plain(val text: String) : LyricsUi
+
+    /** Timed lyrics in time order. An empty [LyricLineInfo.text] is an instrumental gap. */
+    data class Synced(val lines: List<LyricLineInfo>) : LyricsUi
+}
 
 /**
  * State and commands for the Now Playing screen and its queue sheet. Player commands are
@@ -50,6 +73,19 @@ class NowPlayingViewModel(
 
     /** The sleep timer: the deadline of a timed sleep, or end-of-track. */
     val sleepTimer: StateFlow<SleepTimerUi> = repository.events.sleepTimer
+
+    private val _showLyrics = MutableStateFlow(false)
+
+    /** Whether the lyrics pane replaces the cover. Kept across tracks for the life of this model. */
+    val showLyrics: StateFlow<Boolean> = _showLyrics.asStateFlow()
+
+    private val _lyrics = MutableStateFlow<LyricsUi>(LyricsUi.None)
+
+    /** Lyrics of the current track. Loaded once per track id; a track without lyrics is [LyricsUi.None]. */
+    val lyrics: StateFlow<LyricsUi> = _lyrics.asStateFlow()
+
+    /** Lyrics already read, by track id. Only touched on the main thread. */
+    private val lyricsCache = HashMap<Long, LyricsUi>()
 
     private val _favoriteOverride = MutableStateFlow<FavoriteOverride?>(null)
 
@@ -74,6 +110,41 @@ class NowPlayingViewModel(
                 _favoriteOverride.value = null
             }
         }
+        // A new track cancels the read of the previous one.
+        viewModelScope.launch {
+            playback.map { it.track }.distinctUntilChangedBy { it?.id }.collectLatest { track ->
+                loadLyrics(track)
+            }
+        }
+    }
+
+    /** Shows or hides the lyrics pane. */
+    fun toggleLyrics() {
+        _showLyrics.update { !it }
+    }
+
+    /**
+     * Reads the lyrics of [track] into [lyrics]. Tracks without lyrics emit [LyricsUi.None] without
+     * a core call. A failed read is logged by its error type and emits [LyricsUi.None].
+     */
+    private suspend fun loadLyrics(track: TrackInfo?) {
+        if (track == null || !track.hasLyrics) {
+            _lyrics.value = LyricsUi.None
+            return
+        }
+        lyricsCache[track.id]?.let {
+            _lyrics.value = it
+            return
+        }
+        _lyrics.value = LyricsUi.Loading
+        val result = try {
+            lyricsUi(repository.call { it.trackLyrics(track.id) })
+        } catch (e: CoreException) {
+            Log.w(TAG, "Lyrics of track ${track.id} could not be read: ${e.javaClass.simpleName}")
+            LyricsUi.None
+        }
+        lyricsCache[track.id] = result
+        _lyrics.value = result
     }
 
     /** Plays when the play button shows play, pauses when it shows pause. */
@@ -202,5 +273,18 @@ class NowPlayingViewModel(
                 _tracks.update { it + (id to track) }
             }
         }
+    }
+}
+
+/**
+ * Maps the core's lyrics to the UI state. Synced lines win over plain text; empty or missing
+ * lyrics map to [LyricsUi.None].
+ */
+private fun lyricsUi(info: LyricsInfo?): LyricsUi {
+    val synced = info?.synced
+    return when {
+        !synced.isNullOrEmpty() -> LyricsUi.Synced(synced)
+        info != null && info.plain.isNotBlank() -> LyricsUi.Plain(info.plain)
+        else -> LyricsUi.None
     }
 }

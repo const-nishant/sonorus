@@ -1226,8 +1226,16 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   `sleepTimer()` / `CoreEvent.SleepTimerChanged`; Now Playing bedtime button, picker sheet and countdown chip.
 
 ## Phase 18 — Lyrics
-- [ ] `.lrc` sidecars + embedded lyrics at scan; Rust LRC parser; `lyrics_synced`; Now Playing lyrics pane with
-  auto-scroll and tap-to-seek.
+- [x] LRC parser (`crates/library/src/lrc.rs`: multi-timestamp lines, `[offset:]`, metadata tags, enhanced `<..>`
+  word stamps stripped, BOM/CRLF, empty timed lines kept as instrumental gaps).
+- [x] `.lrc` sidecars (same folder + stem) in schema v6 `lyrics_sidecars`, fetched only when new/changed (≤ 512 KiB,
+  UTF-8 then Latin-1), removed with the track or the object. Preference: synced sidecar > synced embedded > plain.
+  Core `trackLyrics(trackId) -> LyricsInfo?` (replaces `lyrics()`); `hasLyrics` covers sidecars.
+- [x] Now Playing lyrics pane (`LyricsPane.kt`): replaces the cover (portrait) / left pane (landscape), current line
+  highlighted and centered with frame-interpolated position, manual scroll pauses auto-centering 4 s, tap to seek,
+  plain-text fallback. A track without lyrics always shows its cover.
+- [ ] On-device check pending (phone was disconnected at commit time). Test data: `sonorus-test/Test Tones/Long
+  Tones/01 - A440 Hi-Res.lrc` (45 lines, 4 s apart); "First Song" embeds a one-line LRC.
 
 ## Phase 19 — Discovery and stats
 - [ ] Smart playlists (most played, recently added, hi-res only, never played, favorites); stats screen from

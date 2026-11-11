@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::lrc::LyricLine;
+
 /// Identity and change-detection data for one object in the bucket (or local folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectStamp {
@@ -47,6 +49,26 @@ pub struct TrackMeta {
     pub album_gain_db: Option<f32>,
     /// ReplayGain album peak as a linear amplitude (`REPLAYGAIN_ALBUM_PEAK`).
     pub album_peak: Option<f32>,
+}
+
+/// Where the lyrics text of a track came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LyricsSource {
+    /// A `.lrc` object next to the audio object.
+    Sidecar,
+    /// The lyrics tag of the audio file.
+    Embedded,
+}
+
+/// The lyrics of one track, resolved from its sidecar and its embedded tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackLyrics {
+    /// The timed lines, when the chosen text parses as LRC.
+    pub synced: Option<Vec<LyricLine>>,
+    /// Readable text: the line texts joined with '\n' for synced lyrics, or the plain text itself.
+    pub plain: Option<String>,
+    /// Where the chosen text came from.
+    pub source: LyricsSource,
 }
 
 /// A catalogued track with its album and artist names resolved.

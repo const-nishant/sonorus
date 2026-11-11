@@ -54,6 +54,8 @@
     <string name="cd_show_secret">Show secret</string>
     <string name="cd_hide_secret">Hide secret</string>
     <string name="cd_sleep_timer">Sleep timer</string>
+    <string name="cd_show_lyrics">Show lyrics</string>
+    <string name="cd_hide_lyrics">Hide lyrics</string>
 
     <!-- Snackbars -->
     <string name="snackbar_removed">Removed “%1$s”</string>
@@ -167,6 +169,9 @@
     <string name="now_playing_title">Now playing</string>
     <string name="now_playing_empty">Nothing is playing</string>
     <string name="now_playing_up_next">Up next</string>
+    <string name="lyrics_none">No lyrics for this song</string>
+    <string name="lyrics_play_from_here">Play from here</string>
+    <string name="lyrics_instrumental">♪</string>
     <string name="now_playing_retrying">Connection lost — retrying in %1$ds (attempt %2$d)</string>
     <string name="queue_empty">The queue is empty.</string>
     <string name="queue_unavailable">Unavailable</string>

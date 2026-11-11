@@ -12,9 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sonorus_core::router::OutputRouter;
 use sonorus_core::types::{
-    AlbumInfo, AlbumSort, CoreConfig, CoreEvent, OutputSampleFormat, OutputSettings, PlaybackState,
-    ReplayGainModeInfo, ReplayGainSettingsInfo, RoutePlanInfo, RouteRequestInfo, S3Settings,
-    SignalPathInfo, SleepTimerInfo, SleepTimerRequest, TrackInfo,
+    AlbumInfo, AlbumSort, CoreConfig, CoreEvent, LyricLineInfo, LyricsSourceInfo,
+    OutputSampleFormat, OutputSettings, PlaybackState, ReplayGainModeInfo, ReplayGainSettingsInfo,
+    RoutePlanInfo, RouteRequestInfo, S3Settings, SignalPathInfo, SleepTimerInfo, SleepTimerRequest,
+    TrackInfo,
 };
 use sonorus_core::{CoreError, EventListener, SonorusCore};
 
@@ -769,4 +770,84 @@ fn replay_gain_settings_are_clamped_and_kept_across_playback() {
     });
     assert_eq!(core.replay_gain_settings().preamp_db, -15.0);
     core.stop();
+}
+
+/// Copies a folder tree.
+fn copy_dir(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create dir");
+    for entry in fs::read_dir(src).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), &to).expect("copy file");
+        }
+    }
+}
+
+#[test]
+fn track_lyrics_round_trip_through_core() {
+    let dir = TempDir::new("lyrics");
+    let music = dir.path().join("music");
+    copy_dir(Path::new(FIXTURES), &music);
+    let lrc = music.join("Artist A/Album One/01 - First Song.lrc");
+    fs::write(&lrc, "[00:01.00]one\n[00:02.50]two\n").expect("write lrc");
+    let (core, _rec) = open(&dir, Some(music.to_str().expect("utf-8 path")));
+
+    let summary = core.scan_library().expect("scan");
+    assert!(summary.failures.is_empty(), "{summary:?}");
+    let find = |query: &str, suffix: &str| {
+        core.search(query.to_owned(), 10)
+            .expect("search")
+            .tracks
+            .into_iter()
+            .find(|t| t.key.ends_with(suffix))
+            .unwrap_or_else(|| panic!("track {suffix} not found"))
+    };
+    let track = find("first song", "01 - First Song.flac");
+    assert!(track.has_lyrics, "sidecar sets has_lyrics");
+    let lyrics = core
+        .track_lyrics(track.id)
+        .expect("lyrics")
+        .expect("track has lyrics");
+    assert_eq!(lyrics.source, LyricsSourceInfo::Sidecar);
+    assert_eq!(
+        lyrics.synced,
+        Some(vec![
+            LyricLineInfo {
+                time_ms: 1_000,
+                text: "one".to_owned()
+            },
+            LyricLineInfo {
+                time_ms: 2_500,
+                text: "two".to_owned()
+            },
+        ])
+    );
+    assert_eq!(lyrics.plain, "one\ntwo");
+
+    // A rewritten .lrc (new size) is picked up by the next scan.
+    fs::write(&lrc, "[00:01.00]one, again\n").expect("rewrite lrc");
+    core.scan_library().expect("rescan");
+    let lyrics = core.track_lyrics(track.id).expect("lyrics").expect("some");
+    assert_eq!(lyrics.plain, "one, again");
+
+    // Without the sidecar, the embedded LRC text of the fixture is used.
+    fs::remove_file(&lrc).expect("remove lrc");
+    core.scan_library().expect("rescan");
+    let lyrics = core.track_lyrics(track.id).expect("lyrics").expect("some");
+    assert_eq!(lyrics.source, LyricsSourceInfo::Embedded);
+    assert_eq!(
+        lyrics.synced,
+        Some(vec![LyricLineInfo {
+            time_ms: 0,
+            text: "hello".to_owned()
+        }])
+    );
+
+    let untagged = find("untagged", "03 - Untagged Track.flac");
+    assert!(!untagged.has_lyrics);
+    assert_eq!(core.track_lyrics(untagged.id).expect("lyrics"), None);
+    assert_eq!(core.track_lyrics(999_999).expect("lyrics"), None);
 }

@@ -6,14 +6,19 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Library, opt_conv};
 use crate::error::{LibraryError, Result};
-use crate::model::{Album, AlbumSort, Artist, LibraryStats, SearchResults, Track};
+use crate::lrc::{LyricLine, parse_lrc};
+use crate::model::{
+    Album, AlbumSort, Artist, LibraryStats, LyricsSource, SearchResults, Track, TrackLyrics,
+};
 
 /// Track columns plus the album and artist names; every track read goes through this.
 pub(crate) const TRACK_SELECT: &str =
     "SELECT t.id, t.key, t.size, t.etag, t.title, t.artist, ar.name, al.title,
         t.album_id, al.artist_id, t.track_no, t.disc_no, t.year, t.genre, t.duration_ms,
         t.sample_rate, t.bits_per_sample, t.channels, t.codec, t.cover_id,
-        (t.lyrics IS NOT NULL AND t.lyrics <> ''), t.added_at,
+        ((t.lyrics IS NOT NULL AND t.lyrics <> '')
+            OR EXISTS (SELECT 1 FROM lyrics_sidecars s WHERE s.track_key = t.key AND s.text <> '')),
+        t.added_at,
         t.rg_track_gain, t.rg_track_peak, t.rg_album_gain, t.rg_album_peak
     FROM tracks t
     JOIN albums al ON al.id = t.album_id
@@ -125,6 +130,48 @@ fn fts_terms(tokens: &[String]) -> String {
         .join(" AND ")
 }
 
+/// Chooses the lyrics to show from the sidecar text and the embedded text. Blank text counts as
+/// absent.
+///
+/// In order: a sidecar that parses as synced; embedded text that parses as synced; plain sidecar
+/// text; plain embedded text. `plain` is always set: the line texts joined with '\n' for synced
+/// lyrics, or the text itself. `None` when neither text is usable.
+pub(crate) fn resolve_lyrics(sidecar: Option<&str>, embedded: Option<&str>) -> Option<TrackLyrics> {
+    let sidecar = sidecar.filter(|s| !s.trim().is_empty());
+    let embedded = embedded.filter(|s| !s.trim().is_empty());
+    if let Some(lines) = sidecar.and_then(parse_lrc) {
+        return Some(synced(lines, LyricsSource::Sidecar));
+    }
+    if let Some(lines) = embedded.and_then(parse_lrc) {
+        return Some(synced(lines, LyricsSource::Embedded));
+    }
+    if let Some(text) = sidecar {
+        return Some(plain(text, LyricsSource::Sidecar));
+    }
+    embedded.map(|text| plain(text, LyricsSource::Embedded))
+}
+
+fn synced(lines: Vec<LyricLine>, source: LyricsSource) -> TrackLyrics {
+    let text = lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    TrackLyrics {
+        synced: Some(lines),
+        plain: Some(text),
+        source,
+    }
+}
+
+fn plain(text: &str, source: LyricsSource) -> TrackLyrics {
+    TrackLyrics {
+        synced: None,
+        plain: Some(text.to_owned()),
+        source,
+    }
+}
+
 impl Library {
     /// The track with `id`, or `LibraryError::NotFound`.
     pub fn track(&self, id: i64) -> Result<Track> {
@@ -175,6 +222,25 @@ impl Library {
             )
             .optional()?;
         Ok(lyrics.flatten().filter(|s| !s.is_empty()))
+    }
+
+    /// Lyrics of a track, or `None` if the track is missing or has no lyrics. See
+    /// `resolve_lyrics` for the order in which the sidecar and embedded texts are used.
+    pub fn track_lyrics(&self, track_id: i64) -> Result<Option<TrackLyrics>> {
+        let found: Option<(Option<String>, Option<String>)> = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT t.lyrics, s.text FROM tracks t
+                 LEFT JOIN lyrics_sidecars s ON s.track_key = t.key
+                 WHERE t.id = ?1",
+                params![track_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        Ok(found.and_then(|(embedded, sidecar)| {
+            resolve_lyrics(sidecar.as_deref(), embedded.as_deref())
+        }))
     }
 
     pub fn albums(&self, sort: AlbumSort, limit: u32, offset: u32) -> Result<Vec<Album>> {
@@ -355,6 +421,91 @@ mod tests {
     fn add(lib: &Library, key: &str, m: TrackMeta, cover: Option<i64>) -> i64 {
         let s: ObjectStamp = stamp(key, 1000);
         lib.upsert_track(&s, &m, cover).unwrap()
+    }
+
+    #[test]
+    fn resolve_lyrics_order() {
+        use crate::lrc::LyricLine;
+
+        assert_eq!(resolve_lyrics(None, None), None);
+        assert_eq!(
+            resolve_lyrics(Some("  \n"), Some("")),
+            None,
+            "blank is absent"
+        );
+
+        assert_eq!(
+            resolve_lyrics(None, Some("words")),
+            Some(TrackLyrics {
+                synced: None,
+                plain: Some("words".into()),
+                source: LyricsSource::Embedded,
+            })
+        );
+        assert_eq!(
+            resolve_lyrics(Some("side words"), Some("words")),
+            Some(TrackLyrics {
+                synced: None,
+                plain: Some("side words".into()),
+                source: LyricsSource::Sidecar,
+            })
+        );
+
+        let side_wins = resolve_lyrics(Some("[00:01.00]side"), Some("[00:02.00]emb")).unwrap();
+        assert_eq!(side_wins.source, LyricsSource::Sidecar);
+        assert_eq!(
+            side_wins.synced,
+            Some(vec![LyricLine {
+                time_ms: 1_000,
+                text: "side".into()
+            }])
+        );
+        assert_eq!(side_wins.plain.as_deref(), Some("side"));
+
+        let embedded_synced =
+            resolve_lyrics(Some("plain side"), Some("[00:02.00]e\n[00:03.00]f")).unwrap();
+        assert_eq!(embedded_synced.source, LyricsSource::Embedded);
+        assert_eq!(embedded_synced.synced.map(|v| v.len()), Some(2));
+        assert_eq!(embedded_synced.plain.as_deref(), Some("e\nf"));
+
+        let gap = resolve_lyrics(None, Some("[00:01.00]a\n[00:02.00]\n[00:03.00]c")).unwrap();
+        assert_eq!(gap.plain.as_deref(), Some("a\n\nc"), "gaps keep their line");
+    }
+
+    #[test]
+    fn sidecar_counts_as_lyrics_and_track_lyrics_reads_it() {
+        let dir = TempDir::new();
+        let lib = lib(&dir);
+        let key = "Artist A/Album One/01 - a.flac";
+        let id = add(&lib, key, meta("a", "Artist A", "Album One"), None);
+        assert!(!lib.track(id).unwrap().has_lyrics);
+        assert_eq!(lib.track_lyrics(id).unwrap(), None);
+
+        lib.upsert_sidecar(
+            key,
+            "Artist A/Album One/01 - a.lrc",
+            16,
+            None,
+            "[00:01.00]side",
+        )
+        .unwrap();
+        assert!(
+            lib.track(id).unwrap().has_lyrics,
+            "sidecar row sets has_lyrics"
+        );
+        assert!(lib.track_by_key(key).unwrap().unwrap().has_lyrics);
+        let lyrics = lib.track_lyrics(id).unwrap().expect("lyrics");
+        assert_eq!(lyrics.source, LyricsSource::Sidecar);
+        assert_eq!(lyrics.synced.map(|v| v.len()), Some(1));
+
+        lib.upsert_sidecar(key, "Artist A/Album One/01 - a.lrc", 2, None, "")
+            .unwrap();
+        assert!(
+            !lib.track(id).unwrap().has_lyrics,
+            "empty sidecar is no lyrics"
+        );
+        assert_eq!(lib.track_lyrics(id).unwrap(), None);
+        assert_eq!(lib.track_lyrics(9999).unwrap(), None);
     }
 
     #[test]

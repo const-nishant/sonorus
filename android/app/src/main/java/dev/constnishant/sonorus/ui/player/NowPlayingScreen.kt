@@ -40,6 +40,7 @@ import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Repeat
@@ -89,6 +90,7 @@ import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.AP
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.constnishant.sonorus.R
+import dev.constnishant.sonorus.core.PlaybackState
 import dev.constnishant.sonorus.core.RepeatMode
 import dev.constnishant.sonorus.core.ReplayGainModeInfo
 import dev.constnishant.sonorus.core.TrackInfo
@@ -132,7 +134,12 @@ fun NowPlayingScreen(
     val viewModel: NowPlayingViewModel = viewModel { NowPlayingViewModel(checkNotNull(this[APPLICATION_KEY]), repository) }
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val sleepTimer by viewModel.sleepTimer.collectAsStateWithLifecycle()
+    val lyrics by viewModel.lyrics.collectAsStateWithLifecycle()
+    val lyricsWanted by viewModel.showLyrics.collectAsStateWithLifecycle()
     val track = playback.track
+    // The preference survives tracks, but a track without lyrics always shows its cover, so the
+    // pane can never be stuck on with its (disabled) toggle unreachable.
+    val showLyrics = lyricsWanted && track?.hasLyrics == true
     var showQueue by rememberSaveable { mutableStateOf(false) }
     var showSleepPicker by rememberSaveable { mutableStateOf(false) }
     // The saved ReplayGain mode, for the signal path dialog. Read from the settings store on entry.
@@ -185,6 +192,9 @@ fun NowPlayingScreen(
                     dismissY = dismissY,
                     sleepTimer = sleepTimer,
                     onSleepTimer = { showSleepPicker = true },
+                    lyricsAvailable = track?.hasLyrics == true,
+                    showLyrics = showLyrics,
+                    onToggleLyrics = viewModel::toggleLyrics,
                 )
 
                 when {
@@ -203,12 +213,17 @@ fun NowPlayingScreen(
                     }
 
                     landscape -> Row(Modifier.weight(1f)) {
-                        CoverArt(
-                            path = track.coverPath,
+                        CoverOrLyrics(
+                            track = track,
+                            playback = playback,
+                            lyrics = lyrics,
+                            showLyrics = showLyrics,
                             dismissY = dismissY,
+                            onSeek = viewModel::seek,
                             onSkip = onSkip,
                             onDismiss = onBack,
                             modifier = Modifier.fillMaxHeight().padding(vertical = 8.dp).aspectRatio(1f),
+                            coverModifier = Modifier.fillMaxSize(),
                         )
                         Spacer(Modifier.width(24.dp))
                         Column(Modifier.weight(1f).verticalScroll(scroll)) {
@@ -226,15 +241,25 @@ fun NowPlayingScreen(
                         }
                     }
 
-                    else -> Column(Modifier.weight(1f).verticalScroll(scroll)) {
-                        Spacer(Modifier.height(8.dp))
-                        CoverArt(
-                            path = track.coverPath,
-                            dismissY = dismissY,
-                            onSkip = onSkip,
-                            onDismiss = onBack,
-                            modifier = Modifier.fillMaxWidth().aspectRatio(1f),
-                        )
+                    else -> Column(Modifier.weight(1f)) {
+                        // The cover or lyrics take the free height; the controls below keep their place.
+                        BoxWithConstraints(
+                            Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CoverOrLyrics(
+                                track = track,
+                                playback = playback,
+                                lyrics = lyrics,
+                                showLyrics = showLyrics,
+                                dismissY = dismissY,
+                                onSeek = viewModel::seek,
+                                onSkip = onSkip,
+                                onDismiss = onBack,
+                                modifier = Modifier.fillMaxSize(),
+                                coverModifier = Modifier.size(minOf(maxWidth, maxHeight)),
+                            )
+                        }
                         Spacer(Modifier.height(24.dp))
                         NowPlayingDetails(
                             playback = playback,
@@ -269,9 +294,11 @@ fun NowPlayingScreen(
 }
 
 /**
- * The collapse button, title row and sleep timer button. Dragging it down moves the whole screen
- * with the finger; releasing past 150 dp, or flinging down, calls [onBack], otherwise the screen
- * springs back. [onSleepTimer] opens the sleep timer picker; the icon is filled while a timer is set.
+ * The collapse button, title row, lyrics toggle and sleep timer button. Dragging it down moves the
+ * whole screen with the finger; releasing past 150 dp, or flinging down, calls [onBack], otherwise
+ * the screen springs back. [onSleepTimer] opens the sleep timer picker; the icon is filled while a
+ * timer is set. The lyrics button is disabled unless the track has lyrics; it is tinted while the
+ * lyrics are shown and [onToggleLyrics] flips them.
  */
 @Composable
 private fun NowPlayingTopBar(
@@ -279,6 +306,9 @@ private fun NowPlayingTopBar(
     dismissY: Animatable<Float, AnimationVector1D>,
     sleepTimer: SleepTimerUi,
     onSleepTimer: () -> Unit,
+    lyricsAvailable: Boolean,
+    showLyrics: Boolean,
+    onToggleLyrics: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val currentOnBack by rememberUpdatedState(onBack)
@@ -320,11 +350,71 @@ private fun NowPlayingTopBar(
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        IconButton(onClick = onSleepTimer) {
-            Icon(
-                imageVector = if (sleepTimer.active) Icons.Rounded.Bedtime else Icons.Outlined.Bedtime,
-                contentDescription = stringResource(R.string.cd_sleep_timer),
-                tint = if (sleepTimer.active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(
+                onClick = onToggleLyrics,
+                enabled = lyricsAvailable,
+                modifier = Modifier.alpha(if (lyricsAvailable) 1f else 0.38f),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Lyrics,
+                    contentDescription = stringResource(
+                        if (showLyrics) R.string.cd_hide_lyrics else R.string.cd_show_lyrics,
+                    ),
+                    tint = if (showLyrics) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onSleepTimer) {
+                Icon(
+                    imageVector = if (sleepTimer.active) Icons.Rounded.Bedtime else Icons.Outlined.Bedtime,
+                    contentDescription = stringResource(R.string.cd_sleep_timer),
+                    tint = if (sleepTimer.active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The cover slot: the big cover, or the lyrics pane when [showLyrics] is on, crossfaded in place.
+ * [modifier] sizes the slot and [coverModifier] sizes the cover within it. The lyrics pane fills
+ * the slot and has no swipe gestures, since it scrolls vertically.
+ */
+@Composable
+private fun CoverOrLyrics(
+    track: TrackInfo,
+    playback: PlaybackUi,
+    lyrics: LyricsUi,
+    showLyrics: Boolean,
+    dismissY: Animatable<Float, AnimationVector1D>,
+    onSeek: (Long) -> Unit,
+    onSkip: (forward: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier,
+    coverModifier: Modifier,
+) {
+    AnimatedContent(
+        targetState = showLyrics,
+        modifier = modifier,
+        contentAlignment = Alignment.Center,
+        transitionSpec = { fadeIn() togetherWith fadeOut() },
+        label = "cover-lyrics",
+    ) { lyricsShown ->
+        if (lyricsShown) {
+            LyricsPane(
+                lyrics = lyrics,
+                positionMs = playback.positionMs,
+                playing = playback.state == PlaybackState.PLAYING,
+                onSeek = onSeek,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            CoverArt(
+                path = track.coverPath,
+                dismissY = dismissY,
+                onSkip = onSkip,
+                onDismiss = onDismiss,
+                modifier = coverModifier,
             )
         }
     }

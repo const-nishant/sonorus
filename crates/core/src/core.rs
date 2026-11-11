@@ -47,10 +47,10 @@ use crate::router::{OutputRouter, RouterPlanner};
 use crate::types::output_info_from;
 use crate::types::{
     AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, Converter, CoreConfig,
-    CoreEvent, DownloadStatus, LibraryStatsInfo, OutputInfo, OutputSettings, PlaylistEntryInfo,
-    PlaylistInfo, RepeatMode, ReplayGainSettingsInfo, S3Settings, ScanProgressInfo, ScanSummary,
-    SearchResult, SignalPathInfo, SleepTimerInfo, SleepTimerRequest, SyncSummary, TrackInfo,
-    UploadJobInfo,
+    CoreEvent, DownloadStatus, LibraryStatsInfo, LyricsInfo, OutputInfo, OutputSettings,
+    PlaylistEntryInfo, PlaylistInfo, RepeatMode, ReplayGainSettingsInfo, S3Settings,
+    ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SleepTimerInfo, SleepTimerRequest,
+    SyncSummary, TrackInfo, UploadJobInfo,
 };
 use crate::upload::{
     CancelRoute, RunEnv, UploadClaim, UploadControl, cancel_job, prepare_job, request_cancel,
@@ -315,9 +315,10 @@ impl SonorusCore {
         Ok(Converter::new(&self.library)?.search(results))
     }
 
-    /// The embedded lyrics of a track, if it has any. Blocking.
-    pub fn lyrics(&self, track_id: i64) -> CoreResult<Option<String>> {
-        Ok(self.library.lyrics(track_id)?)
+    /// The lyrics of a track: a `.lrc` sidecar or the embedded tag, synced when the text has
+    /// timestamps. `None` if the track is missing or has no lyrics. Blocking.
+    pub fn track_lyrics(&self, track_id: i64) -> CoreResult<Option<LyricsInfo>> {
+        Ok(self.library.track_lyrics(track_id)?.map(LyricsInfo::from))
     }
 
     /// Scans the configured backend into the catalogue. Progress and the result arrive as

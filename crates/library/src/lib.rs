@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod favorites;
 pub mod history;
+pub mod lrc;
 pub mod model;
 pub mod pins;
 pub mod playlists;
@@ -16,9 +17,11 @@ pub mod uploads;
 
 pub use db::Library;
 pub use error::{LibraryError, Result};
+pub use lrc::{LyricLine, parse_lrc};
 pub use model::{
-    Album, AlbumSort, Artist, CoverImage, FavoriteRecord, LibraryStats, ObjectStamp, Playlist,
-    PlaylistEntry, PlaylistRecord, PruneStats, SearchResults, Track, TrackMeta,
+    Album, AlbumSort, Artist, CoverImage, FavoriteRecord, LibraryStats, LyricsSource, ObjectStamp,
+    Playlist, PlaylistEntry, PlaylistRecord, PruneStats, SearchResults, Track, TrackLyrics,
+    TrackMeta,
 };
 pub use pins::{Pin, PinKind, PinnedTrack};
 pub use remote::RemoteReader;

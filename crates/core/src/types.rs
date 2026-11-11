@@ -18,8 +18,9 @@ use sonorus_engine::player::{PlayerEvent, PlayerState};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_library::uploads::{UploadRow, UploadState as LibraryUploadState};
 use sonorus_library::{
-    Album, AlbumSort as LibraryAlbumSort, Artist, Library, LibraryStats, Playlist, PlaylistEntry,
-    ScanProgress, ScanReport, SearchResults, SyncReport, Track,
+    Album, AlbumSort as LibraryAlbumSort, Artist, Library, LibraryStats, LyricLine, LyricsSource,
+    Playlist, PlaylistEntry, ScanProgress, ScanReport, SearchResults, SyncReport, Track,
+    TrackLyrics,
 };
 use sonorus_storage::{StorageConfig, normalize_prefix, region_from_endpoint};
 
@@ -184,10 +185,39 @@ pub struct TrackInfo {
     pub size: u64,
     /// Absolute path of the cover image file, when there is one.
     pub cover_path: Option<String>,
-    /// Whether the track has embedded lyrics.
+    /// Whether the track has lyrics, embedded or from a `.lrc` sidecar.
     pub has_lyrics: bool,
     /// Whether the track is in the favorites.
     pub is_favorite: bool,
+}
+
+/// One timed line of synced lyrics.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LyricLineInfo {
+    /// Start time from the beginning of the track, in milliseconds.
+    pub time_ms: u64,
+    /// Line text. Empty for an instrumental gap.
+    pub text: String,
+}
+
+/// Where the lyrics of a track came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LyricsSourceInfo {
+    /// A `.lrc` file next to the audio file in the library.
+    Sidecar,
+    /// The lyrics tag of the audio file.
+    Embedded,
+}
+
+/// The lyrics of a track.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LyricsInfo {
+    /// Timed lines in time order, when the lyrics are synced.
+    pub synced: Option<Vec<LyricLineInfo>>,
+    /// Readable text: the lines joined with newlines when synced, otherwise the plain text.
+    pub plain: String,
+    /// Where the lyrics came from.
+    pub source: LyricsSourceInfo,
 }
 
 /// An album as shown in listings.
@@ -1055,6 +1085,36 @@ impl From<UploadRow> for UploadJobInfo {
             state: row.state.into(),
             error: row.error,
             source_uri: row.source_uri,
+        }
+    }
+}
+
+impl From<LyricLine> for LyricLineInfo {
+    fn from(l: LyricLine) -> Self {
+        LyricLineInfo {
+            time_ms: l.time_ms,
+            text: l.text,
+        }
+    }
+}
+
+impl From<LyricsSource> for LyricsSourceInfo {
+    fn from(s: LyricsSource) -> Self {
+        match s {
+            LyricsSource::Sidecar => LyricsSourceInfo::Sidecar,
+            LyricsSource::Embedded => LyricsSourceInfo::Embedded,
+        }
+    }
+}
+
+impl From<TrackLyrics> for LyricsInfo {
+    fn from(t: TrackLyrics) -> Self {
+        LyricsInfo {
+            synced: t
+                .synced
+                .map(|lines| lines.into_iter().map(LyricLineInfo::from).collect()),
+            plain: t.plain.unwrap_or_default(),
+            source: t.source.into(),
         }
     }
 }
