@@ -13,3 +13,6 @@ android/.idea/
 .DS_Store
 sonorus.db*
 covers/
+
+# Local Claude Code agent definitions
+.claude/

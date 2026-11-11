@@ -1,0 +1,81 @@
+name: Bug report
+description: Report something in Sonorus that does not work
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+
+  - type: input
+    id: version
+    attributes:
+      label: Sonorus version
+      placeholder: "Settings → About, e.g. 0.14.0"
+    validations:
+      required: true
+
+  - type: input
+    id: android
+    attributes:
+      label: Android version and device
+      placeholder: "e.g. Android 15 on Pixel 8"
+
+  - type: dropdown
+    id: audio-output
+    attributes:
+      label: Audio output
+      options:
+        - Phone speaker
+        - Wired headphones
+        - USB DAC
+        - Bluetooth
+        - Other
+
+  - type: input
+    id: dac-model
+    attributes:
+      label: USB DAC model
+      description: Only if you use a USB DAC.
+
+  - type: dropdown
+    id: storage-provider
+    attributes:
+      label: Storage provider
+      options:
+        - Backblaze B2
+        - Cloudflare R2
+        - AWS S3
+        - MinIO
+        - Wasabi
+        - Other
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Remove access keys, bucket names and endpoints before pasting."
+      render: shell

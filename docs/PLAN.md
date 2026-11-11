@@ -1265,10 +1265,13 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
 - [ ] "Upload here" deferred: upload keys are chosen by the core (artist/album), needs a core change.
 
 ## Phase 21 — CI/CD and releases (GitHub Actions)
-- [ ] Prerequisite: GitHub repo as `origin` (user creates it; push only with approval) after a full-history
-  secrets scan.
-- [ ] Conventional Commits from here on; `v0.13.0` anchor tag; versionName from the latest tag, versionCode =
-  major·1e6 + minor·1e3 + patch; release-please PR → tag + GitHub Release with CHANGELOG.
-- [ ] `ci.yml` (Rust fmt/clippy/test with a pinned `rust-toolchain.toml`; Android assembleDebug + lint with NDK
-  28.2.13676358); `release.yml` on release published: R8 release APK + AAB signed from secrets
-  (`ANDROID_KEYSTORE_B64` + 3 passwords/alias), credential-leak check on the dex, assets + SHA256SUMS attached.
+- [x] GitHub repo `const-nishant/sonorus` as `origin`; full-history secrets scan before the first push.
+- [x] Conventional Commits; `v0.13.0` anchor tag; versionName from the latest tag (`-dev+sha` on debug builds
+  off the tag), versionCode = major·1e6 + minor·1e3 + patch; release-please (`.github/` config) keeps a release
+  PR, merging it tags and creates the GitHub Release with CHANGELOG.
+- [x] `ci.yml`: Rust fmt/clippy/test (pinned `rust-toolchain.toml`), cargo-deny, Android assembleDebug + lint,
+  debug APK artifact. `release.yml` (same workflow as release-please, since GITHUB_TOKEN releases don't trigger
+  workflows): R8 release APK + AAB signed from secrets, credential-leak check, apksigner verify, assets +
+  SHA256SUMS + build provenance attestation. Actions pinned to commit SHAs.
+- [x] Open-source setup: README, GPL-3.0-or-later, CONTRIBUTING, SECURITY, issue forms, PR template, Dependabot.
+- [ ] First run on GitHub, a signed prerelease installed on the device (needs the keystore secrets).

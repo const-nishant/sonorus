@@ -6,6 +6,57 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Versioning from git tags. The newest `vX.Y.Z[-pre]` tag names the release: versionName is the
+// tag without the 'v', versionCode is derived from X.Y.Z. A debug build that is not exactly on
+// its tag gets `-dev+<short sha>` appended to versionName. Release builds use the tag as is.
+// ---------------------------------------------------------------------------------------------
+
+val repoRootDir = rootProject.layout.projectDirectory.dir("..").asFile
+
+/** Runs git in the repository root. Returns (exit code, trimmed stdout), or null if git cannot run. */
+fun gitRun(vararg args: String): Pair<Int, String>? = runCatching {
+    val output = providers.exec {
+        workingDir = repoRootDir
+        commandLine(listOf("git") + args.toList())
+        isIgnoreExitValue = true
+    }
+    val exit = output.result.get().exitValue
+    exit to output.standardOutput.asText.get().trim()
+}.getOrNull()
+
+val gitTag: String? = gitRun("describe", "--tags", "--match", "v[0-9]*", "--abbrev=0")
+    ?.takeIf { it.first == 0 }?.second?.takeIf { it.isNotEmpty() }
+val gitExactTag: Boolean = gitRun("describe", "--tags", "--exact-match", "--match", "v[0-9]*")
+    ?.first == 0
+val gitShortSha: String = gitRun("rev-parse", "--short", "HEAD")
+    ?.takeIf { it.first == 0 }?.second?.takeIf { it.isNotEmpty() } ?: "unknown"
+
+/** Release version (tag without 'v'), or null when there is no version tag. */
+val releaseVersionName: String? = gitTag?.removePrefix("v")
+
+/** versionCode from the numeric X.Y.Z part of the tag, pre-release suffix ignored. */
+val releaseVersionCode: Int = if (gitTag == null) 1 else {
+    val numeric = Regex("""(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?""")
+        .matchEntire(releaseVersionName!!)
+        ?: throw GradleException("Version tag '$gitTag' is not vX.Y.Z or vX.Y.Z-pre; cannot derive versionCode.")
+    val (major, minor, patch) = numeric.destructured.toList().map { it.toInt() }
+    check(minor < 1000 && patch < 1000) {
+        "Version tag '$gitTag': minor and patch must be below 1000 for versionCode (got $minor.$patch)."
+    }
+    check(major < 2147) { "Version tag '$gitTag': major must be below 2147 for versionCode." }
+    major * 1_000_000 + minor * 1_000 + patch
+}
+
+/** versionName for a build type: `0.0.0-dev` without any tag; debug builds off the tag get `-dev+sha`. */
+fun sonorusVersionName(debug: Boolean): String = when {
+    releaseVersionName == null -> "0.0.0-dev"
+    debug && !gitExactTag -> "$releaseVersionName-dev+$gitShortSha"
+    else -> releaseVersionName
+}
+
+logger.lifecycle("Sonorus version: ${sonorusVersionName(debug = false)} ($releaseVersionCode)")
+
 /**
  * Debug-only defaults for the Settings bucket form, so a dev install starts prefilled. Each value
  * comes from the SONORUS_S3_* environment variable, else from the repository's gitignored `.env`.
@@ -39,6 +90,12 @@ fun bucketDefault(env: String): String =
 fun javaString(value: String): String =
     "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
 
+/** Release signing: attached only when all four SONORUS_KEYSTORE_* / SONORUS_KEY_* variables are set. */
+val releaseSigningEnv: Map<String, String?> = listOf(
+    "SONORUS_KEYSTORE_PATH", "SONORUS_KEYSTORE_PASSWORD", "SONORUS_KEY_ALIAS", "SONORUS_KEY_PASSWORD",
+).associateWith { providers.environmentVariable(it).orNull?.takeIf { value -> value.isNotEmpty() } }
+val releaseSigningReady: Boolean = releaseSigningEnv.values.all { it != null }
+
 android {
     namespace = "dev.constnishant.sonorus"
     compileSdk = 37
@@ -48,9 +105,20 @@ android {
         applicationId = "dev.constnishant.sonorus"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = releaseVersionCode
+        versionName = sonorusVersionName(debug = false)
         ndk { abiFilters += "arm64-v8a" }
+    }
+
+    signingConfigs {
+        create("release") {
+            if (releaseSigningReady) {
+                storeFile = file(releaseSigningEnv.getValue("SONORUS_KEYSTORE_PATH")!!)
+                storePassword = releaseSigningEnv.getValue("SONORUS_KEYSTORE_PASSWORD")
+                keyAlias = releaseSigningEnv.getValue("SONORUS_KEY_ALIAS")
+                keyPassword = releaseSigningEnv.getValue("SONORUS_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
@@ -60,7 +128,10 @@ android {
             }
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (releaseSigningReady) signingConfig = signingConfigs.getByName("release")
             bucketDefaultFields.keys.forEach { field -> buildConfigField("String", field, "\"\"") }
         }
     }
@@ -73,6 +144,15 @@ android {
         buildConfig = true
     }
     packaging { jniLibs { useLegacyPackaging = false } }
+}
+
+// The debug build gets the `-dev+sha` suffix when it is not exactly on the version tag.
+androidComponents {
+    onVariants { variant ->
+        if (variant.buildType == "debug") {
+            variant.outputs.forEach { output -> output.versionName.set(sonorusVersionName(debug = true)) }
+        }
+    }
 }
 
 dependencies {
