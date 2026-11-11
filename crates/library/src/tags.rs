@@ -58,10 +58,14 @@ fn file_type_from_hint(ext: &str) -> Option<FileType> {
     }
 }
 
-fn codec_name(file_type: FileType) -> String {
+/// Codec name stored for a file. MP4 is a container: lofty only reports a bit depth for its
+/// lossless streams (ALAC, or FLAC in MP4), so an MP4 without one is AAC (or the rare MP3-in-MP4,
+/// which is just as lossy).
+fn codec_name(file_type: FileType, bit_depth: Option<u8>) -> String {
     match file_type {
         FileType::Flac => "FLAC".to_owned(),
-        FileType::Mp4 => "ALAC".to_owned(),
+        FileType::Mp4 if bit_depth.is_some() => "ALAC".to_owned(),
+        FileType::Mp4 => "AAC".to_owned(),
         FileType::Wav => "WAV".to_owned(),
         FileType::Aiff => "AIFF".to_owned(),
         other => format!("{other:?}").to_uppercase(),
@@ -165,7 +169,7 @@ pub fn read_meta<R: Read + Seek>(reader: R, ext_hint: Option<&str>) -> Result<Tr
         album: tag_text(tag, |t| t.album()),
         genre: tag_text(tag, |t| t.genre()),
         lyrics,
-        codec: Some(codec_name(tagged.file_type())),
+        codec: Some(codec_name(tagged.file_type(), props.bit_depth())),
         track_no: tag.and_then(|t| t.track()),
         track_total: tag.and_then(|t| t.track_total()),
         disc_no: tag.and_then(|t| t.disk()),
@@ -248,6 +252,14 @@ mod tests {
 
     fn keys(list: &[&str]) -> HashSet<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn mp4_codec_follows_the_bit_depth() {
+        assert_eq!(codec_name(FileType::Mp4, Some(24)), "ALAC");
+        assert_eq!(codec_name(FileType::Mp4, None), "AAC");
+        assert_eq!(codec_name(FileType::Flac, None), "FLAC");
+        assert_eq!(codec_name(FileType::Mpeg, None), "MPEG");
     }
 
     #[test]

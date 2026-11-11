@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cloud
+import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Settings
@@ -68,10 +69,16 @@ import dev.constnishant.sonorus.ui.components.tracksText
  *
  * @param onAlbum opens the album with the given id.
  * @param onOpenSettings opens Settings (top bar button and the empty-library prompts).
+ * @param onOpenStats opens the listening stats (top bar button).
  * @param modifier applied to the root layout.
  */
 @Composable
-fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Modifier = Modifier) {
+fun HomeScreen(
+    onAlbum: (Long) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenStats: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val repository = LocalContext.current.repository
     val viewModel: HomeViewModel = viewModel(
         factory = viewModelFactory { initializer { HomeViewModel(checkNotNull(this[APPLICATION_KEY]), repository) } },
@@ -87,6 +94,9 @@ fun HomeScreen(onAlbum: (Long) -> Unit, onOpenSettings: () -> Unit, modifier: Mo
             TopAppBar(
                 title = { Text(stringResource(R.string.app_name)) },
                 actions = {
+                    IconButton(onClick = onOpenStats) {
+                        Icon(Icons.Rounded.Insights, contentDescription = stringResource(R.string.cd_listening_stats))
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Rounded.Settings, contentDescription = stringResource(R.string.cd_settings))
                     }

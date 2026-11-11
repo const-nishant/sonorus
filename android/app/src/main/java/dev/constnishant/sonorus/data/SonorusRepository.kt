@@ -68,6 +68,9 @@ class SonorusRepository(private val app: Context) {
     /** Persisted ReplayGain settings (mode and pre-amp). Applied to the core when it opens. */
     val replayGain = ReplayGainSettingsStore(app)
 
+    /** Persisted recent search queries, newest first (at most [RECENT_SEARCH_LIMIT]). */
+    val recentSearches = RecentSearchesStore(app)
+
     /** UI state built from core events. */
     val events = CoreEvents()
 

@@ -12,6 +12,9 @@ pub enum LibraryError {
     Storage(#[from] sonorus_storage::StorageError),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A caller-supplied path is not a valid catalogue folder path (absolute, or with `..`).
+    #[error("invalid folder path: {0}")]
+    InvalidPath(String),
     /// A remote user-data document is corrupt or uses a newer format; it is never overwritten.
     #[error("sync error: {0}")]
     Sync(String),

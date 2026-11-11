@@ -45,6 +45,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import dev.constnishant.sonorus.R
+import dev.constnishant.sonorus.core.SmartPlaylistKind
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.player.MiniPlayer
 import dev.constnishant.sonorus.ui.player.NowPlayingScreen
@@ -54,6 +55,8 @@ import dev.constnishant.sonorus.ui.screens.ArtistScreen
 import dev.constnishant.sonorus.ui.screens.HomeScreen
 import dev.constnishant.sonorus.ui.screens.LibraryScreen
 import dev.constnishant.sonorus.ui.screens.PlaylistScreen
+import dev.constnishant.sonorus.ui.screens.SmartPlaylistScreen
+import dev.constnishant.sonorus.ui.screens.StatsScreen
 import dev.constnishant.sonorus.ui.screens.SearchScreen
 import dev.constnishant.sonorus.ui.settings.SettingsScreen
 import dev.constnishant.sonorus.ui.uploads.UploadsScreen
@@ -77,6 +80,15 @@ private val IdArgs = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType
 
 private fun NavBackStackEntry.idArg(): Long =
     checkNotNull(arguments?.getLong(Routes.ARG_ID)) { "missing ${Routes.ARG_ID}" }
+
+/** Navigation arguments for the smart playlist route: the [SmartPlaylistKind] enum name. */
+private val KindArgs = listOf(navArgument(Routes.ARG_KIND) { type = NavType.StringType })
+
+/** The smart playlist kind named by the route argument. */
+private fun NavBackStackEntry.kindArg(): SmartPlaylistKind {
+    val name = checkNotNull(arguments?.getString(Routes.ARG_KIND)) { "missing ${Routes.ARG_KIND}" }
+    return SmartPlaylistKind.valueOf(name)
+}
 
 /**
  * The app shell: bottom navigation, mini player, snackbar host and the navigation graph. The
@@ -170,6 +182,7 @@ fun SonorusRoot() {
                 HomeScreen(
                     onAlbum = { navController.navigate(Routes.album(it)) },
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                    onOpenStats = { navController.navigate(Routes.STATS) },
                 )
             }
             composable(Routes.LIBRARY) {
@@ -177,6 +190,7 @@ fun SonorusRoot() {
                     onAlbum = { navController.navigate(Routes.album(it)) },
                     onArtist = { navController.navigate(Routes.artist(it)) },
                     onPlaylist = { navController.navigate(Routes.playlist(it)) },
+                    onSmartPlaylist = { navController.navigate(Routes.smartPlaylist(it)) },
                 )
             }
             composable(Routes.SEARCH) {
@@ -217,6 +231,19 @@ fun SonorusRoot() {
                     onBack = { navController.popBackStack() },
                     onAlbum = { navController.navigate(Routes.album(it)) },
                     onArtist = { navController.navigate(Routes.artist(it)) },
+                )
+            }
+            composable(Routes.SMART, arguments = KindArgs) { entry ->
+                SmartPlaylistScreen(
+                    kind = entry.kindArg(),
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.STATS) {
+                StatsScreen(
+                    onAlbum = { navController.navigate(Routes.album(it)) },
+                    onArtist = { navController.navigate(Routes.artist(it)) },
+                    onBack = { navController.popBackStack() },
                 )
             }
             composable(Routes.SETTINGS) {

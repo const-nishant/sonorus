@@ -13,9 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sonorus_core::router::OutputRouter;
 use sonorus_core::types::{
     AlbumInfo, AlbumSort, CoreConfig, CoreEvent, LyricLineInfo, LyricsSourceInfo,
-    OutputSampleFormat, OutputSettings, PlaybackState, ReplayGainModeInfo, ReplayGainSettingsInfo,
-    RoutePlanInfo, RouteRequestInfo, S3Settings, SignalPathInfo, SleepTimerInfo, SleepTimerRequest,
-    TrackInfo,
+    OutputSampleFormat, OutputSettings, PlaybackState, QualityFilterInfo, ReplayGainModeInfo,
+    ReplayGainSettingsInfo, RoutePlanInfo, RouteRequestInfo, S3Settings, SignalPathInfo,
+    SleepTimerInfo, SleepTimerRequest, SmartPlaylistKind, StatsRangeInfo, TrackInfo,
 };
 use sonorus_core::{CoreError, EventListener, SonorusCore};
 
@@ -850,4 +850,225 @@ fn track_lyrics_round_trip_through_core() {
     assert!(!untagged.has_lyrics);
     assert_eq!(core.track_lyrics(untagged.id).expect("lyrics"), None);
     assert_eq!(core.track_lyrics(999_999).expect("lyrics"), None);
+}
+
+fn titles(tracks: &[TrackInfo]) -> Vec<&str> {
+    tracks.iter().map(|t| t.title.as_str()).collect()
+}
+
+#[test]
+fn quality_search_and_smart_lists_through_core() {
+    let dir = TempDir::new("quality");
+    let (core, _rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+
+    // Fixtures: 96 kHz/24 FLAC and 96 kHz/24 ALAC are hi-res; 16/44.1 WAV and FLAC are lossless.
+    let hi = core
+        .search_filtered(String::new(), 10, QualityFilterInfo::HiRes)
+        .expect("hi-res browse");
+    assert_eq!(titles(&hi.tracks), vec!["First Song", "Second Song"]);
+    assert!(
+        hi.albums.is_empty() && hi.artists.is_empty(),
+        "browse has no albums or artists"
+    );
+
+    let lossless = core
+        .search_filtered(String::new(), 10, QualityFilterInfo::Lossless)
+        .expect("lossless browse");
+    assert_eq!(lossless.tracks.len(), 4);
+    let lossy = core
+        .search_filtered(String::new(), 10, QualityFilterInfo::Lossy)
+        .expect("lossy browse");
+    assert!(lossy.tracks.is_empty());
+
+    // An empty query with Any still returns nothing, as before.
+    assert!(
+        core.search_filtered(String::new(), 10, QualityFilterInfo::Any)
+            .expect("any browse")
+            .tracks
+            .is_empty()
+    );
+
+    // Albums match on the album column and artists on the album-artist column only, so a track
+    // title alone yields no album or artist.
+    let wave_lossless = core
+        .search_filtered("wave".to_owned(), 10, QualityFilterInfo::Lossless)
+        .expect("search");
+    assert_eq!(titles(&wave_lossless.tracks), vec!["Wave Song"]);
+    assert!(wave_lossless.albums.is_empty() && wave_lossless.artists.is_empty());
+    let album_lossless = core
+        .search_filtered("album two".to_owned(), 10, QualityFilterInfo::Lossless)
+        .expect("search");
+    assert_eq!(album_lossless.albums.len(), 1);
+    assert_eq!(album_lossless.albums[0].title, "Album Two");
+    assert!(
+        core.search_filtered("album two".to_owned(), 10, QualityFilterInfo::Lossy)
+            .expect("search")
+            .albums
+            .is_empty()
+    );
+    let artist_lossless = core
+        .search_filtered("artist b".to_owned(), 10, QualityFilterInfo::Lossless)
+        .expect("search");
+    assert_eq!(artist_lossless.artists.len(), 1);
+    assert_eq!(artist_lossless.artists[0].name, "Artist B");
+    let wave_hi = core
+        .search_filtered("wave".to_owned(), 10, QualityFilterInfo::HiRes)
+        .expect("search");
+    assert!(wave_hi.tracks.is_empty() && wave_hi.albums.is_empty() && wave_hi.artists.is_empty());
+
+    // search() is the Any filter.
+    let plain = core.search("song".to_owned(), 10).expect("search");
+    let any = core
+        .search_filtered("song".to_owned(), 10, QualityFilterInfo::Any)
+        .expect("search");
+    assert_eq!(plain, any);
+
+    let never = core
+        .smart_playlist(SmartPlaylistKind::NeverPlayed, 10)
+        .expect("never played");
+    assert_eq!(never.len(), 4);
+    let recent = core
+        .smart_playlist(SmartPlaylistKind::RecentlyAdded, 2)
+        .expect("recently added");
+    assert_eq!(recent.len(), 2);
+    let smart_hi = core
+        .smart_playlist(SmartPlaylistKind::HiRes, 10)
+        .expect("hi-res list");
+    assert_eq!(titles(&smart_hi), vec!["First Song", "Second Song"]);
+    assert!(
+        core.smart_playlist(SmartPlaylistKind::MostPlayed30Days, 10)
+            .expect("most played")
+            .is_empty()
+    );
+
+    let first = smart_hi[0].id;
+    assert!(
+        core.smart_playlist(SmartPlaylistKind::Favorites, 10)
+            .expect("favorites")
+            .is_empty()
+    );
+    core.set_favorite(first, true).expect("favorite");
+    let favs = core
+        .smart_playlist(SmartPlaylistKind::Favorites, 10)
+        .expect("favorites");
+    assert_eq!(favs.iter().map(|t| t.id).collect::<Vec<_>>(), vec![first]);
+}
+
+#[test]
+fn stats_and_most_played_follow_a_real_play() {
+    let dir = TempDir::new("stats");
+    let music = dir.path().join("music");
+    fs::create_dir_all(&music).expect("create music dir");
+    write_silent_wav(&music.join("Tone.wav"), 2);
+    let (core, rec) = open(&dir, Some(music.to_str().expect("utf-8 path")));
+    core.scan_library().expect("scan");
+    let track = core
+        .albums(AlbumSort::Title, 10, 0)
+        .expect("albums")
+        .into_iter()
+        .next()
+        .and_then(|a| {
+            core.album_tracks(a.id)
+                .expect("album tracks")
+                .into_iter()
+                .next()
+        })
+        .expect("one track");
+
+    let empty = core
+        .listening_stats(StatsRangeInfo::AllTime, 5)
+        .expect("stats");
+    assert_eq!((empty.plays, empty.distinct_tracks), (0, 0));
+
+    core.play_tracks(vec![track.id], 0).expect("play");
+    rec.wait_for(
+        |e| matches!(e, CoreEvent::TrackEnded { track_id } if *track_id == track.id),
+        "track ended",
+    );
+
+    for range in [
+        StatsRangeInfo::Week,
+        StatsRangeInfo::Month,
+        StatsRangeInfo::Year,
+        StatsRangeInfo::AllTime,
+    ] {
+        let stats = core.listening_stats(range, 5).expect("stats");
+        assert_eq!(stats.plays, 1, "{range:?}");
+        assert_eq!(stats.distinct_tracks, 1, "{range:?}");
+        assert_eq!(stats.top_tracks.len(), 1, "{range:?}");
+        assert_eq!(stats.top_tracks[0].track.id, track.id, "{range:?}");
+        assert_eq!(stats.top_tracks[0].plays, 1, "{range:?}");
+        assert!(stats.total_played_ms > 0, "{range:?}");
+        assert_eq!(stats.top_albums.len(), 1, "{range:?}");
+        assert_eq!(stats.top_artists.len(), 1, "{range:?}");
+        assert_eq!(stats.top_albums[0].album.id, track.album_id, "{range:?}");
+    }
+
+    let most = core
+        .smart_playlist(SmartPlaylistKind::MostPlayedAllTime, 5)
+        .expect("most played");
+    assert_eq!(
+        most.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![track.id]
+    );
+    assert!(
+        core.smart_playlist(SmartPlaylistKind::NeverPlayed, 5)
+            .expect("never played")
+            .is_empty()
+    );
+}
+
+#[test]
+fn catalogue_folder_through_core() {
+    let dir = TempDir::new("folders");
+    let (core, _rec) = open(&dir, Some(FIXTURES));
+    core.scan_library().expect("scan");
+
+    let root = core.catalogue_folder(String::new()).expect("root");
+    assert_eq!(root.path, "");
+    let names: Vec<(&str, &str, u64)> = root
+        .folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.path.as_str(), f.track_count))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("Artist A", "Artist A/", 2), ("Artist B", "Artist B/", 2)]
+    );
+    assert!(root.tracks.is_empty());
+
+    // The trailing slash is optional.
+    let album = core
+        .catalogue_folder("Artist A/Album One".to_owned())
+        .expect("album folder");
+    assert_eq!(album.path, "Artist A/Album One/");
+    assert!(album.folders.is_empty());
+    assert_eq!(
+        album
+            .tracks
+            .iter()
+            .map(|t| t.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "Artist A/Album One/01 - First Song.flac",
+            "Artist A/Album One/02 - Second Song.m4a",
+        ]
+    );
+    assert!(album.tracks.iter().all(|t| t.cover_path.is_some()));
+
+    assert!(matches!(
+        core.catalogue_folder("/Artist A".to_owned()),
+        Err(CoreError::Library { .. })
+    ));
+    assert!(matches!(
+        core.catalogue_folder("Artist A/../Artist B".to_owned()),
+        Err(CoreError::Library { .. })
+    ));
+
+    let (unconfigured, _rec) = open(&TempDir::new("folders-none"), None);
+    assert!(matches!(
+        unconfigured.catalogue_folder(String::new()),
+        Err(CoreError::NotConfigured)
+    ));
 }

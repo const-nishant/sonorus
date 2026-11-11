@@ -1239,8 +1239,15 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   Tones/01 - A440 Hi-Res.lrc` (45 lines, 4 s apart); "First Song" embeds a one-line LRC.
 
 ## Phase 19 — Discovery and stats
-- [ ] Smart playlists (most played, recently added, hi-res only, never played, favorites); stats screen from
-  `history`; recent searches + format filters; folder view.
+- [x] Library queries: `quality.rs` (one lossless list FLAC/ALAC/WAV/AIFF/PCM/WAVPACK/APE/TTA shared by SQL and Rust;
+  hi-res = lossless and > 16 bit or > 48 kHz), `smart.rs` (most played 30 d / all time, recently added, hi-res, never
+  played, favorites), `stats.rs` (week/month/year/all-time totals + top tracks/albums/artists), `folder.rs`
+  (catalogue folders by key prefix, LIKE-escaped). Core `searchFiltered`, `smartPlaylist`, `listeningStats`,
+  `catalogueFolder`.
+- [x] Scanner fix: MP4 was always stored as "ALAC"; now ALAC only when lofty reports a bit depth, else AAC.
+  Schema v7 flags old "ALAC" rows for a re-read.
+- [x] App: smart playlists section + read-only screen, Stats screen (Home → Insights) with proportional bars,
+  search quality chips + last 10 recent searches, Library "Folders" tab with breadcrumbs and back-to-parent.
 
 ## Phase 20 — Bucket manager (CRUD, confined to the configured prefix)
 - [ ] storage: `list_folder` (delimiter), `copy_object`, batch `delete_objects`, small `put_object`.

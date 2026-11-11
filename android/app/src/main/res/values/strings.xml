@@ -358,6 +358,70 @@
     <string name="licenses_loading">Loading…</string>
     <string name="licenses_unavailable">The license text could not be loaded.</string>
 
+    <!-- Library: folders and smart playlists -->
+    <string name="library_tab_folders">Folders</string>
+    <string name="library_smart_playlists">Smart playlists</string>
+    <string name="library_your_playlists">Your playlists</string>
+    <string name="smart_most_played_30_title">Most played (30 days)</string>
+    <string name="smart_most_played_30_desc">Songs you played the most in the last 30 days</string>
+    <string name="smart_most_played_all_title">Most played (all time)</string>
+    <string name="smart_most_played_all_desc">Songs you have played the most, ever</string>
+    <string name="smart_recently_added_title">Recently added</string>
+    <string name="smart_recently_added_desc">The newest songs in your library</string>
+    <string name="smart_hi_res_title">Hi-res</string>
+    <string name="smart_hi_res_desc">Lossless songs above CD quality</string>
+    <string name="smart_never_played_title">Never played</string>
+    <string name="smart_never_played_desc">Songs you have not played yet</string>
+    <string name="smart_favorites_title">Favorites</string>
+    <string name="smart_favorites_desc">Songs you liked, newest first</string>
+    <string name="smart_empty_most_played_30">Nothing played in the last 30 days</string>
+    <string name="smart_empty_most_played_all">Nothing has been played yet</string>
+    <string name="smart_empty_recently_added">No songs in your library yet</string>
+    <string name="smart_empty_never_played">Every song has been played at least once</string>
+    <string name="smart_empty_favorites">No favorites yet. Tap the heart on any song.</string>
+    <string name="smart_open_failed">Couldn\'t open this smart playlist</string>
+    <string name="quality_empty_hi_res">No hi-res tracks in your library</string>
+    <string name="quality_empty_lossless">No lossless tracks in your library</string>
+    <string name="quality_empty_lossy">No lossy tracks in your library</string>
+
+    <!-- Search: quality filters and recent searches -->
+    <string name="search_filter_all">All</string>
+    <string name="search_filter_hi_res">Hi-res</string>
+    <string name="search_filter_lossless">Lossless</string>
+    <string name="search_filter_lossy">Lossy</string>
+    <string name="search_hi_res_tracks">Hi-res tracks</string>
+    <string name="search_lossless_tracks">Lossless tracks</string>
+    <string name="search_lossy_tracks">Lossy tracks</string>
+    <string name="search_recent_title">Recent searches</string>
+    <string name="search_empty_all">No songs in your library yet</string>
+
+    <!-- Folders -->
+    <string name="folders_all">All folders</string>
+    <string name="folders_failed">Couldn\'t load folders</string>
+    <string name="folders_empty_title">This folder is empty</string>
+    <string name="folders_empty_message">No folders or songs here.</string>
+
+    <!-- Listening stats -->
+    <string name="cd_listening_stats">Listening stats</string>
+    <string name="stats_title">Listening stats</string>
+    <string name="stats_range_week">Week</string>
+    <string name="stats_range_month">Month</string>
+    <string name="stats_range_year">Year</string>
+    <string name="stats_range_all">All time</string>
+    <string name="stats_listening_time">Listening time</string>
+    <string name="stats_plays_label">Plays</string>
+    <string name="stats_songs_label">Songs</string>
+    <string name="stats_top_songs">Top songs</string>
+    <string name="stats_top_albums">Top albums</string>
+    <string name="stats_top_artists">Top artists</string>
+    <string name="stats_empty_title">No listening in this period yet</string>
+    <string name="stats_empty_message">Songs you play will show up here.</string>
+    <string name="stats_load_failed">Couldn\'t load listening stats</string>
+    <plurals name="plays_count">
+        <item quantity="one">%1$d play</item>
+        <item quantity="other">%1$d plays</item>
+    </plurals>
+
     <!-- Errors shown to the user -->
     <string name="error_load_generic">Could not load this.</string>
     <string name="error_generic">Something went wrong.</string>

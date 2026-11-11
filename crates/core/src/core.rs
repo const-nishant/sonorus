@@ -46,10 +46,11 @@ use crate::router::{OutputRouter, RouterPlanner};
 #[cfg(target_os = "android")]
 use crate::types::output_info_from;
 use crate::types::{
-    AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, Converter, CoreConfig,
-    CoreEvent, DownloadStatus, LibraryStatsInfo, LyricsInfo, OutputInfo, OutputSettings,
-    PlaylistEntryInfo, PlaylistInfo, RepeatMode, ReplayGainSettingsInfo, S3Settings,
-    ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SleepTimerInfo, SleepTimerRequest,
+    AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, CatalogueFolderInfo,
+    Converter, CoreConfig, CoreEvent, DownloadStatus, LibraryStatsInfo, ListeningStatsInfo,
+    LyricsInfo, OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, QualityFilterInfo,
+    RepeatMode, ReplayGainSettingsInfo, S3Settings, ScanProgressInfo, ScanSummary, SearchResult,
+    SignalPathInfo, SleepTimerInfo, SleepTimerRequest, SmartPlaylistKind, StatsRangeInfo,
     SyncSummary, TrackInfo, UploadJobInfo,
 };
 use crate::upload::{
@@ -313,6 +314,52 @@ impl SonorusCore {
     pub fn search(&self, query: String, limit: u32) -> CoreResult<SearchResult> {
         let results = self.library.search(&query, limit)?;
         Ok(Converter::new(&self.library)?.search(results))
+    }
+
+    /// Searches like `search`, keeping only tracks of one audio quality. Albums and artists are
+    /// kept only when one of their matching tracks passes the filter. With an empty query and a
+    /// filter other than `Any`, it lists the tracks of that quality, with no albums or artists.
+    /// Blocking.
+    pub fn search_filtered(
+        &self,
+        query: String,
+        limit: u32,
+        filter: QualityFilterInfo,
+    ) -> CoreResult<SearchResult> {
+        let results = self.library.search_filtered(&query, limit, filter.into())?;
+        Ok(Converter::new(&self.library)?.search(results))
+    }
+
+    /// Up to `limit` tracks of a built-in smart playlist. Blocking.
+    pub fn smart_playlist(
+        &self,
+        kind: SmartPlaylistKind,
+        limit: u32,
+    ) -> CoreResult<Vec<TrackInfo>> {
+        let tracks = self.library.smart_playlist(kind.into(), limit)?;
+        Ok(Converter::new(&self.library)?.tracks(tracks))
+    }
+
+    /// Listening totals over `range` (ending now), with the `top` most played tracks, albums and
+    /// artists. Blocking.
+    pub fn listening_stats(
+        &self,
+        range: StatsRangeInfo,
+        top: u32,
+    ) -> CoreResult<ListeningStatsInfo> {
+        let stats = self.library.listening_stats(range.into(), top)?;
+        Ok(Converter::new(&self.library)?.listening_stats(stats))
+    }
+
+    /// The folder view of the catalogue at `path`, relative to the bucket prefix (or the local
+    /// folder). `""` is the root and `"Artist A/Album One/"` a folder; the trailing `/` is
+    /// optional. Lists the child folders and the tracks directly in the folder. Fails with
+    /// `NotConfigured` without a backend, and with `Library` for an absolute path or one with
+    /// `..`. Blocking.
+    pub fn catalogue_folder(&self, path: String) -> CoreResult<CatalogueFolderInfo> {
+        let prefix = self.catalogue_prefix()?;
+        let folder = self.library.catalogue_folder(&prefix, &path)?;
+        Ok(Converter::new(&self.library)?.catalogue_folder(folder))
     }
 
     /// The lyrics of a track: a `.lrc` sidecar or the embedded tag, synced when the text has
@@ -937,6 +984,16 @@ impl SonorusCore {
                 storage, prefix, ..
             }) => Ok((storage, prefix)),
             _ => Err(CoreError::NotConfigured),
+        }
+    }
+
+    /// The key prefix that catalogue track keys start with: the bucket prefix, or empty for a
+    /// local folder (the same prefix a scan lists). `NotConfigured` with no backend.
+    fn catalogue_prefix(&self) -> CoreResult<String> {
+        match self.backend_snapshot() {
+            Some(Backend::Bucket { prefix, .. }) => Ok(prefix),
+            Some(Backend::Local { .. }) => Ok(String::new()),
+            None => Err(CoreError::NotConfigured),
         }
     }
 

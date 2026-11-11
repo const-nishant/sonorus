@@ -2,6 +2,7 @@
 
 package dev.constnishant.sonorus.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -88,6 +90,7 @@ import dev.constnishant.sonorus.core.AlbumInfo
 import dev.constnishant.sonorus.core.AlbumSort
 import dev.constnishant.sonorus.core.ArtistInfo
 import dev.constnishant.sonorus.core.PlaylistInfo
+import dev.constnishant.sonorus.core.SmartPlaylistKind
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.components.AlbumCard
 import dev.constnishant.sonorus.ui.components.Artwork
@@ -96,6 +99,7 @@ import dev.constnishant.sonorus.ui.components.ConfirmDialog
 import dev.constnishant.sonorus.ui.components.EmptyState
 import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.PlaylistNameDialog
+import dev.constnishant.sonorus.ui.components.SectionTitle
 import dev.constnishant.sonorus.ui.components.albumsText
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.tracksText
@@ -105,7 +109,14 @@ private val LIBRARY_TABS = listOf(
     R.string.library_tab_albums,
     R.string.library_tab_artists,
     R.string.library_tab_playlists,
+    R.string.library_tab_folders,
 )
+
+/** The index of the Playlists tab in [LIBRARY_TABS]. */
+private const val PLAYLISTS_PAGE = 2
+
+/** The index of the Folders tab in [LIBRARY_TABS]. */
+private const val FOLDERS_PAGE = 3
 
 /** Artists lists longer than this get the A–Z index. */
 private const val FAST_SCROLL_MIN_ARTISTS = 30
@@ -114,12 +125,14 @@ private const val FAST_SCROLL_MIN_ARTISTS = 30
 private val FAST_SCROLL_LETTERS: List<Char> = listOf('#') + ('A'..'Z').toList()
 
 /**
- * The Library screen with three swipeable tabs: albums (sortable grid), artists, and playlists, which
- * can be created, renamed and deleted. Pulling down starts a library scan.
+ * The Library screen with four swipeable tabs: albums (sortable grid), artists, playlists (with the
+ * smart playlists above the user's own, which can be created, renamed and deleted), and folders.
+ * Pulling down starts a library scan. System back on the Folders tab goes up one folder.
  *
  * @param onAlbum opens an album.
  * @param onArtist opens an artist.
  * @param onPlaylist opens a playlist.
+ * @param onSmartPlaylist opens a smart playlist.
  * @param modifier applied to the root layout.
  */
 @Composable
@@ -127,6 +140,7 @@ fun LibraryScreen(
     onAlbum: (Long) -> Unit,
     onArtist: (Long) -> Unit,
     onPlaylist: (Long) -> Unit,
+    onSmartPlaylist: (SmartPlaylistKind) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val repository = LocalContext.current.repository
@@ -138,6 +152,10 @@ fun LibraryScreen(
     val artists by viewModel.artists.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
     val scanning by viewModel.scanning.collectAsStateWithLifecycle()
+    val foldersViewModel: FoldersViewModel = viewModel(
+        factory = viewModelFactory { initializer { FoldersViewModel(checkNotNull(this[APPLICATION_KEY]), repository) } },
+    )
+    val folderPath by foldersViewModel.path.collectAsStateWithLifecycle()
     var savedPage by rememberSaveable { mutableIntStateOf(0) }
     val pagerState = rememberPagerState(initialPage = savedPage, pageCount = { LIBRARY_TABS.size })
     val scope = rememberCoroutineScope()
@@ -145,12 +163,16 @@ fun LibraryScreen(
     var creating by rememberSaveable { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<PlaylistInfo?>(null) }
     var deleting by remember { mutableStateOf<PlaylistInfo?>(null) }
+    // Back on the Folders tab goes up one folder; at the root it leaves the screen as usual.
+    BackHandler(enabled = pagerState.currentPage == FOLDERS_PAGE && folderPath.isNotEmpty()) {
+        foldersViewModel.up()
+    }
 
     Scaffold(
         modifier = modifier,
         topBar = { TopAppBar(title = { Text(stringResource(R.string.library_title)) }) },
         floatingActionButton = {
-            if (pagerState.currentPage == 2) {
+            if (pagerState.currentPage == PLAYLISTS_PAGE) {
                 FloatingActionButton(onClick = { creating = true }) {
                     Icon(Icons.Rounded.Add, contentDescription = stringResource(R.string.cd_new_playlist))
                 }
@@ -184,12 +206,14 @@ fun LibraryScreen(
                             onAlbum = onAlbum,
                         )
                         1 -> ArtistsTab(state = artists, onArtist = onArtist)
-                        else -> PlaylistsTab(
+                        PLAYLISTS_PAGE -> PlaylistsTab(
                             state = playlists,
                             onPlaylist = onPlaylist,
+                            onSmartPlaylist = onSmartPlaylist,
                             onRename = { renaming = it },
                             onDelete = { deleting = it },
                         )
+                        else -> FoldersTab(viewModel = foldersViewModel)
                     }
                 }
             }
@@ -474,29 +498,47 @@ private fun artistIndexLetter(name: String): Char {
     }
 }
 
-/** The Playlists tab: cover, name, track count and total length, with a per-row menu. */
+/**
+ * The Playlists tab: the smart playlists under "Smart playlists", then the user's playlists under
+ * "Your playlists" (cover, name, track count and total length, with a per-row menu).
+ */
 @Composable
 private fun PlaylistsTab(
     state: LoadState<List<PlaylistInfo>>,
     onPlaylist: (Long) -> Unit,
+    onSmartPlaylist: (SmartPlaylistKind) -> Unit,
     onRename: (PlaylistInfo) -> Unit,
     onDelete: (PlaylistInfo) -> Unit,
 ) {
-    when (state) {
-        LoadState.Loading -> LoadingContent()
-        is LoadState.Failed -> CenteredContent {
-            EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.library_playlists_failed), state.message)
+    LazyColumn(Modifier.fillMaxSize()) {
+        item(key = "smart-title") { SectionTitle(stringResource(R.string.library_smart_playlists)) }
+        items(SMART_PLAYLISTS, key = { it.name }) { kind ->
+            ListItem(
+                modifier = Modifier.clickable(role = Role.Button) { onSmartPlaylist(kind) },
+                leadingContent = { Icon(kind.icon(), contentDescription = null) },
+                headlineContent = { Text(stringResource(kind.titleRes()), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                supportingContent = { Text(stringResource(kind.descriptionRes())) },
+            )
         }
-        is LoadState.Ready -> if (state.value.isEmpty()) {
-            CenteredContent {
-                EmptyState(
-                    Icons.AutoMirrored.Rounded.QueueMusic,
-                    stringResource(R.string.library_no_playlists),
-                    stringResource(R.string.library_playlists_hint),
-                )
+        item(key = "your-title") { SectionTitle(stringResource(R.string.library_your_playlists)) }
+        when (state) {
+            LoadState.Loading -> item(key = "playlists-loading") {
+                Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
             }
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
+            is LoadState.Failed -> item(key = "playlists-failed") {
+                EmptyState(Icons.Rounded.ErrorOutline, stringResource(R.string.library_playlists_failed), state.message)
+            }
+            is LoadState.Ready -> if (state.value.isEmpty()) {
+                item(key = "playlists-empty") {
+                    EmptyState(
+                        Icons.AutoMirrored.Rounded.QueueMusic,
+                        stringResource(R.string.library_no_playlists),
+                        stringResource(R.string.library_playlists_hint),
+                    )
+                }
+            } else {
                 items(state.value, key = { it.id }) { playlist ->
                     PlaylistRow(
                         playlist = playlist,

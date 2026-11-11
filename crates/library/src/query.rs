@@ -10,6 +10,7 @@ use crate::lrc::{LyricLine, parse_lrc};
 use crate::model::{
     Album, AlbumSort, Artist, LibraryStats, LyricsSource, SearchResults, Track, TrackLyrics,
 };
+use crate::quality::{QualityFilter, quality_condition};
 
 /// Track columns plus the album and artist names; every track read goes through this.
 pub(crate) const TRACK_SELECT: &str =
@@ -31,7 +32,7 @@ pub(crate) const ALBUM_SELECT: &str = "SELECT al.id, al.title, ar.name, al.artis
     FROM albums al
     JOIN artists ar ON ar.id = al.artist_id";
 
-const ARTIST_SELECT: &str = "SELECT ar.id, ar.name,
+pub(crate) const ARTIST_SELECT: &str = "SELECT ar.id, ar.name,
         (SELECT COUNT(*) FROM albums al WHERE al.artist_id = ar.id),
         (SELECT COUNT(*) FROM tracks t JOIN albums al ON al.id = t.album_id
             WHERE al.artist_id = ar.id)
@@ -85,7 +86,7 @@ pub(crate) fn row_to_album(row: &Row<'_>) -> rusqlite::Result<Album> {
     })
 }
 
-fn row_to_artist(row: &Row<'_>) -> rusqlite::Result<Artist> {
+pub(crate) fn row_to_artist(row: &Row<'_>) -> rusqlite::Result<Artist> {
     let album_count: i64 = row.get(2)?;
     let track_count: i64 = row.get(3)?;
     Ok(Artist {
@@ -94,6 +95,15 @@ fn row_to_artist(row: &Row<'_>) -> rusqlite::Result<Artist> {
         album_count: u32::try_from(album_count).unwrap_or(0),
         track_count: u32::try_from(track_count).unwrap_or(0),
     })
+}
+
+/// Track order of the artist album sort: album artist, album, disc, track, then title and key.
+/// Used by the browse lists (smart playlists and quality browses).
+pub(crate) fn track_order_by_artist() -> String {
+    format!(
+        "{}, t.disc_no NULLS LAST, t.track_no NULLS LAST, t.title, t.key",
+        album_order(AlbumSort::Artist)
+    )
 }
 
 fn album_order(sort: AlbumSort) -> &'static str {
@@ -318,13 +328,41 @@ impl Library {
     /// (AND), with case and diacritics folded, so `beyonce` finds `Beyoncé`.
     /// Tracks match on any of title, artist, album or album artist (ranked by bm25); albums
     /// match on their title and artists on their name (the album-artist column), each only
-    /// within that column.
+    /// within that column. Same as `search_filtered` with `QualityFilter::Any`.
     pub fn search(&self, query: &str, limit: u32) -> Result<SearchResults> {
+        self.search_filtered(query, limit, QualityFilter::Any)
+    }
+
+    /// `search`, keeping only tracks of one audio quality (see `QualityFilter`). Albums and
+    /// artists are kept only when one of their matching tracks passes the filter.
+    ///
+    /// With no searchable tokens, `Any` returns nothing. Any other filter browses: it returns the
+    /// tracks of that quality in artist album order, at most `limit`, with no albums or artists.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: u32,
+        filter: QualityFilter,
+    ) -> Result<SearchResults> {
+        let quality = quality_condition(filter);
+        let limit = i64::from(limit);
         let tokens = search_tokens(query);
         if tokens.is_empty() {
-            return Ok(SearchResults::default());
+            if filter == QualityFilter::Any {
+                return Ok(SearchResults::default());
+            }
+            let conn = self.lock();
+            let mut stmt = conn.prepare(&format!(
+                "{TRACK_SELECT} WHERE {quality} ORDER BY {} LIMIT ?1",
+                track_order_by_artist()
+            ))?;
+            let rows = stmt.query_map(params![limit], row_to_track)?;
+            let tracks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(SearchResults {
+                tracks,
+                ..SearchResults::default()
+            });
         }
-        let limit = i64::from(limit);
         let terms = fts_terms(&tokens);
         let album_match = format!("album : ({terms})");
         let artist_match = format!("album_artist : ({terms})");
@@ -333,7 +371,7 @@ impl Library {
         let tracks = {
             let mut stmt = conn.prepare(&format!(
                 "{TRACK_SELECT} JOIN track_fts ON track_fts.rowid = t.id
-                 WHERE track_fts MATCH ?1
+                 WHERE track_fts MATCH ?1 AND {quality}
                  ORDER BY bm25(track_fts) LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![terms, limit], row_to_track)?;
@@ -345,7 +383,7 @@ impl Library {
                 "{ALBUM_SELECT} WHERE al.id IN (
                     SELECT t.album_id FROM tracks t
                     JOIN track_fts ON track_fts.rowid = t.id
-                    WHERE track_fts MATCH ?1)
+                    WHERE track_fts MATCH ?1 AND {quality})
                  ORDER BY al.title COLLATE NOCASE, al.id LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![album_match, limit], row_to_album)?;
@@ -358,7 +396,7 @@ impl Library {
                     SELECT al.artist_id FROM tracks t
                     JOIN albums al ON al.id = t.album_id
                     JOIN track_fts ON track_fts.rowid = t.id
-                    WHERE track_fts MATCH ?1)
+                    WHERE track_fts MATCH ?1 AND {quality})
                  ORDER BY ar.name COLLATE NOCASE, ar.id LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![artist_match, limit], row_to_artist)?;

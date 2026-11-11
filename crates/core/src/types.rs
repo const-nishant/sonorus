@@ -18,9 +18,9 @@ use sonorus_engine::player::{PlayerEvent, PlayerState};
 use sonorus_engine::queue::RepeatMode as EngineRepeatMode;
 use sonorus_library::uploads::{UploadRow, UploadState as LibraryUploadState};
 use sonorus_library::{
-    Album, AlbumSort as LibraryAlbumSort, Artist, Library, LibraryStats, LyricLine, LyricsSource,
-    Playlist, PlaylistEntry, ScanProgress, ScanReport, SearchResults, SyncReport, Track,
-    TrackLyrics,
+    Album, AlbumSort as LibraryAlbumSort, Artist, CatalogueFolder, Library, LibraryStats,
+    ListeningStats, LyricLine, LyricsSource, Playlist, PlaylistEntry, QualityFilter, ScanProgress,
+    ScanReport, SearchResults, SmartPlaylist, StatsRange, SyncReport, Track, TrackLyrics,
 };
 use sonorus_storage::{StorageConfig, normalize_prefix, region_from_endpoint};
 
@@ -295,6 +295,125 @@ pub struct SearchResult {
     pub albums: Vec<AlbumInfo>,
     /// Matching artists.
     pub artists: Vec<ArtistInfo>,
+}
+
+/// Audio quality a search or browse keeps. `HiRes` is lossless and above 16 bits per sample or
+/// above 48 kHz. `Lossless` is any lossless codec. `Lossy` is everything else, including tracks
+/// with no codec recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum QualityFilterInfo {
+    /// Every track.
+    #[default]
+    Any,
+    /// Hi-res lossless tracks only.
+    HiRes,
+    /// Lossless tracks only, at any resolution.
+    Lossless,
+    /// Tracks that are not lossless.
+    Lossy,
+}
+
+/// The built-in smart playlists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SmartPlaylistKind {
+    /// Tracks played most in the last 30 days.
+    MostPlayed30Days,
+    /// Tracks played most over all time.
+    MostPlayedAllTime,
+    /// Most recently added tracks first.
+    RecentlyAdded,
+    /// Hi-res lossless tracks, in artist album order.
+    HiRes,
+    /// Tracks with no play in the history, in artist album order.
+    NeverPlayed,
+    /// Favorite tracks, most recently favorited first.
+    Favorites,
+}
+
+/// The window of a listening-statistics query. Each window ends now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StatsRangeInfo {
+    /// The last 7 days.
+    Week,
+    /// The last 30 days.
+    Month,
+    /// The last 365 days.
+    Year,
+    /// Every play in the history.
+    AllTime,
+}
+
+/// A track with its plays in a statistics window.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TrackPlaysInfo {
+    /// The track.
+    pub track: TrackInfo,
+    /// Number of plays in the window.
+    pub plays: u64,
+    /// Total played time in the window, in milliseconds.
+    pub played_ms: u64,
+}
+
+/// An album with the plays of its tracks in a statistics window.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AlbumPlaysInfo {
+    /// The album.
+    pub album: AlbumInfo,
+    /// Number of plays of its tracks in the window.
+    pub plays: u64,
+    /// Total played time of its tracks in the window, in milliseconds.
+    pub played_ms: u64,
+}
+
+/// An artist with the plays of their tracks in a statistics window.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ArtistPlaysInfo {
+    /// The artist.
+    pub artist: ArtistInfo,
+    /// Number of plays of their tracks in the window.
+    pub plays: u64,
+    /// Total played time of their tracks in the window, in milliseconds.
+    pub played_ms: u64,
+}
+
+/// Listening totals for a window, with the top tracks, albums and artists.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ListeningStatsInfo {
+    /// Total played time in the window, in milliseconds.
+    pub total_played_ms: u64,
+    /// Number of plays in the window.
+    pub plays: u64,
+    /// Number of different catalogued tracks played in the window.
+    pub distinct_tracks: u64,
+    /// Most played tracks, by played time then plays.
+    pub top_tracks: Vec<TrackPlaysInfo>,
+    /// Most played albums, by played time then plays.
+    pub top_albums: Vec<AlbumPlaysInfo>,
+    /// Most played artists, by played time then plays.
+    pub top_artists: Vec<ArtistPlaysInfo>,
+}
+
+/// A folder directly under the folder being viewed.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FolderEntryInfo {
+    /// The folder's own name.
+    pub name: String,
+    /// The folder's path relative to the bucket prefix (or local folder), with a trailing `/`.
+    pub path: String,
+    /// Number of catalogued tracks under this folder, at any depth.
+    pub track_count: u64,
+}
+
+/// One folder of the catalogue, as a folder view: its child folders and the tracks directly in
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CatalogueFolderInfo {
+    /// The folder path, normalized: empty for the root, otherwise with a trailing `/`.
+    pub path: String,
+    /// Child folders, sorted by name, case-insensitively.
+    pub folders: Vec<FolderEntryInfo>,
+    /// Tracks directly in this folder, sorted by object key.
+    pub tracks: Vec<TrackInfo>,
 }
 
 /// Library totals for the about or settings screen.
@@ -1049,6 +1168,41 @@ impl From<SyncReport> for SyncSummary {
     }
 }
 
+impl From<SmartPlaylistKind> for SmartPlaylist {
+    fn from(kind: SmartPlaylistKind) -> Self {
+        match kind {
+            SmartPlaylistKind::MostPlayed30Days => SmartPlaylist::MostPlayed { days: Some(30) },
+            SmartPlaylistKind::MostPlayedAllTime => SmartPlaylist::MostPlayed { days: None },
+            SmartPlaylistKind::RecentlyAdded => SmartPlaylist::RecentlyAdded,
+            SmartPlaylistKind::HiRes => SmartPlaylist::HiRes,
+            SmartPlaylistKind::NeverPlayed => SmartPlaylist::NeverPlayed,
+            SmartPlaylistKind::Favorites => SmartPlaylist::Favorites,
+        }
+    }
+}
+
+impl From<QualityFilterInfo> for QualityFilter {
+    fn from(filter: QualityFilterInfo) -> Self {
+        match filter {
+            QualityFilterInfo::Any => QualityFilter::Any,
+            QualityFilterInfo::HiRes => QualityFilter::HiRes,
+            QualityFilterInfo::Lossless => QualityFilter::Lossless,
+            QualityFilterInfo::Lossy => QualityFilter::Lossy,
+        }
+    }
+}
+
+impl From<StatsRangeInfo> for StatsRange {
+    fn from(range: StatsRangeInfo) -> Self {
+        match range {
+            StatsRangeInfo::Week => StatsRange::Week,
+            StatsRangeInfo::Month => StatsRange::Month,
+            StatsRangeInfo::Year => StatsRange::Year,
+            StatsRangeInfo::AllTime => StatsRange::AllTime,
+        }
+    }
+}
+
 impl From<LibraryStats> for LibraryStatsInfo {
     fn from(s: LibraryStats) -> Self {
         LibraryStatsInfo {
@@ -1256,6 +1410,59 @@ impl<'a> Converter<'a> {
             tracks: self.tracks(r.tracks),
             albums: self.albums(r.albums),
             artists: r.artists.into_iter().map(ArtistInfo::from).collect(),
+        }
+    }
+
+    /// Converts listening statistics.
+    pub(crate) fn listening_stats(&self, s: ListeningStats) -> ListeningStatsInfo {
+        ListeningStatsInfo {
+            total_played_ms: s.total_played_ms,
+            plays: s.plays,
+            distinct_tracks: s.distinct_tracks,
+            top_tracks: s
+                .top_tracks
+                .into_iter()
+                .map(|p| TrackPlaysInfo {
+                    track: self.track(p.track),
+                    plays: p.plays,
+                    played_ms: p.played_ms,
+                })
+                .collect(),
+            top_albums: s
+                .top_albums
+                .into_iter()
+                .map(|p| AlbumPlaysInfo {
+                    album: self.album(p.album),
+                    plays: p.plays,
+                    played_ms: p.played_ms,
+                })
+                .collect(),
+            top_artists: s
+                .top_artists
+                .into_iter()
+                .map(|p| ArtistPlaysInfo {
+                    artist: ArtistInfo::from(p.artist),
+                    plays: p.plays,
+                    played_ms: p.played_ms,
+                })
+                .collect(),
+        }
+    }
+
+    /// Converts a catalogue folder view.
+    pub(crate) fn catalogue_folder(&self, f: CatalogueFolder) -> CatalogueFolderInfo {
+        CatalogueFolderInfo {
+            path: f.path,
+            folders: f
+                .folders
+                .into_iter()
+                .map(|e| FolderEntryInfo {
+                    name: e.name,
+                    path: e.path,
+                    track_count: e.track_count,
+                })
+                .collect(),
+            tracks: self.tracks(f.tracks),
         }
     }
 }

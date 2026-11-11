@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{LibraryError, Result};
 use crate::model::{ObjectStamp, PruneStats, TrackMeta};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE artists (
@@ -169,6 +169,13 @@ CREATE TABLE lyrics_sidecars (
     etag      TEXT,
     text      TEXT NOT NULL
 );
+";
+
+/// v7: no new columns. Before v7 every MP4 file was stored with codec "ALAC", so AAC `.m4a` files
+/// counted as lossless (and as hi-res above 48 kHz). The scanner now tells them apart; this flags
+/// the affected rows so the next scan re-reads them (see `needs_reread` in `SCHEMA_V5`).
+const SCHEMA_V7: &str = "
+UPDATE tracks SET needs_reread = 1 WHERE codec = 'ALAC';
 ";
 
 const UPSERT_TRACK_SQL: &str = "
@@ -534,6 +541,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (4, SCHEMA_V4),
         (5, SCHEMA_V5),
         (6, SCHEMA_V6),
+        (7, SCHEMA_V7),
     ] {
         if version < target {
             let tx = conn.transaction()?;
@@ -1262,6 +1270,43 @@ mod tests {
     }
 
     #[test]
+    fn v6_database_upgrades_to_v7_flagging_mp4_rows() {
+        let dir = TempDir::new();
+        let db = dir.path().join("v6.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            for sql in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute_batch(
+                "INSERT INTO artists (name) VALUES ('A');
+                 INSERT INTO albums (title, artist_id, added_at) VALUES ('B', 1, 0);
+                 INSERT INTO tracks (key, size, title, artist, album_id, codec, added_at, updated_at)
+                    VALUES ('a/b/song.m4a', 5, 't', 'A', 1, 'ALAC', 0, 0),
+                           ('a/b/other.flac', 5, 't', 'A', 1, 'FLAC', 0, 0);",
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&db, &dir.path().join("covers")).unwrap();
+        let conn = lib.lock();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let flagged: Vec<String> = conn
+            .prepare("SELECT key FROM tracks WHERE needs_reread = 1 ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(flagged, vec!["a/b/song.m4a".to_owned()]);
+    }
+
+    #[test]
     fn v5_database_upgrades_to_v6_with_no_sidecars() {
         let dir = TempDir::new();
         let db = dir.path().join("v5.db");
@@ -1287,7 +1332,7 @@ mod tests {
             let v: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 6);
+            assert_eq!(v, SCHEMA_VERSION);
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM lyrics_sidecars", [], |r| r.get(0))
                 .unwrap();
