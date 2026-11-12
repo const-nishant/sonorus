@@ -9,9 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       prerelease_tag:
-        description: "Prerelease tag to create on this commit, e.g. v0.13.1-rc.1"
+        description: "Tag to build, e.g. v0.13.1-rc.1. Created on this commit as a prerelease unless 'rebuild' is set"
         required: true
         type: string
+      rebuild:
+        description: "Rebuild an existing release from its tag and replace its assets"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,9 +62,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          # A rebuild builds the tagged commit, so the version and the code match the release.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.rebuild && inputs.prerelease_tag || github.sha }}
+
+      - name: Check the release to rebuild
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json tagName >/dev/null
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
 
       - name: Create prerelease tag
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.rebuild
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -74,7 +88,7 @@ jobs:
           git push origin "refs/tags/$TAG"
 
       - name: Create prerelease
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.rebuild
         run: gh release create "$TAG" --prerelease --generate-notes --verify-tag
 
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1

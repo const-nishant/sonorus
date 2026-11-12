@@ -72,6 +72,10 @@ To test a build from any commit without merging a release PR:
 2. Enter a `prerelease_tag` such as `v0.13.1-rc.1`. The workflow tags the selected commit with it,
    creates a GitHub prerelease, and uploads the signed artifacts.
 
+To rebuild an existing release (for example after a failed or cancelled build), run the workflow
+with its tag as `prerelease_tag` and tick **rebuild**. It builds the tagged commit and replaces the
+release's assets.
+
 The tag must be new. Delete the prerelease and its tag afterwards if you do not want to keep it.
 
 ## Keystore safety
