@@ -83,6 +83,9 @@ jobs:
           java-version: 17
 
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          # The default also installs the legacy 'tools' package, which no longer exists.
+          packages: platform-tools
 
       - name: Install SDK packages
         run: sdkmanager "ndk;28.2.13676358" "platforms;android-37.0" "build-tools;37.0.0"
