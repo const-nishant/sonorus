@@ -1250,12 +1250,19 @@ unless allowed). The cache is scoped per bucket (`data_dir/cache/<hash(endpoint|
   search quality chips + last 10 recent searches, Library "Folders" tab with breadcrumbs and back-to-parent.
 
 ## Phase 20 — Bucket manager (CRUD, confined to the configured prefix)
-- [ ] storage: `list_folder` (delimiter), `copy_object`, batch `delete_objects`, small `put_object`.
-- [ ] core: browse, rename/move (copy → verify → delete; catalogue key updated in place so favorites/playlists/
-  history survive; cache entry renamed/dropped), delete objects/folders (catalogue + cache + upload rows purged),
-  edit tags (download → lofty write → re-upload → rescan), set album cover; prefix guard on every key.
-- [ ] Android "Manage bucket": breadcrumb browser, multi-select, rename/move/edit tags/delete with confirmations
-  (typed name for folder deletes), "Upload here", entry points from Settings and long-press menus.
+- [x] storage: `list_folder` (delimiter), `copy_object` (CopyObject; multipart UploadPartCopy in 512 MiB parts
+  above 5 GiB), batch `delete_objects` (1000 per request, per-key errors).
+- [x] core (`manage.rs`): `browse`, `rename_object`, `move_objects` (copy → size verify → delete; no overwrite;
+  catalogue key updated in place via `library::rekey` so favorites/playlists/history survive; `.lrc` follows;
+  cache entry dropped), `delete_objects` / `delete_folder` (root refused; catalogue, cache, pins and upload rows
+  purged), `edit_tags` (temp download → lofty write → re-upload → rescan), `set_album_cover` (JPEG/PNG ≤ 20 MiB,
+  one-folder albums). `KeyGuard` on every key: inside the prefix, no `/`-leading, empty, `.` or `..` segments,
+  never the root, never `_sonorus/`.
+- [x] App "Manage bucket": breadcrumb browser, pull-to-refresh, multi-select, file sheet, rename (base name
+  preselected), move picker, delete confirmations (count; typed name for folders), edit tags (track and album),
+  set album cover; entry points in Settings → Bucket, track/album menus and the Album screen.
+  Device-tested on `sonorus-test/`: browse, rename, move, multi delete, nested folder delete, tag edit + revert.
+- [ ] "Upload here" deferred: upload keys are chosen by the core (artist/album), needs a core change.
 
 ## Phase 21 — CI/CD and releases (GitHub Actions)
 - [ ] Prerequisite: GitHub repo as `origin` (user creates it; push only with approval) after a full-history

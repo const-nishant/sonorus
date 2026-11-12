@@ -1,6 +1,7 @@
 package dev.constnishant.sonorus.ui.screens
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.constnishant.sonorus.R
@@ -10,6 +11,7 @@ import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.data.DownloadsUi
 import dev.constnishant.sonorus.data.SonorusRepository
 import dev.constnishant.sonorus.data.userMessage
+import java.io.IOException
 import dev.constnishant.sonorus.ui.components.PinUi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -80,6 +82,22 @@ class AlbumViewModel(
                 repository.events.emitError(e.userMessage(context, R.string.error_download))
             }
             refreshPin()
+        }
+    }
+
+    /**
+     * Sets the album's cover to the image at [uri]. A failure is shown as a message; a success
+     * reloads the album through the library-changed notification.
+     */
+    fun setCover(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                repository.setAlbumCover(albumId, uri)
+            } catch (e: CoreException) {
+                repository.events.emitError(e.userMessage(context, R.string.error_set_cover))
+            } catch (e: IOException) {
+                repository.events.emitError(context.getString(R.string.error_set_cover))
+            }
         }
     }
 

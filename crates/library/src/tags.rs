@@ -3,11 +3,10 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{Read, Seek};
+use std::path::Path;
 
-use lofty::config::ParseOptions;
-#[cfg(test)]
-use lofty::config::WriteOptions;
-use lofty::file::{AudioFile, FileType, TaggedFileExt};
+use lofty::config::{ParseOptions, WriteOptions};
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
@@ -188,6 +187,102 @@ pub fn read_meta<R: Read + Seek>(reader: R, ext_hint: Option<&str>) -> Result<Tr
         album_gain_db: gain(ItemKey::ReplayGainAlbumGain),
         album_peak: peak(ItemKey::ReplayGainAlbumPeak),
     })
+}
+
+/// Field values to write into the tags of an audio file (see [`write_tags`]). `None` leaves a
+/// field as it is. A text field becomes blank (empty or only spaces) to remove it. A number field
+/// of 0 removes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagEdit {
+    /// Track title.
+    pub title: Option<String>,
+    /// Track artist.
+    pub artist: Option<String>,
+    /// Album title.
+    pub album: Option<String>,
+    /// Album artist.
+    pub album_artist: Option<String>,
+    /// Release year, from 0 to 9999. 0 removes it.
+    pub year: Option<i32>,
+    /// Track number on its disc. 0 removes it.
+    pub track_no: Option<u32>,
+    /// Disc number. 0 removes it.
+    pub disc_no: Option<u32>,
+    /// Genre.
+    pub genre: Option<String>,
+}
+
+/// Largest year [`write_tags`] accepts.
+const MAX_YEAR: i32 = 9999;
+
+/// Writes `edit` into the primary tag of the audio file at `path`, creating that tag when the
+/// file has none, and keeps the file's other tags. The file is rewritten in place.
+///
+/// Fails with `LibraryError::Tags` when lofty cannot read or write the file, or when the year is
+/// outside 0..=9999.
+pub fn write_tags(path: &Path, edit: &TagEdit) -> Result<()> {
+    if let Some(year) = edit.year
+        && !(0..=MAX_YEAR).contains(&year)
+    {
+        return Err(tag_error(format!("year {year} is out of range")));
+    }
+    let mut tagged: TaggedFile = lofty::read_from_path(path).map_err(tag_error)?;
+    let tag_type = tagged.primary_tag_type();
+    if tagged.tag_mut(tag_type).is_none() {
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged
+        .tag_mut(tag_type)
+        .ok_or_else(|| tag_error("no tag to write"))?;
+
+    set_text(tag, ItemKey::TrackTitle, edit.title.as_deref());
+    set_text(tag, ItemKey::TrackArtist, edit.artist.as_deref());
+    set_text(tag, ItemKey::AlbumTitle, edit.album.as_deref());
+    set_text(tag, ItemKey::AlbumArtist, edit.album_artist.as_deref());
+    set_text(tag, ItemKey::Genre, edit.genre.as_deref());
+    set_number(tag, ItemKey::TrackNumber, edit.track_no);
+    set_number(tag, ItemKey::DiscNumber, edit.disc_no);
+    match edit.year {
+        None => {}
+        Some(0) => {
+            tag.remove_key(ItemKey::Year);
+            tag.remove_key(ItemKey::RecordingDate);
+        }
+        // Same storage as `Accessor::set_date`: the recording date replaces the year item.
+        Some(year) => {
+            tag.remove_key(ItemKey::Year);
+            tag.insert_text(ItemKey::RecordingDate, year.to_string());
+        }
+    }
+
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(tag_error)
+}
+
+/// Sets a text item to the trimmed value, or removes it when the value is blank. `None` changes
+/// nothing.
+fn set_text(tag: &mut Tag, key: ItemKey, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        tag.remove_key(key);
+    } else {
+        tag.insert_text(key, value.to_owned());
+    }
+}
+
+/// Sets a number item, or removes it for 0. `None` changes nothing.
+fn set_number(tag: &mut Tag, key: ItemKey, value: Option<u32>) {
+    match value {
+        None => {}
+        Some(0) => tag.remove_key(key),
+        Some(number) => {
+            tag.insert_text(key, number.to_string());
+        }
+    }
 }
 
 /// Finds a folder-level cover image for `audio_key` among `all_keys`.
@@ -566,5 +661,109 @@ mod fixture_tests {
     fn garbage_without_hint_is_an_error() {
         let junk = std::io::Cursor::new(vec![0u8; 64]);
         assert!(matches!(read_meta(junk, None), Err(LibraryError::Tags(_))));
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::db::test_support::TempDir;
+
+    fn tagged_copy(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("edit.flac");
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Artist A/Album One/01 - First Song.flac"
+        );
+        std::fs::copy(src, &path).expect("copy fixture");
+        path
+    }
+
+    fn read(path: &Path) -> TrackMeta {
+        let file = std::fs::File::open(path).expect("open");
+        read_meta(file, Some("flac")).expect("read_meta")
+    }
+
+    #[test]
+    fn title_changes_and_other_fields_stay() {
+        let dir = TempDir::new();
+        let path = tagged_copy(&dir);
+        let edit = TagEdit {
+            title: Some("  Renamed Song  ".into()),
+            ..Default::default()
+        };
+        write_tags(&path, &edit).expect("write");
+        let m = read(&path);
+        assert_eq!(m.title.as_deref(), Some("Renamed Song"));
+        assert_eq!(m.artist.as_deref(), Some("Artist A"));
+        assert_eq!(m.album.as_deref(), Some("Album One"));
+        assert_eq!(m.track_no, Some(1));
+        assert!(m.cover.is_some(), "pictures are kept");
+    }
+
+    #[test]
+    fn blank_text_removes_and_zero_number_removes() {
+        let dir = TempDir::new();
+        let path = tagged_copy(&dir);
+        let edit = TagEdit {
+            genre: Some("   ".into()),
+            album_artist: Some(String::new()),
+            track_no: Some(0),
+            disc_no: Some(0),
+            ..Default::default()
+        };
+        write_tags(&path, &edit).expect("write");
+        let m = read(&path);
+        assert_eq!(m.genre, None);
+        assert_eq!(m.album_artist, None);
+        assert_eq!(m.track_no, None);
+        assert_eq!(m.disc_no, None);
+        assert_eq!(m.title.as_deref(), Some("First Song"), "untouched");
+    }
+
+    #[test]
+    fn numbers_and_year_are_written() {
+        let dir = TempDir::new();
+        let path = tagged_copy(&dir);
+        let edit = TagEdit {
+            track_no: Some(7),
+            disc_no: Some(2),
+            year: Some(1999),
+            ..Default::default()
+        };
+        write_tags(&path, &edit).expect("write");
+        let m = read(&path);
+        assert_eq!(m.track_no, Some(7));
+        assert_eq!(m.disc_no, Some(2));
+        assert_eq!(m.year, Some(1999));
+    }
+
+    #[test]
+    fn out_of_range_year_is_refused_and_file_is_untouched() {
+        let dir = TempDir::new();
+        let path = tagged_copy(&dir);
+        let before = std::fs::read(&path).expect("read");
+        for year in [-1, 10_000] {
+            let edit = TagEdit {
+                year: Some(year),
+                ..Default::default()
+            };
+            assert!(matches!(
+                write_tags(&path, &edit),
+                Err(LibraryError::Tags(_))
+            ));
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn unreadable_file_is_a_tag_error() {
+        let dir = TempDir::new();
+        let path = dir.path().join("junk.flac");
+        std::fs::write(&path, vec![0u8; 64]).expect("write junk");
+        assert!(matches!(
+            write_tags(&path, &TagEdit::default()),
+            Err(LibraryError::Tags(_))
+        ));
     }
 }

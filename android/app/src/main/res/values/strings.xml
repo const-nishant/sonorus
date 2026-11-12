@@ -452,4 +452,106 @@
     <string name="error_sync">Sync failed.</string>
     <string name="file_name_fallback">audio file</string>
     <string name="usb_dac_fallback_name">USB audio</string>
+    <!-- Manage bucket: entry points and menus -->
+    <string name="settings_manage_bucket">Manage bucket</string>
+    <string name="settings_manage_bucket_hint">Browse, rename, move and delete files in the bucket</string>
+    <string name="settings_manage_bucket_needs_bucket">Connect a bucket first to manage its files</string>
+    <string name="action_edit_tags">Edit tags…</string>
+    <string name="action_edit_album_tags">Edit album tags…</string>
+    <string name="action_show_in_bucket">Show in bucket</string>
+    <string name="action_set_cover">Set cover…</string>
+    <string name="action_save">Save</string>
+    <string name="error_save_tags">Couldn\'t save the tags.</string>
+    <string name="error_set_cover">Couldn\'t set the cover.</string>
+    <string name="error_manage">Couldn\'t change the bucket.</string>
+
+    <!-- Tag forms -->
+    <string name="tags_title">Edit tags</string>
+    <string name="tags_album_title">Edit album tags</string>
+    <string name="tags_field_title">Title</string>
+    <string name="tags_field_artist">Artist</string>
+    <string name="tags_field_album">Album</string>
+    <string name="tags_field_album_artist">Album artist</string>
+    <string name="tags_field_year">Year</string>
+    <string name="tags_field_track_no">Track number</string>
+    <string name="tags_field_disc_no">Disc number</string>
+    <string name="tags_field_genre">Genre</string>
+    <string name="tags_saving">Saving tags…</string>
+    <string name="tags_saving_progress">Saving %1$d of %2$d…</string>
+    <string name="tags_number_hint">Leave empty to remove it</string>
+    <string name="tags_number_error">Enter a number from 0 to %1$d</string>
+    <plurals name="tags_album_partial">
+        <item quantity="one">%1$d of %2$d track could not be saved. %3$s</item>
+        <item quantity="other">%1$d of %2$d tracks could not be saved. %3$s</item>
+    </plurals>
+
+    <!-- Manage bucket screen -->
+    <string name="manage_title">Manage bucket</string>
+    <string name="manage_root">Root</string>
+    <string name="manage_load_failed">Couldn\'t open this folder</string>
+    <string name="manage_empty_title">This folder is empty</string>
+    <string name="manage_empty_message">Files and folders in this part of the bucket show up here.</string>
+    <string name="manage_clear_selection">Clear selection</string>
+    <string name="manage_select_all">Select all</string>
+    <string name="manage_move">Move</string>
+    <string name="manage_details">Details</string>
+    <string name="manage_failures_title">Not changed</string>
+    <string name="manage_detail_key">Key</string>
+    <string name="manage_detail_size">Size</string>
+    <string name="manage_detail_modified">Modified</string>
+    <string name="manage_cd_folder">Folder</string>
+    <string name="manage_cd_file">File</string>
+    <string name="manage_cd_track">Track</string>
+    <string name="manage_busy_renaming">Renaming…</string>
+    <string name="manage_result_renamed">Renamed to %1$s</string>
+    <plurals name="manage_result_partial_move">
+        <item quantity="one">Moved %1$d of %2$d. %3$d failed</item>
+        <item quantity="other">Moved %1$d of %2$d. %3$d failed</item>
+    </plurals>
+    <plurals name="manage_result_partial_delete">
+        <item quantity="one">Deleted %1$d of %2$d. %3$d failed</item>
+        <item quantity="other">Deleted %1$d of %2$d. %3$d failed</item>
+    </plurals>
+    <string name="manage_rename_title">Rename</string>
+    <string name="manage_rename_field">Name</string>
+    <string name="manage_rename_empty">Enter a name</string>
+    <string name="manage_rename_slash">A name can\'t contain /</string>
+    <string name="manage_rename_same">Enter a different name</string>
+    <string name="manage_move_title">Move to folder</string>
+    <string name="manage_move_here">Move here</string>
+    <string name="manage_move_pick_other">Choose a different folder. An item can\'t move into itself or into one of its own subfolders.</string>
+    <string name="manage_move_no_folders">No subfolders here.</string>
+    <string name="manage_delete_title">Delete from bucket</string>
+    <string name="manage_delete_folder_message">Delete “%1$s” and everything inside it? This can\'t be undone. If your bucket has versioning enabled, you may be able to recover them in your provider\'s console.</string>
+    <string name="manage_delete_type_name">Type “%1$s” to confirm</string>
+    <string name="manage_delete_type_count">Type %1$d to confirm</string>
+
+    <plurals name="manage_selected_count">
+        <item quantity="one">%1$d selected</item>
+        <item quantity="other">%1$d selected</item>
+    </plurals>
+    <plurals name="manage_busy_moving">
+        <item quantity="one">Moving %1$d item…</item>
+        <item quantity="other">Moving %1$d items…</item>
+    </plurals>
+    <plurals name="manage_busy_deleting">
+        <item quantity="one">Deleting %1$d item…</item>
+        <item quantity="other">Deleting %1$d items…</item>
+    </plurals>
+    <plurals name="manage_result_moved">
+        <item quantity="one">Moved %1$d item</item>
+        <item quantity="other">Moved %1$d items</item>
+    </plurals>
+    <plurals name="manage_result_deleted">
+        <item quantity="one">Deleted %1$d item</item>
+        <item quantity="other">Deleted %1$d items</item>
+    </plurals>
+    <plurals name="manage_delete_files_message">
+        <item quantity="one">Delete %1$d item from the bucket? This can\'t be undone. If your bucket has versioning enabled, you may be able to recover them in your provider\'s console.</item>
+        <item quantity="other">Delete %1$d items from the bucket? This can\'t be undone. If your bucket has versioning enabled, you may be able to recover them in your provider\'s console.</item>
+    </plurals>
+    <plurals name="manage_delete_mixed_message">
+        <item quantity="one">Delete %1$d item, including the contents of any folder? This can\'t be undone. If your bucket has versioning enabled, you may be able to recover them in your provider\'s console.</item>
+        <item quantity="other">Delete %1$d items, including the contents of any folder? This can\'t be undone. If your bucket has versioning enabled, you may be able to recover them in your provider\'s console.</item>
+    </plurals>
 </resources>

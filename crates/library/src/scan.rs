@@ -563,6 +563,43 @@ pub async fn scan(
     })
 }
 
+/// Re-reads one audio object into the catalogue: its tags, properties, cover and `.lrc` sidecar,
+/// the same way [`scan`] would. Unlike a scan it stores the track even when its stamp did not
+/// change, so it also picks up tags that were edited in place.
+///
+/// The object is found by listing its folder (`source.list` of the folder prefix). Returns
+/// `Ok(true)` when the track was stored. When the audio object is no longer listed, its track row
+/// (and sidecar) is removed and the result is `Ok(false)`, as is any key that is not audio.
+/// Errors from the listing, the tag read or the catalogue are returned. The caller prunes the
+/// catalogue afterwards when the change may have emptied an album.
+pub async fn scan_key(library: &Library, source: Arc<dyn MetaSource>, key: &str) -> Result<bool> {
+    if !is_audio_key(key) {
+        return Ok(false);
+    }
+    let folder = key.rfind('/').map_or("", |i| &key[..=i]);
+    let listed = source.list(folder).await?;
+    let Some(stamp) = listed.iter().find(|s| s.key == key).cloned() else {
+        library.remove_tracks(&[key.to_owned()])?;
+        return Ok(false);
+    };
+    let all_keys: HashSet<String> = listed.iter().map(|s| s.key.clone()).collect();
+    let meta = source.read_meta(&stamp).await?;
+    let mut folder_covers: HashMap<String, Option<i64>> = HashMap::new();
+    store_track(
+        library,
+        source.as_ref(),
+        &all_keys,
+        &mut folder_covers,
+        &stamp,
+        &meta,
+    )
+    .await?;
+    let sidecars = sidecar_map(&listed);
+    let audio_keys = HashSet::from([key.to_owned()]);
+    sync_sidecars(library, source.as_ref(), &audio_keys, &sidecars).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,5 +1139,72 @@ mod tests {
         assert_eq!(extension("trailing."), None);
         assert_eq!(mime_for_cover("a/cover.PNG"), "image/png");
         assert_eq!(mime_for_cover("a/cover.jpg"), "image/jpeg");
+    }
+}
+
+#[cfg(test)]
+mod scan_key_tests {
+    use super::*;
+    use crate::db::test_support::TempDir;
+    use crate::tags::{TagEdit, write_tags};
+    use std::fs;
+
+    fn fixtures() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"))
+    }
+
+    fn copy_dir(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    fn dir_source(root: &Path) -> Arc<dyn MetaSource> {
+        Arc::new(DirSource::new(root))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rereads_a_track_whose_tags_changed_in_place() {
+        let tmp = TempDir::new();
+        let lib = Library::open_in_memory(&tmp.path().join("covers")).unwrap();
+        let music = tmp.path().join("music");
+        copy_dir(&fixtures(), &music);
+        scan(&lib, dir_source(&music), "", 2, |_| {}).await.unwrap();
+
+        let key = "Artist A/Album One/01 - First Song.flac";
+        let edit = TagEdit {
+            title: Some("Edited Title".into()),
+            ..Default::default()
+        };
+        write_tags(&music.join(key), &edit).unwrap();
+
+        assert!(scan_key(&lib, dir_source(&music), key).await.unwrap());
+        let track = lib.track_by_key(key).unwrap().expect("still catalogued");
+        assert_eq!(track.title, "Edited Title");
+        assert_eq!(track.album, "Album One");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_object_removes_its_track_and_non_audio_is_ignored() {
+        let tmp = TempDir::new();
+        let lib = Library::open_in_memory(&tmp.path().join("covers")).unwrap();
+        let music = tmp.path().join("music");
+        copy_dir(&fixtures(), &music);
+        scan(&lib, dir_source(&music), "", 2, |_| {}).await.unwrap();
+
+        let key = "Artist B/Album Two/01 - Wave Song.wav";
+        fs::remove_file(music.join(key)).unwrap();
+        assert!(!scan_key(&lib, dir_source(&music), key).await.unwrap());
+        assert!(lib.track_by_key(key).unwrap().is_none());
+
+        let cover = "Artist B/Album Two/cover.jpg";
+        assert!(!scan_key(&lib, dir_source(&music), cover).await.unwrap());
     }
 }

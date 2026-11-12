@@ -239,6 +239,20 @@ impl TrackCache {
         file_len(&file_path(&inner.dir, &entry_name(key, size), AUDIO_EXT)) == Some(size)
     }
 
+    /// Deletes the entry for `key`/`size` (its `.audio`, `.part` and `.map` files), pinned or not.
+    /// Used when the object behind the key has changed or gone. An entry with a live writer is
+    /// left alone, so the download in progress finishes; a missing entry is not an error.
+    pub fn remove(&self, key: &str, size: u64) -> Result<()> {
+        let inner = lock(&self.inner);
+        let name = entry_name(key, size);
+        if inner.is_live(&name) {
+            log::info!("cache entry {name} is being written; not removed");
+            return Ok(());
+        }
+        remove_entry(&inner.dir, &name)?;
+        Ok(())
+    }
+
     /// Sets the byte limit and evicts down to it.
     pub fn set_limit(&self, bytes: u64) {
         let mut inner = lock(&self.inner);

@@ -11,6 +11,7 @@ pub mod pins;
 pub mod playlists;
 pub mod quality;
 pub mod query;
+pub mod rekey;
 pub mod remote;
 pub mod scan;
 pub mod smart;
@@ -33,6 +34,7 @@ pub use quality::{QualityFilter, is_lossless, matches_quality};
 pub use remote::RemoteReader;
 pub use scan::{
     BoxFuture, BucketSource, DirSource, MetaSource, ScanFailure, ScanProgress, ScanReport, scan,
+    scan_key,
 };
 pub use smart::SmartPlaylist;
 pub use stats::{AlbumPlays, ArtistPlays, ListeningStats, StatsRange, TrackPlays};
@@ -40,4 +42,4 @@ pub use sync::{
     BucketStore, DOC_VERSION, FAVORITES_FILE, FavoritesDoc, MemoryStore, PLAYLISTS_FILE,
     PlaylistsDoc, SyncReport, UserDataStore, merge_favorites, merge_playlists, sync_user_data,
 };
-pub use tags::{folder_cover_key, read_meta};
+pub use tags::{TagEdit, folder_cover_key, read_meta, write_tags};

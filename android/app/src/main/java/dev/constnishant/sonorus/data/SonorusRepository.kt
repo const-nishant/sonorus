@@ -9,7 +9,12 @@ import dev.constnishant.sonorus.R
 import dev.constnishant.sonorus.core.CacheSettings
 import dev.constnishant.sonorus.core.CacheUsageInfo
 import dev.constnishant.sonorus.core.CoreConfig
+import dev.constnishant.sonorus.core.BucketFolderInfo
 import dev.constnishant.sonorus.core.CoreException
+import dev.constnishant.sonorus.core.DeleteReport
+import dev.constnishant.sonorus.core.MoveReport
+import dev.constnishant.sonorus.core.TagEditInfo
+import dev.constnishant.sonorus.core.TrackInfo
 import dev.constnishant.sonorus.core.DownloadStatus
 import dev.constnishant.sonorus.core.OutputInfo
 import dev.constnishant.sonorus.core.OutputSettings
@@ -380,6 +385,77 @@ class SonorusRepository(private val app: Context) {
     suspend fun cancelUploadNow(jobId: Long) {
         call { it.uploadCancel(jobId) }
         events.emitUploadsChanged()
+    }
+
+    /** The folder view of the bucket at [path] (relative to the prefix, `""` for the root). Throws a [CoreException]. */
+    suspend fun browseBucket(path: String): BucketFolderInfo = call { it.browse(path) }
+
+    /** One catalogued track by id. Throws a [CoreException]. */
+    suspend fun track(id: Long): TrackInfo = call { it.track(id) }
+
+    /**
+     * The folder of the object [key], relative to the bucket prefix and ending with `/`, or `""`
+     * for the root. Reads the saved settings, so it runs on [Dispatchers.IO].
+     */
+    suspend fun bucketFolderOf(key: String): String = withContext(Dispatchers.IO) {
+        val prefix = settings.load()?.prefix.orEmpty().trim().trim('/').let { if (it.isEmpty()) "" else "$it/" }
+        val folder = key.removePrefix(prefix).substringBeforeLast('/', "")
+        if (folder.isEmpty()) "" else "$folder/"
+    }
+
+    /** The bucket folder of the album's first track, or `""` (the root) when it has no tracks. */
+    suspend fun bucketFolderOfAlbum(albumId: Long): String {
+        val key = call { it.albumTracks(albumId) }.firstOrNull()?.key ?: return ""
+        return bucketFolderOf(key)
+    }
+
+    /** Renames the file [key] to [newName] and returns its new key. Tells library observers. Throws a [CoreException]. */
+    suspend fun renameObject(key: String, newName: String): String {
+        val newKey = call { it.renameObject(key, newName) }
+        notifyLibraryChanged()
+        return newKey
+    }
+
+    /** Moves the objects [keys] into the bucket folder [folder]. Tells library observers. Throws a [CoreException]. */
+    suspend fun moveObjects(keys: List<String>, folder: String): MoveReport {
+        val report = call { it.moveObjects(keys, folder) }
+        notifyLibraryChanged()
+        return report
+    }
+
+    /** Deletes the files [keys] from the bucket. Tells library observers. Throws a [CoreException]. */
+    suspend fun deleteObjects(keys: List<String>): DeleteReport {
+        val report = call { it.deleteObjects(keys) }
+        notifyLibraryChanged()
+        return report
+    }
+
+    /** Deletes the bucket folder [path] with everything in it. Tells library observers. Throws a [CoreException]. */
+    suspend fun deleteFolder(path: String): DeleteReport {
+        val report = call { it.deleteFolder(path) }
+        notifyLibraryChanged()
+        return report
+    }
+
+    /** Writes [edit] into the tags of track [trackId]. Tells library observers. Throws a [CoreException]. */
+    suspend fun editTags(trackId: Long, edit: TagEditInfo) {
+        call { it.editTags(trackId, edit) }
+        notifyLibraryChanged()
+    }
+
+    /**
+     * Sets the cover of album [albumId] to the image at [uri]. The descriptor is opened here and
+     * handed to the core, which closes it. Throws a [CoreException], or an [IOException] when the
+     * image cannot be opened.
+     */
+    suspend fun setAlbumCover(albumId: Long, uri: Uri) {
+        withContext(Dispatchers.IO) {
+            val pfd = app.contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IOException("no descriptor for the picked image")
+            // The core owns the descriptor from here on, on every path.
+            call { it.setAlbumCover(albumId, pfd.detachFd()) }
+        }
+        notifyLibraryChanged()
     }
 
     /** The name of a picked file: its display name, else the last segment of its URI. */

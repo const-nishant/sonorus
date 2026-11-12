@@ -3,6 +3,7 @@
 mod client;
 mod config;
 mod error;
+mod manage;
 mod tls;
 mod upload;
 
@@ -11,4 +12,5 @@ pub use client::{
 };
 pub use config::{StorageConfig, normalize_prefix, region_from_endpoint};
 pub use error::{Result, StorageError};
+pub use manage::FolderListing;
 pub use upload::{MAX_PART_ATTEMPTS, PART_SIZE, UploadProgress, UploadedPart};

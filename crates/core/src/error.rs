@@ -51,6 +51,15 @@ pub enum CoreError {
         /// Display text of the underlying error.
         detail: String,
     },
+    /// A bucket management operation was refused to keep it inside the configured prefix, or to
+    /// protect data: a key outside the prefix, a `..` or empty segment, the bucket root, the
+    /// internal `_sonorus/` folder, a name that is not a plain file name, a move of a folder into
+    /// itself, or an overwrite. Nothing was changed.
+    #[error("refused: {detail}")]
+    Refused {
+        /// Which rule was broken, without any secret values.
+        detail: String,
+    },
     /// The operation cannot run right now (for example, a scan is already in progress).
     #[error("busy: {detail}")]
     Busy {

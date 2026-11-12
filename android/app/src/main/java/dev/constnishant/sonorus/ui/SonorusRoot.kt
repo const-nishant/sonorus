@@ -26,6 +26,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,6 +50,8 @@ import dev.constnishant.sonorus.core.SmartPlaylistKind
 import dev.constnishant.sonorus.data.repository
 import dev.constnishant.sonorus.ui.player.MiniPlayer
 import dev.constnishant.sonorus.ui.player.NowPlayingScreen
+import dev.constnishant.sonorus.ui.components.LocalOpenBucketFolder
+import dev.constnishant.sonorus.ui.manage.ManageBucketScreen
 import dev.constnishant.sonorus.ui.player.showsPause
 import dev.constnishant.sonorus.ui.screens.AlbumScreen
 import dev.constnishant.sonorus.ui.screens.ArtistScreen
@@ -80,6 +83,15 @@ private val IdArgs = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType
 
 private fun NavBackStackEntry.idArg(): Long =
     checkNotNull(arguments?.getLong(Routes.ARG_ID)) { "missing ${Routes.ARG_ID}" }
+
+/** Navigation arguments for the Manage bucket route: the bucket folder path, `""` for the root. */
+private val PathArgs = listOf(navArgument(Routes.ARG_PATH) {
+    type = NavType.StringType
+    defaultValue = ""
+})
+
+/** The bucket folder path named by the route argument. */
+private fun NavBackStackEntry.pathArg(): String = arguments?.getString(Routes.ARG_PATH).orEmpty()
 
 /** Navigation arguments for the smart playlist route: the [SmartPlaylistKind] enum name. */
 private val KindArgs = listOf(navArgument(Routes.ARG_KIND) { type = NavType.StringType })
@@ -120,140 +132,151 @@ fun SonorusRoot() {
         repository.events.errors.collect { snackbarHostState.showSnackbar(it) }
     }
 
-    Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        // Screens handle the status bar themselves; this Scaffold only reserves the bottom bar.
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        bottomBar = {
-            if (showChrome) {
-                Column {
-                    AnimatedVisibility(
-                        visible = playback.track != null,
-                        enter = slideInVertically { it } + fadeIn(),
-                        exit = slideOutVertically { it } + fadeOut(),
-                    ) {
-                        MiniPlayer(
-                            playback = shownPlayback,
-                            onOpen = { navController.navigate(Routes.NOW_PLAYING) },
-                            onPlayPause = {
-                                val pause = playback.state.showsPause()
-                                repository.command { if (pause) it.pause() else it.play() }
-                            },
-                            onNext = { repository.command { it.next() } },
-                            onPrevious = { repository.command { it.previous() } },
-                        )
-                    }
-                    NavigationBar {
-                        TopLevelTabs.forEach { tab ->
-                            NavigationBarItem(
-                                selected = currentTab == tab.route,
-                                onClick = {
-                                    if (currentTab == tab.route) {
-                                        // Re-selecting the current tab returns to its top screen.
-                                        navController.popBackStack(tab.route, inclusive = false)
-                                    } else {
-                                        navController.navigate(tab.route) {
-                                            popUpTo(Routes.HOME) { saveState = true }
-                                            launchSingleTop = true
-                                            restoreState = true
-                                        }
-                                    }
+    CompositionLocalProvider(
+        LocalOpenBucketFolder provides { path -> navController.navigate(Routes.manage(path)) },
+    ) {
+        Scaffold(
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+            // Screens handle the status bar themselves; this Scaffold only reserves the bottom bar.
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
+            bottomBar = {
+                if (showChrome) {
+                    Column {
+                        AnimatedVisibility(
+                            visible = playback.track != null,
+                            enter = slideInVertically { it } + fadeIn(),
+                            exit = slideOutVertically { it } + fadeOut(),
+                        ) {
+                            MiniPlayer(
+                                playback = shownPlayback,
+                                onOpen = { navController.navigate(Routes.NOW_PLAYING) },
+                                onPlayPause = {
+                                    val pause = playback.state.showsPause()
+                                    repository.command { if (pause) it.pause() else it.play() }
                                 },
-                                icon = { Icon(tab.icon, contentDescription = null) },
-                                label = { Text(stringResource(tab.labelRes)) },
+                                onNext = { repository.command { it.next() } },
+                                onPrevious = { repository.command { it.previous() } },
                             )
+                        }
+                        NavigationBar {
+                            TopLevelTabs.forEach { tab ->
+                                NavigationBarItem(
+                                    selected = currentTab == tab.route,
+                                    onClick = {
+                                        if (currentTab == tab.route) {
+                                            // Re-selecting the current tab returns to its top screen.
+                                            navController.popBackStack(tab.route, inclusive = false)
+                                        } else {
+                                            navController.navigate(tab.route) {
+                                                popUpTo(Routes.HOME) { saveState = true }
+                                                launchSingleTop = true
+                                                restoreState = true
+                                            }
+                                        }
+                                    },
+                                    icon = { Icon(tab.icon, contentDescription = null) },
+                                    label = { Text(stringResource(tab.labelRes)) },
+                                )
+                            }
                         }
                     }
                 }
-            }
-        },
-    ) { innerPadding ->
-        NavHost(
-            navController = navController,
-            startDestination = Routes.HOME,
-            modifier = Modifier.padding(innerPadding).consumeWindowInsets(innerPadding),
-            // Shared-axis style: the new screen slides in a little from the side while fading in.
-            enterTransition = { slideInHorizontally(navMotion()) { it / 10 } + fadeIn(navMotion()) },
-            exitTransition = { fadeOut(navMotion()) },
-            popEnterTransition = { fadeIn(navMotion()) },
-            popExitTransition = { slideOutHorizontally(navMotion()) { it / 10 } + fadeOut(navMotion()) },
-        ) {
-            composable(Routes.HOME) {
-                HomeScreen(
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onOpenSettings = { navController.navigate(Routes.SETTINGS) },
-                    onOpenStats = { navController.navigate(Routes.STATS) },
-                )
-            }
-            composable(Routes.LIBRARY) {
-                LibraryScreen(
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onArtist = { navController.navigate(Routes.artist(it)) },
-                    onPlaylist = { navController.navigate(Routes.playlist(it)) },
-                    onSmartPlaylist = { navController.navigate(Routes.smartPlaylist(it)) },
-                )
-            }
-            composable(Routes.SEARCH) {
-                SearchScreen(
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onArtist = { navController.navigate(Routes.artist(it)) },
-                )
-            }
-            composable(Routes.ALBUM, arguments = IdArgs) { entry ->
-                AlbumScreen(
-                    albumId = entry.idArg(),
-                    onArtist = { navController.navigate(Routes.artist(it)) },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(Routes.ARTIST, arguments = IdArgs) { entry ->
-                ArtistScreen(
-                    artistId = entry.idArg(),
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(Routes.PLAYLIST, arguments = IdArgs) { entry ->
-                PlaylistScreen(
-                    playlistId = entry.idArg(),
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(
-                Routes.NOW_PLAYING,
-                // Now Playing rises from the mini player and drops back down when closed.
-                enterTransition = { slideInVertically(sheetMotion()) { it } },
+            },
+        ) { innerPadding ->
+            NavHost(
+                navController = navController,
+                startDestination = Routes.HOME,
+                modifier = Modifier.padding(innerPadding).consumeWindowInsets(innerPadding),
+                // Shared-axis style: the new screen slides in a little from the side while fading in.
+                enterTransition = { slideInHorizontally(navMotion()) { it / 10 } + fadeIn(navMotion()) },
                 exitTransition = { fadeOut(navMotion()) },
                 popEnterTransition = { fadeIn(navMotion()) },
-                popExitTransition = { slideOutVertically(sheetMotion()) { it } },
+                popExitTransition = { slideOutHorizontally(navMotion()) { it / 10 } + fadeOut(navMotion()) },
             ) {
-                NowPlayingScreen(
-                    onBack = { navController.popBackStack() },
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onArtist = { navController.navigate(Routes.artist(it)) },
-                )
-            }
-            composable(Routes.SMART, arguments = KindArgs) { entry ->
-                SmartPlaylistScreen(
-                    kind = entry.kindArg(),
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(Routes.STATS) {
-                StatsScreen(
-                    onAlbum = { navController.navigate(Routes.album(it)) },
-                    onArtist = { navController.navigate(Routes.artist(it)) },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(Routes.SETTINGS) {
-                SettingsScreen(
-                    onBack = { navController.popBackStack() },
-                    onUploads = { navController.navigate(Routes.UPLOADS) },
-                )
-            }
-            composable(Routes.UPLOADS) {
-                UploadsScreen(onBack = { navController.popBackStack() })
+                composable(Routes.HOME) {
+                    HomeScreen(
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                        onOpenStats = { navController.navigate(Routes.STATS) },
+                    )
+                }
+                composable(Routes.LIBRARY) {
+                    LibraryScreen(
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onArtist = { navController.navigate(Routes.artist(it)) },
+                        onPlaylist = { navController.navigate(Routes.playlist(it)) },
+                        onSmartPlaylist = { navController.navigate(Routes.smartPlaylist(it)) },
+                    )
+                }
+                composable(Routes.SEARCH) {
+                    SearchScreen(
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onArtist = { navController.navigate(Routes.artist(it)) },
+                    )
+                }
+                composable(Routes.ALBUM, arguments = IdArgs) { entry ->
+                    AlbumScreen(
+                        albumId = entry.idArg(),
+                        onArtist = { navController.navigate(Routes.artist(it)) },
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(Routes.ARTIST, arguments = IdArgs) { entry ->
+                    ArtistScreen(
+                        artistId = entry.idArg(),
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(Routes.PLAYLIST, arguments = IdArgs) { entry ->
+                    PlaylistScreen(
+                        playlistId = entry.idArg(),
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(
+                    Routes.NOW_PLAYING,
+                    // Now Playing rises from the mini player and drops back down when closed.
+                    enterTransition = { slideInVertically(sheetMotion()) { it } },
+                    exitTransition = { fadeOut(navMotion()) },
+                    popEnterTransition = { fadeIn(navMotion()) },
+                    popExitTransition = { slideOutVertically(sheetMotion()) { it } },
+                ) {
+                    NowPlayingScreen(
+                        onBack = { navController.popBackStack() },
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onArtist = { navController.navigate(Routes.artist(it)) },
+                    )
+                }
+                composable(Routes.SMART, arguments = KindArgs) { entry ->
+                    SmartPlaylistScreen(
+                        kind = entry.kindArg(),
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(Routes.STATS) {
+                    StatsScreen(
+                        onAlbum = { navController.navigate(Routes.album(it)) },
+                        onArtist = { navController.navigate(Routes.artist(it)) },
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(Routes.SETTINGS) {
+                    SettingsScreen(
+                        onBack = { navController.popBackStack() },
+                        onUploads = { navController.navigate(Routes.UPLOADS) },
+                        onManageBucket = { navController.navigate(Routes.manage()) },
+                    )
+                }
+                composable(Routes.MANAGE, arguments = PathArgs) { entry ->
+                    ManageBucketScreen(
+                        initialPath = entry.pathArg(),
+                        onBack = { navController.popBackStack() },
+                    )
+                }
+                composable(Routes.UPLOADS) {
+                    UploadsScreen(onBack = { navController.popBackStack() })
+                }
             }
         }
     }

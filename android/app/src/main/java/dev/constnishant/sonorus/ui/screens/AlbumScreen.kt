@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -15,12 +16,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Photo
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -30,6 +38,12 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -58,7 +72,10 @@ import dev.constnishant.sonorus.ui.components.LoadingContent
 import dev.constnishant.sonorus.ui.components.PinUi
 import dev.constnishant.sonorus.ui.components.TrackActions
 import dev.constnishant.sonorus.ui.components.TrackRow
+import dev.constnishant.sonorus.ui.components.AlbumTagsDialog
 import dev.constnishant.sonorus.ui.components.animatedDominant
+import dev.constnishant.sonorus.ui.components.rememberBucketConfigured
+import dev.constnishant.sonorus.ui.components.rememberBucketMenuActions
 import dev.constnishant.sonorus.ui.components.formatTotal
 import dev.constnishant.sonorus.ui.components.isHiRes
 import dev.constnishant.sonorus.ui.components.qualityLabel
@@ -89,6 +106,13 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
     val currentId by rememberCurrentTrackId()
     val actions = rememberTrackActions()
     val title = (state as? LoadState.Ready)?.value?.album?.title.orEmpty()
+    val configured by rememberBucketConfigured()
+    val bucket = rememberBucketMenuActions()
+    var menuOpen by remember { mutableStateOf(false) }
+    var editOpen by remember { mutableStateOf(false) }
+    val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) viewModel.setCover(uri)
+    }
 
     Scaffold(
         modifier = modifier,
@@ -96,6 +120,41 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
             TopAppBar(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { BackButton(onBack) },
+                actions = {
+                    if (configured) {
+                        Box {
+                            IconButton(onClick = { menuOpen = true }) {
+                                Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.cd_more_options))
+                            }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.action_edit_album_tags)) },
+                                    leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                                    onClick = {
+                                        menuOpen = false
+                                        editOpen = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.action_show_in_bucket)) },
+                                    leadingIcon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
+                                    onClick = {
+                                        menuOpen = false
+                                        bucket.showAlbum(albumId)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.action_set_cover)) },
+                                    leadingIcon = { Icon(Icons.Rounded.Photo, contentDescription = null) },
+                                    onClick = {
+                                        menuOpen = false
+                                        coverPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                    },
+                                )
+                            }
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = Color.Transparent,
                     scrolledContainerColor = MaterialTheme.colorScheme.surface,
@@ -121,6 +180,10 @@ fun AlbumScreen(albumId: Long, onArtist: (Long) -> Unit, onBack: () -> Unit, mod
                 modifier = Modifier.padding(padding),
             )
         }
+    }
+
+    if (editOpen) {
+        AlbumTagsDialog(albumId = albumId, onDismiss = { editOpen = false })
     }
 }
 

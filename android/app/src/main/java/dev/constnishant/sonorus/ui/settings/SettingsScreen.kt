@@ -95,10 +95,16 @@ private enum class SettingsPage { ROOT, BUCKET, LIBRARY, PLAYBACK, DOWNLOADS, AB
 
 /**
  * Settings: a short list of categories, each opening its own page. Back on a page returns to the
- * list; back on the list leaves via [onBack]. [onUploads] opens the uploads screen.
+ * list; back on the list leaves via [onBack]. [onUploads] opens the uploads screen and
+ * [onManageBucket] the Manage bucket screen.
  */
 @Composable
-fun SettingsScreen(onBack: () -> Unit, onUploads: () -> Unit, modifier: Modifier = Modifier) {
+fun SettingsScreen(
+    onBack: () -> Unit,
+    onUploads: () -> Unit,
+    onManageBucket: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val repository = LocalContext.current.repository
     val viewModel: SettingsViewModel = viewModel { SettingsViewModel(checkNotNull(this[APPLICATION_KEY]), repository) }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -128,7 +134,7 @@ fun SettingsScreen(onBack: () -> Unit, onUploads: () -> Unit, modifier: Modifier
                 onUploads = onUploads,
             )
             SettingsPage.BUCKET -> Page(stringResource(R.string.settings_section_bucket), toRoot) {
-                BucketPage(state, viewModel)
+                BucketPage(state, viewModel, onManageBucket)
             }
             SettingsPage.LIBRARY -> Page(stringResource(R.string.settings_section_library), toRoot) {
                 LibraryPage(state, scan, viewModel)
@@ -254,7 +260,7 @@ private fun replayGainLabel(mode: ReplayGainModeInfo): String = stringResource(
 private val ReplayGainPreamps = listOf(-6f, -3f, 0f, 3f, 6f)
 
 @Composable
-private fun BucketPage(state: SettingsUiState, viewModel: SettingsViewModel) {
+private fun BucketPage(state: SettingsUiState, viewModel: SettingsViewModel, onManageBucket: () -> Unit) {
     val form = state.form
     var showSecret by rememberSaveable { mutableStateOf(false) }
     var confirmingDisconnect by remember { mutableStateOf(false) }
@@ -349,6 +355,16 @@ private fun BucketPage(state: SettingsUiState, viewModel: SettingsViewModel) {
         Text(stringResource(R.string.settings_save_connect))
     }
     SettingsStatus(state.bucketMessage, state.bucketFailed)
+    SettingsRow(
+        title = stringResource(R.string.settings_manage_bucket),
+        summary = if (state.hasSettings) {
+            stringResource(R.string.settings_manage_bucket_hint)
+        } else {
+            stringResource(R.string.settings_manage_bucket_needs_bucket)
+        },
+        enabled = state.hasSettings,
+        onClick = onManageBucket,
+    )
     if (state.hasSettings) {
         SettingsRow(
             title = stringResource(R.string.settings_disconnect),

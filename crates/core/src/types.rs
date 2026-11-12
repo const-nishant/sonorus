@@ -416,6 +416,106 @@ pub struct CatalogueFolderInfo {
     pub tracks: Vec<TrackInfo>,
 }
 
+/// One entry of the bucket browser: a folder, or an object directly in the browsed folder.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BucketEntryInfo {
+    /// The entry's own name: the last path segment, without the trailing `/` of a folder.
+    pub name: String,
+    /// The full object key in the bucket (or the relative path in a local folder). A folder's key
+    /// is its prefix and ends with `/`.
+    pub key: String,
+    /// The path relative to the bucket prefix (or local folder). A folder's path ends with `/`.
+    pub path: String,
+    /// Whether this entry is a folder.
+    pub is_folder: bool,
+    /// Size in bytes. 0 for a folder.
+    pub size: u64,
+    /// Last-modified time in Unix milliseconds, when known. `None` for a folder.
+    pub modified_ms: Option<i64>,
+    /// Library track id, set when this object is a catalogued track.
+    pub track_id: Option<i64>,
+}
+
+/// The bucket browser's view of one folder: its child folders and the objects directly in it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BucketFolderInfo {
+    /// The folder path relative to the bucket prefix: empty for the root, otherwise with a
+    /// trailing `/`.
+    pub path: String,
+    /// Child folders, sorted by name, case-insensitively. The internal `_sonorus/` folder is
+    /// hidden at the root.
+    pub folders: Vec<BucketEntryInfo>,
+    /// Objects directly in the folder (including `.lrc` sidecars and images), sorted by name,
+    /// case-insensitively.
+    pub files: Vec<BucketEntryInfo>,
+}
+
+/// One object that a bulk operation could not process, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FailureInfo {
+    /// The object key.
+    pub key: String,
+    /// Why it failed, as display text without secret values.
+    pub message: String,
+}
+
+/// Outcome of `SonorusCore::move_objects`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MoveReport {
+    /// Objects moved, `.lrc` sidecars that moved with a track included. Files already in the
+    /// target folder are not counted.
+    pub moved: u32,
+    /// Objects that were not moved. Each one stays where it was.
+    pub failed: Vec<FailureInfo>,
+}
+
+/// Outcome of `SonorusCore::delete_objects` and `SonorusCore::delete_folder`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeleteReport {
+    /// Objects deleted, `.lrc` sidecars included.
+    pub deleted: u32,
+    /// Objects that were not deleted, with the reason.
+    pub failed: Vec<FailureInfo>,
+}
+
+/// Tag values to write into a track's file, for `SonorusCore::edit_tags`. A `None` field keeps
+/// its current value. A text field that is blank (empty or only spaces) removes the tag. A number
+/// field of 0 removes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct TagEditInfo {
+    /// Track title.
+    pub title: Option<String>,
+    /// Track artist.
+    pub artist: Option<String>,
+    /// Album title.
+    pub album: Option<String>,
+    /// Album artist.
+    pub album_artist: Option<String>,
+    /// Release year, 0 to 9999. 0 removes it.
+    pub year: Option<i32>,
+    /// Track number on its disc. 0 removes it.
+    pub track_no: Option<u32>,
+    /// Disc number. 0 removes it.
+    pub disc_no: Option<u32>,
+    /// Genre.
+    pub genre: Option<String>,
+}
+
+impl From<TagEditInfo> for sonorus_library::TagEdit {
+    fn from(edit: TagEditInfo) -> Self {
+        sonorus_library::TagEdit {
+            title: edit.title,
+            artist: edit.artist,
+            album: edit.album,
+            album_artist: edit.album_artist,
+            year: edit.year,
+            track_no: edit.track_no,
+            disc_no: edit.disc_no,
+            genre: edit.genre,
+        }
+    }
+}
+
 /// Library totals for the about or settings screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct LibraryStatsInfo {

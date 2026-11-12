@@ -10,6 +10,7 @@ uniffi::setup_scaffolding!();
 pub mod core;
 pub mod error;
 pub mod events;
+mod manage;
 mod offline;
 pub mod router;
 pub mod types;

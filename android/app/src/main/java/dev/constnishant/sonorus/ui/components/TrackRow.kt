@@ -9,8 +9,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Queue
 import androidx.compose.material.icons.rounded.QueuePlayNext
@@ -46,7 +48,8 @@ import kotlinx.coroutines.flow.map
 
 /**
  * One track in a list. Shows the title, artist (and album when [showArtwork]), duration, a
- * favorite toggle, and an overflow menu with "Play next", "Add to queue" and "Add to playlist…".
+ * favorite toggle, and an overflow menu with "Play next", "Add to queue" and "Add to playlist…". When a
+ * bucket is configured the menu also has "Edit tags…" and "Show in bucket".
  *
  * @param number leading track number, shown when [showArtwork] is false.
  * @param showArtwork shows the 48dp cover instead of [number] and adds the album to the subtitle.
@@ -70,6 +73,9 @@ fun TrackRow(
     LaunchedEffect(track.isFavorite) { favorite = track.isFavorite }
     var menuOpen by remember { mutableStateOf(false) }
     var addOpen by remember { mutableStateOf(false) }
+    var editOpen by remember { mutableStateOf(false) }
+    val configured by rememberBucketConfigured()
+    val bucket = rememberBucketMenuActions()
     val primary = MaterialTheme.colorScheme.primary
     val leading: (@Composable () -> Unit)? = if (showArtwork || number != null) {
         { TrackLeading(track, number, showArtwork) }
@@ -154,6 +160,24 @@ fun TrackRow(
                                 addOpen = true
                             },
                         )
+                        if (configured) {
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.action_edit_tags)) },
+                                leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                                onClick = {
+                                    menuOpen = false
+                                    editOpen = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.action_show_in_bucket)) },
+                                leadingIcon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
+                                onClick = {
+                                    menuOpen = false
+                                    bucket.showTrack(track)
+                                },
+                            )
+                        }
                         extraMenuItems?.invoke(this) { menuOpen = false }
                     }
                 }
@@ -167,6 +191,9 @@ fun TrackRow(
             onDismiss = { addOpen = false },
             actions = actions,
         )
+    }
+    if (editOpen) {
+        TrackTagsDialog(trackId = track.id, onDismiss = { editOpen = false })
     }
 }
 

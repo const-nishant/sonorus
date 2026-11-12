@@ -24,6 +24,7 @@ fun CoreException.userMessage(context: Context, @StringRes fallback: Int, vararg
         is CoreException.Storage -> context.getString(R.string.error_storage)
         is CoreException.Sync -> context.getString(R.string.error_sync_refused, detail)
         is CoreException.Busy -> sentence(detail)
+        is CoreException.Refused -> sentence(detail)
         is CoreException.Library, is CoreException.Internal -> context.getString(fallback, *args)
     }
 }

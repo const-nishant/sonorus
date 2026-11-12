@@ -41,17 +41,19 @@ use tokio::runtime::Runtime;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventListener, ListenerSlot, PlayerStatus, spawn_pump};
+use crate::manage::{self, KeyGuard, Target};
 use crate::offline::{CACHE_DIR, Offline, cache_id_for};
 use crate::router::{OutputRouter, RouterPlanner};
 #[cfg(target_os = "android")]
 use crate::types::output_info_from;
 use crate::types::{
-    AlbumInfo, AlbumSort, ArtistInfo, CacheSettings, CacheUsageInfo, CatalogueFolderInfo,
-    Converter, CoreConfig, CoreEvent, DownloadStatus, LibraryStatsInfo, ListeningStatsInfo,
-    LyricsInfo, OutputInfo, OutputSettings, PlaylistEntryInfo, PlaylistInfo, QualityFilterInfo,
-    RepeatMode, ReplayGainSettingsInfo, S3Settings, ScanProgressInfo, ScanSummary, SearchResult,
-    SignalPathInfo, SleepTimerInfo, SleepTimerRequest, SmartPlaylistKind, StatsRangeInfo,
-    SyncSummary, TrackInfo, UploadJobInfo,
+    AlbumInfo, AlbumSort, ArtistInfo, BucketFolderInfo, CacheSettings, CacheUsageInfo,
+    CatalogueFolderInfo, Converter, CoreConfig, CoreEvent, DeleteReport, DownloadStatus,
+    LibraryStatsInfo, ListeningStatsInfo, LyricsInfo, MoveReport, OutputInfo, OutputSettings,
+    PlaylistEntryInfo, PlaylistInfo, QualityFilterInfo, RepeatMode, ReplayGainSettingsInfo,
+    S3Settings, ScanProgressInfo, ScanSummary, SearchResult, SignalPathInfo, SleepTimerInfo,
+    SleepTimerRequest, SmartPlaylistKind, StatsRangeInfo, SyncSummary, TagEditInfo, TrackInfo,
+    UploadJobInfo,
 };
 use crate::upload::{
     CancelRoute, RunEnv, UploadClaim, UploadControl, cancel_job, prepare_job, request_cancel,
@@ -68,6 +70,8 @@ const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
 const PREAMP_LIMIT_DB: f32 = 15.0;
 /// Longest timed sleep, in minutes (24 h).
 const MAX_SLEEP_MINUTES: u32 = 24 * 60;
+/// Folder under the data directory for temporary files (a tag edit's working copy).
+const TEMP_DIR: &str = "tmp";
 
 /// Where the music comes from.
 #[derive(Clone)]
@@ -130,6 +134,8 @@ impl Drop for ScanGuard<'_> {
 /// The music library, backend and playback engine behind the Android app.
 #[derive(uniffi::Object)]
 pub struct SonorusCore {
+    /// The data directory: the catalogue, covers, the offline cache and temporary files.
+    data_dir: PathBuf,
     library: Arc<Library>,
     backend: RwLock<Option<Backend>>,
     player: Mutex<Option<PlayerSlot>>,
@@ -183,6 +189,7 @@ impl SonorusCore {
         );
         offline.set_bucket(bucket_identity(backend.as_ref()));
         let core = Arc::new(Self {
+            data_dir,
             library,
             backend: RwLock::new(backend),
             player: Mutex::new(None),
@@ -968,6 +975,98 @@ fn bucket_identity(backend: Option<&Backend>) -> Option<(String, Storage)> {
     }
 }
 
+#[uniffi::export]
+impl SonorusCore {
+    /// The bucket browser's view of the folder `path`, relative to the bucket prefix (or to the
+    /// local folder). `""` is the root and `"Artist/Album/"` a folder; a missing trailing `/` is
+    /// added. Lists the child folders and the objects directly in the folder, with the track id of
+    /// each catalogued track. The internal `_sonorus/` folder is hidden at the root. Fails with
+    /// `NotConfigured` without a backend, and with `Refused` for a path outside the prefix or with
+    /// an empty, `.` or `..` segment. Blocking.
+    pub fn browse(&self, path: String) -> CoreResult<BucketFolderInfo> {
+        self.with_manage(|ctx| manage::browse(ctx, &path))
+    }
+
+    /// Renames the object `key` to `new_name`, a file name in the same folder, and returns the new
+    /// key. `new_name` must not contain `/`, must not be blank or longer than 255 bytes, and must
+    /// keep an audio extension when the object is audio. Nothing is ever overwritten: a name
+    /// another object already has is `Refused`. A track keeps its favorite, playlist, history and
+    /// lyrics rows, and its `.lrc` sidecar is renamed with it. A pending upload of either key
+    /// refuses the rename. Blocking. The core emits no event for this: the caller reloads its
+    /// views.
+    pub fn rename_object(&self, key: String, new_name: String) -> CoreResult<String> {
+        let result = self.with_manage(|ctx| manage::rename(ctx, &key, &new_name));
+        self.refresh_pins();
+        result
+    }
+
+    /// Moves the objects `keys` into the folder `folder`, relative to the bucket prefix (`""` for
+    /// the root). Each folder key moves every object under it and keeps its structure, so
+    /// `"A/B/"` moved into `"X/"` lands under `"X/B/"`. Each track takes its `.lrc` sidecar along.
+    /// Each object is copied, checked, and removed from its old place, and the catalogue follows.
+    /// An object that fails is listed in `failed` and stays where it was; the others still move.
+    /// `Refused` (before anything moves) for a key outside the prefix, the root, the internal
+    /// folder, or a folder moved into itself or one of its subfolders. Blocking. The core emits no
+    /// event for this: the caller reloads its views.
+    pub fn move_objects(&self, keys: Vec<String>, folder: String) -> CoreResult<MoveReport> {
+        let result = self.with_manage(|ctx| manage::move_keys(ctx, &keys, &folder));
+        self.refresh_pins();
+        result
+    }
+
+    /// Deletes the objects `keys` (files only) and the `.lrc` sidecar of each track among them.
+    /// The catalogue rows of deleted tracks are removed, with their search and sidecar rows and
+    /// their offline cache entries. Playlist items, favorites and history keep the old key: the
+    /// app shows them as unavailable, and a re-upload of the same key brings them back. Tracks
+    /// that could not be deleted are listed in `failed` and stay catalogued. `Refused` for a key
+    /// outside the prefix, a folder (use `delete_folder`), or the internal folder. Blocking. The
+    /// core emits no event for this: the caller reloads its views.
+    pub fn delete_objects(&self, keys: Vec<String>) -> CoreResult<DeleteReport> {
+        let result = self.with_manage(|ctx| manage::delete_keys(ctx, &keys));
+        self.refresh_pins();
+        result
+    }
+
+    /// Deletes every object under the folder `path`, relative to the bucket prefix, in any
+    /// subfolder, then cleans up the catalogue as `delete_objects` does. The bucket root can never
+    /// be deleted: that is `Refused`, as is the internal `_sonorus/` folder. Blocking. The core
+    /// emits no event for this: the caller reloads its views.
+    pub fn delete_folder(&self, path: String) -> CoreResult<DeleteReport> {
+        let result = self.with_manage(|ctx| manage::delete_folder(ctx, &path));
+        self.refresh_pins();
+        result
+    }
+
+    /// Writes `edit` into the tags of the catalogued track `track_id`, and stores the file under
+    /// the same key. A `None` field keeps its value. A blank text field removes the tag, and a
+    /// number of 0 removes the number. The year must be 0 to 9999. The file is downloaded to a
+    /// temporary file under the data directory in range reads, edited there, uploaded back (in
+    /// parts above 8 MiB), and the track is re-read into the catalogue. The temporary file is
+    /// removed on every path. A stream that is already playing this track keeps playing the old
+    /// bytes; the next play uses the new file. Blocking, and can take minutes for a large file, so
+    /// call it from a background thread with a spinner.
+    pub fn edit_tags(&self, track_id: i64, edit: TagEditInfo) -> CoreResult<()> {
+        let edit = sonorus_library::TagEdit::from(edit);
+        let result = self.with_manage(|ctx| manage::edit_tags(ctx, track_id, &edit));
+        self.refresh_pins();
+        result
+    }
+
+    /// Sets the cover of album `album_id` to the image in the file descriptor `fd`. The image is
+    /// at most 20 MiB and must be JPEG or PNG (checked by its magic bytes). It is stored as
+    /// `cover.jpg` or `cover.png` in the album's folder, and the other type's `cover.*` is removed.
+    /// The album's tracks must all be in one folder, or the call is `Refused`. The core takes
+    /// ownership of `fd` and closes it when this call returns, on every path, so the caller must
+    /// not close it again. Blocking. The core emits no event for this: the caller reloads its
+    /// views.
+    pub fn set_album_cover(&self, album_id: i64, fd: i32) -> CoreResult<()> {
+        let mut file = take_fd(fd)?;
+        let cover = manage::read_cover(&mut file)?;
+        drop(file);
+        self.with_manage(|ctx| manage::set_album_cover(ctx, album_id, &cover))
+    }
+}
+
 impl SonorusCore {
     /// The backend, cloned so that no lock is held while it is used.
     fn backend_snapshot(&self) -> Option<Backend> {
@@ -985,6 +1084,31 @@ impl SonorusCore {
             }) => Ok((storage, prefix)),
             _ => Err(CoreError::NotConfigured),
         }
+    }
+
+    /// Runs `f` with the management context of the current backend: the bucket with its prefix,
+    /// or the local folder with an empty prefix. Fails with `NotConfigured` without a backend.
+    fn with_manage<T>(&self, f: impl FnOnce(&manage::Ctx<'_>) -> CoreResult<T>) -> CoreResult<T> {
+        let backend = self.backend_snapshot().ok_or(CoreError::NotConfigured)?;
+        let rt = self.runtime()?;
+        let (prefix, target) = match &backend {
+            Backend::Bucket {
+                storage, prefix, ..
+            } => (prefix.clone(), Target::Bucket(storage)),
+            Backend::Local { root } => (String::new(), Target::Local(root.as_path())),
+        };
+        let (source, _) = self.scan_source()?;
+        let temp_dir = self.data_dir.join(TEMP_DIR);
+        let ctx = manage::Ctx {
+            library: &self.library,
+            rt,
+            target,
+            guard: KeyGuard::new(&prefix),
+            cache: self.offline.cache(),
+            source,
+            temp_dir: &temp_dir,
+        };
+        f(&ctx)
     }
 
     /// The key prefix that catalogue track keys start with: the bucket prefix, or empty for a
