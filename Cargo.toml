@@ -26,7 +26,7 @@ dotenvy = "0.15"
 symphonia = { version = "0.6", default-features = false, features = ["flac", "pcm", "wav", "aiff", "isomp4", "alac", "all-meta", "opt-simd"] }
 rtrb = "0.4"
 sonorus-storage = { path = "crates/storage" }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 lofty = "0.25"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
